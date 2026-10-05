@@ -7,19 +7,26 @@ name: lane
 # Measured on this account:
 #   run 37313287045  20 runners, 20 distinct Azure IPs, 100/100 served, 0 x 429
 #   run 37318129878  20 runners, 1456 served, 0 x 429, ~460 req/min aggregate
-# ...while the relay host's own WARP egress was returning 429 on every request.
+# ...while the relay host's own egress was rate limited on every request.
 #
 # A free account allows 20 concurrent jobs, and queued runs start automatically
-# as running ones finish, so the orchestrator only needs to keep the queue topped
-# up rather than schedule anything itself.
+# as running ones finish, so the orchestrator only tops the queue up.
 #
 # A lane exits 75 the moment its bucket is exhausted. That frees its concurrency
-# slot, and the next dispatch supplies a runner with a fresh IP.
+# slot and the next dispatch supplies a runner with a fresh IP.
 
 on:
   workflow_dispatch:
+    inputs:
+      relay_url:
+        description: 'Relay base URL supplied by the orchestrator'
+        required: false
+        default: ''
+      relay_token:
+        description: 'Shared token for the relay lane endpoints'
+        required: false
+        default: ''
   schedule:
-    # Safety net for when the orchestrator is not running.
     - cron: '*/15 * * * *'
 
 permissions:
@@ -39,8 +46,10 @@ jobs:
 
       - name: Serve until the bucket is spent
         env:
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          # Dispatch input wins; the repo secret is the fallback for the scheduled
+          # runs, which have no orchestrator to supply a value.
+          RELAY_URL: ${{ inputs.relay_url || secrets.RELAY_URL }}
+          RELAY_TOKEN: ${{ inputs.relay_token || secrets.RELAY_TOKEN }}
           LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
           LANE_LIFETIME_S: '240'
           LANE_IDLE_EXIT_S: '90'
@@ -49,8 +58,9 @@ jobs:
         run: |
           set -uo pipefail
           if [ -z "${RELAY_URL:-}" ]; then
-            echo "RELAY_URL secret not set; nothing to do"
+            echo "no relay URL (dispatch input and RELAY_URL secret both empty); exiting"
             exit 0
           fi
+          echo "relay=$RELAY_URL lane=$LANE_ID"
           node --version
           node src/worker.js

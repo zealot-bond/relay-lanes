@@ -19,6 +19,12 @@ const REF = process.env.GH_REF || 'main'
 const TARGET = Number(process.env.LANES_TARGET || 20)
 const TICK_MS = Number(process.env.ORCH_TICK_MS || 20000)
 const API = 'https://api.github.com'
+const PORT = Number(process.env.PORT || 8791)
+// The lane needs to reach this relay. Passing it as a dispatch input means the
+// jar never has to be told its own public URL, which is the one value that is
+// impossible to know reliably from inside a container.
+const RELAY_TOKEN = process.env.RELAY_TOKEN || ''
+const PUBLIC_URL = (process.env.RELAY_PUBLIC_URL || '').replace(/\/$/, '')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const stamp = () => new Date().toISOString().slice(11, 19)
@@ -58,13 +64,45 @@ const counts = async () => {
   return { active: inProgress?.workflow_runs?.length ?? 0, queued: queued?.workflow_runs?.length ?? 0 }
 }
 
+/**
+ * Work out the URL lanes should call back on.
+ *
+ * Order: an explicit RELAY_PUBLIC_URL wins, then whatever the panel put in
+ * PANEL_URL, then a public-IP lookup combined with the listening port. The
+ * lookup is done once and cached because it is the only outbound call needed.
+ */
+async function resolveRelayUrl () {
+  if (PUBLIC_URL) return PUBLIC_URL
+  const fromEnv = (process.env.PANEL_URL || '').replace(/\/$/, '')
+  if (fromEnv) return fromEnv
+  try {
+    const res = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(8000) })
+    const ip = (await res.text()).trim()
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+      const url = `http://${ip}:${PORT}`
+      console.log(`[orch] discovered relay url ${url}`)
+      return url
+    }
+  } catch { /* fall through */ }
+  return ''
+}
+
 async function main () {
   if (!TOKEN || !REPO) {
     console.error('[orch] GH_TOKEN and GH_REPO are required; lane top-up disabled')
     return
   }
+  const relayUrl = await resolveRelayUrl()
   console.log(`[orch] repo=${REPO} workflow=${WORKFLOW} target=${TARGET} every ${TICK_MS / 1000}s`)
+  console.log(`[orch] lanes will call back on ${relayUrl || '(unknown: dispatching without a url!)'}`)
+  if (!relayUrl) {
+    console.error('[orch] no relay URL could be determined; set RELAY_PUBLIC_URL in baked-credentials.json')
+  }
 
+  // Fail loudly and early if the workflow does not exist in that repo. A 404 here
+  // otherwise repeats forever and the pool silently stays empty, which looks
+  // exactly like "the code is broken" from the outside.
+  let warnedMissing = false
   for (;;) {
     try {
       const { active, queued } = await counts()
@@ -74,22 +112,44 @@ async function main () {
         // Dispatch in small batches: GitHub queues the surplus itself, and a
         // burst of 20 dispatches can trip secondary rate limits on the API.
         const batch = Math.min(deficit, 4)
+        let sent = 0
         for (let i = 0; i < batch; i++) {
           try {
+            // Pass the callback URL and token as inputs so a lane never depends
+            // on repo secrets being configured correctly.
             await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
-              method: 'POST', body: { ref: REF, inputs: {} },
+              method: 'POST',
+              body: {
+                ref: REF,
+                inputs: {
+                  relay_url: relayUrl,
+                  relay_token: RELAY_TOKEN,
+                },
+              },
             })
+            sent++
           } catch (e) {
+            if (/404/.test(e.message) && !warnedMissing) {
+              warnedMissing = true
+              console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO}.`)
+              console.error('[orch] lanes cannot start. Check GH_REPO and GH_WORKFLOW in baked-credentials.json.')
+            }
             console.error(`[orch] dispatch failed: ${e.message}`)
             break
           }
           await sleep(1200)
         }
-        console.log(`${stamp()} [orch] active=${active} queued=${queued} deficit=${deficit} -> dispatched ${batch}`)
+        if (!warnedMissing) {
+          console.log(`${stamp()} [orch] active=${active} queued=${queued} deficit=${deficit} -> dispatched ${sent}`)
+        }
       } else {
         console.log(`${stamp()} [orch] active=${active} queued=${queued} at target`)
       }
     } catch (e) {
+      if (/404/.test(e.message) && !warnedMissing) {
+        warnedMissing = true
+        console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO} -- lanes cannot start.`)
+      }
       console.error(`${stamp()} [orch] tick error: ${e.message}`)
     }
     await sleep(TICK_MS)
