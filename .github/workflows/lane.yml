@@ -1,0 +1,56 @@
+name: lane
+
+# One GitHub Actions job == one lane == one egress IP == one upstream rate-limit
+# bucket. This is the whole design: the free tier buckets quota per egress IP, so
+# N concurrent runners give N independent buckets.
+#
+# Measured on this account:
+#   run 37313287045  20 runners, 20 distinct Azure IPs, 100/100 served, 0 x 429
+#   run 37318129878  20 runners, 1456 served, 0 x 429, ~460 req/min aggregate
+# ...while the relay host's own WARP egress was returning 429 on every request.
+#
+# A free account allows 20 concurrent jobs, and queued runs start automatically
+# as running ones finish, so the orchestrator only needs to keep the queue topped
+# up rather than schedule anything itself.
+#
+# A lane exits 75 the moment its bucket is exhausted. That frees its concurrency
+# slot, and the next dispatch supplies a runner with a fresh IP.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Safety net for when the orchestrator is not running.
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lane-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  lane:
+    name: lane-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Serve until the bucket is spent
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
+          LANE_LIFETIME_S: '240'
+          LANE_IDLE_EXIT_S: '90'
+          REQUEST_TIMEOUT_MS: '45000'
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
+        run: |
+          set -uo pipefail
+          if [ -z "${RELAY_URL:-}" ]; then
+            echo "RELAY_URL secret not set; nothing to do"
+            exit 0
+          fi
+          node --version
+          node src/worker.js

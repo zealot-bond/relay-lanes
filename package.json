@@ -1,0 +1,19 @@
+{
+  "name": "opencode-relay-lanes",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub Actions lane pool: 20 concurrent jobs give 20 independent egress IPs, each its own OpenCode Zen free-tier bucket.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "orchestrate": "node src/orchestrator.js",
+    "setup": "node src/setup.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
