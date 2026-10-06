@@ -44,10 +44,14 @@ const KEEPALIVE = new https.Agent({
  * version appended both ev.delta and choices[0].delta.content for the same
  * frame, which double counted the output.
  *
+ * `onText` is called with each text fragment as it arrives, so a streaming client
+ * sees tokens while the model is still writing instead of waiting for the whole
+ * answer. It is purely additive: folding the final completion is unchanged.
+ *
  * Reasoning-only models (nemotron-3-ultra) stream their thinking in
  * delta.reasoning and put the answer in delta.content; only content counts.
  */
-function parseUpstream (raw, model) {
+function parseUpstream (raw, model, onText) {
   if (!raw) return null
   const trimmed = raw.trimStart()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
@@ -75,7 +79,7 @@ function parseUpstream (raw, model) {
 
     const delta = ev?.choices?.[0]?.delta
     const cd = delta?.content
-    if (typeof cd === 'string') parts.push(cd)
+    if (typeof cd === 'string') { parts.push(cd); onText?.(cd) }
     // Tool calls arrive as deltas keyed by index, so they must be merged by index
     // rather than appended. They also carry the whole answer for models that
     // decide to call a tool instead of replying in text: dropping them made the
@@ -113,6 +117,7 @@ function parseUpstream (raw, model) {
 
     if (ev?.type === 'response.output_text.delta' && typeof ev.delta === 'string') {
       parts.push(ev.delta)
+      onText?.(ev.delta)
     }
     // The responses dialect has NO [DONE] sentinel; response.completed is the
     // terminal event. Without this the stream looks unterminated and an empty
@@ -149,14 +154,24 @@ function parseUpstream (raw, model) {
  * upstream shape from the model id.
  */
 /**
- * Small output budgets silently produce nothing.
+ * Output budget.
  *
  * These models are reasoning models: with max_output_tokens=32 the entire budget
- * is spent on hidden reasoning and the stream ends with zero answer text, which
- * looked like an upstream failure. Measured: 32 tokens gave an empty completion,
- * 200 gave "ok". So the client's request is treated as a floor, not a hard cap.
+ * is spent on hidden reasoning and the stream ends with zero answer text. So a
+ * tiny explicit request is raised to MIN_OUTPUT_TOKENS.
+ *
+ * But when the client sets NO limit the budget must not be small. Upstream stops
+ * on its own end-of-sequence, so imposing 512 here truncated long answers
+ * mid-sentence -- the reported "only half the text" bug, arriving with
+ * finish_reason "length". A missing limit now means effectively unbounded.
  */
 const MIN_OUTPUT_TOKENS = Number(process.env.MIN_OUTPUT_TOKENS || 512)
+const DEFAULT_OUTPUT_TOKENS = Number(process.env.DEFAULT_OUTPUT_TOKENS || 32768)
+
+function outputBudget (maxTokens) {
+  if (Number(maxTokens) > 0) return Math.max(maxTokens, MIN_OUTPUT_TOKENS)
+  return DEFAULT_OUTPUT_TOKENS
+}
 
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP }) {
   const protocol = protocolFor(model)
@@ -180,7 +195,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       })),
       stream: true,                          // the responses endpoint requires it
       tools: fingerprintToolSpecsResponses(),
-      max_output_tokens: Math.max(maxTokens || 0, MIN_OUTPUT_TOKENS),
+      max_output_tokens: outputBudget(maxTokens),
     }
     if (temperature !== undefined) body.temperature = temperature
     if (topP !== undefined) body.top_p = topP
@@ -192,15 +207,23 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
     messages: msgs,
     stream: true,                            // free tier refuses stream:false
     tools: fingerprintToolSpecs(),
-    max_tokens: Math.max(maxTokens || 0, MIN_OUTPUT_TOKENS),
+    max_tokens: outputBudget(maxTokens),
   }
   if (temperature !== undefined) body.temperature = temperature
   if (topP !== undefined) body.top_p = topP
   return body
 }
 
-/** One upstream request. Resolves with a classification; never throws upstream. */
-export async function callUpstream (job, { signal } = {}) {
+/**
+ * One upstream request. Resolves with a classification; never throws upstream.
+ *
+ * `onDelta(text)` is invoked the moment a text fragment arrives on the socket,
+ * before the response ends. That is what makes streaming worth having: the lane
+ * can forward each fragment to the relay immediately, so the client renders
+ * tokens while the model is still writing. Waiting for `end` would make
+ * time-to-first-token equal the entire generation time.
+ */
+export async function callUpstream (job, { signal, onDelta } = {}) {
   const { model, messages, system, maxTokens, temperature, topP } = job || {}
   const protocol = protocolFor(model)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP }))
@@ -223,7 +246,27 @@ export async function callUpstream (job, { signal } = {}) {
       },
     }, (res) => {
       const chunks = []
-      res.on('data', (c) => chunks.push(c))
+      // Incremental SSE decode. Only complete `data:` lines are parsed, so a
+      // frame split across two TCP reads is never mangled into invalid JSON.
+      let carry = ''
+      res.on('data', (c) => {
+        chunks.push(c)
+        if (!onDelta) return
+        carry += c.toString('utf8')
+        let nl
+        while ((nl = carry.indexOf('\n')) !== -1) {
+          const line = carry.slice(0, nl)
+          carry = carry.slice(nl + 1)
+          if (!line.startsWith('data:')) continue
+          const p = line.slice(5).trim()
+          if (!p || p === '[DONE]') continue
+          let ev
+          try { ev = JSON.parse(p) } catch { continue }
+          const text = ev?.choices?.[0]?.delta?.content ??
+            (ev?.type === 'response.output_text.delta' ? ev.delta : undefined)
+          if (typeof text === 'string' && text) onDelta(text)
+        }
+      })
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString()
         const verdict = classifyUpstream(res.statusCode, raw)

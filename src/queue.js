@@ -29,14 +29,22 @@ export class WorkQueue extends EventEmitter {
     this.claimLeaseMs = claimLeaseMs
   }
 
-  /** Return claims whose lane never reported, so the work is not lost. */
-  reapStaleClaims () {
+  /**
+ * Return claims whose lane never reported, so the work is not lost.
+ *
+ * An entry that has already finished, or whose client disconnected, is dropped
+ * rather than requeued. Requeuing a dead entry is what created a zombie loop: a
+ * lane would claim it, burn a full upstream call serving nobody, and the lease
+ * would expire and hand it back again, forever, starving real requests.
+ */
+reapStaleClaims () {
     const now = Date.now()
     const reaped = []
     for (const entry of this.inflight.values()) {
       if (entry.claimedAt && now - entry.claimedAt > this.claimLeaseMs) {
         this.inflight.delete(entry.id)
         entry.pendingResolve = null
+        if (entry.done || entry.abandoned) continue
         this.pending.push(entry)
         reaped.push(entry)
       }
@@ -86,6 +94,37 @@ export class WorkQueue extends EventEmitter {
   }
 
   /**
+   * Retire an entry from the queue exactly once and settle its client.
+   *
+   * Every dispatch ends here, whatever the outcome. Centralising removal is what
+   * stops an entry being left in `pending` (never claimable by a dispatcher, so it
+   * would only be served and requeued) or left in `inflight` (reaped and
+   * requeued on lease expiry, which is the zombie loop).
+   */
+  finish (entry, result) {
+    if (!entry) return
+    this.inflight.delete(entry.id)
+    const at = this.pending.indexOf(entry)
+    if (at !== -1) this.pending.splice(at, 1)
+    if (entry.done) return
+    entry.done = true
+    entry.pendingResolve = null
+    entry.resolve?.(result)
+    this.emit('done', { entry, result })
+  }
+
+  /** Drop an entry whose client is gone, so no lane spends time on it. */
+  abandon (entry) {
+    if (!entry) return
+    entry.abandoned = true
+    entry.done = true
+    entry.pendingResolve = null
+    this.inflight.delete(entry.id)
+    const at = this.pending.indexOf(entry)
+    if (at !== -1) this.pending.splice(at, 1)
+  }
+
+  /**
    * Return an in-flight entry to the pending list.
    *
    * Needed because a lane that reports exhaustion consumes the claim: the entry
@@ -95,6 +134,8 @@ export class WorkQueue extends EventEmitter {
    */
   requeue (entry, { front = true } = {}) {
     if (!entry) return false
+    // Never resurrect finished or abandoned work.
+    if (entry.done || entry.abandoned) return false
     this.inflight.delete(entry.id)
     entry.pendingResolve = null
     if (front) this.pending.unshift(entry)

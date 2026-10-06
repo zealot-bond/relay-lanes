@@ -22,7 +22,10 @@ const TARGET = config.LANES_TARGET
 const TICK_MS = config.ORCH_TICK_MS
 // Lanes kept warm while the relay is idle: enough to absorb a burst instantly,
 // without paying for a full pool around an empty queue.
-const STANDBY = Number(process.env.LANES_STANDBY || 4)
+// Lanes held warm while the relay is idle. Defaults to TARGET so the pool is
+// genuinely full and a request never waits on a cold start. Lower it to cut
+// runner minutes when the relay is idle for long stretches.
+const STANDBY = Number(process.env.LANES_STANDBY || TARGET)
 const API = 'https://api.github.com'
 const PORT = config.PORT
 // The lane needs to reach this relay. Passing it as a dispatch input means the
@@ -112,15 +115,16 @@ async function main () {
 
   // Runaway guard. Overnight this dispatched 3212 workflow runs in ~10 hours for a
   // pool of 20 lanes, because every lane exited after 90s idle and each exit
-  // looked like a deficit. A free account has a monthly minutes budget, so an
-  // unbounded dispatch loop is an account-level risk, not just noise.
-  //
-  // Three brakes, each independent:
-  //   DISPATCH_BUDGET  hard cap on dispatches per hour
-  //   cooldown        a run that fails fast must not be retried immediately
-  //   single-per-tick  one dispatch per tick, so a refill takes minutes not seconds
-  const BUDGET_PER_HOUR = Number(process.env.DISPATCH_BUDGET || 120)
-  const COOLDOWN_MS = Number(process.env.DISPATCH_COOLDOWN_MS || 90000)
+  // looked like a deficit. The brake is now demand-based sizing plus an hourly
+  // cap, NOT a cooldown between successful dispatches: the cooldown made a cold
+  // start take 30 minutes (one lane per 90s), which is the opposite of what a
+  // pool is for. GitHub queues dispatches itself and starts them as concurrency
+  // slots free, so a burst is safe and is the fastest path to N lanes.
+  const BUDGET_PER_HOUR = Number(process.env.DISPATCH_BUDGET || 400)
+  const MAX_BURST = Number(process.env.DISPATCH_BURST || 20)
+  const DISPATCH_SPACING_MS = Number(process.env.DISPATCH_SPACING_MS || 700)
+  // Only a failing dispatch backs off. A success means the config is right.
+  const COOLDOWN_MS = Number(process.env.DISPATCH_COOLDOWN_MS || 30000)
   let dispatches = []
   let cooldownUntil = 0
 
@@ -134,12 +138,9 @@ async function main () {
     try {
       const { active, queued } = await counts()
 
-      // Demand-driven sizing. The orchestrator shares a process with the relay,
-      // so it can read the real queue instead of guessing. Holding a full pool of
-      // TARGET lanes around an idle relay is what burned the account overnight
-      // (3212 runs in ~10h), because runners are charged by the minute whether
-      // or not they are used. A small standby pool absorbs bursts; the rest is
-      // spun up only when there is work waiting for it.
+      // The orchestrator shares a process with the relay, so it reads the real
+      // queue. Pending work scales the pool to TARGET; an idle pool settles at
+      // STANDBY so runner minutes are not spent on nothing.
       const q = queue.stats()
       const busy = q.pending > 0 || q.inflight > 0
       const target = busy ? TARGET : STANDBY
@@ -154,35 +155,43 @@ async function main () {
         const wait = Math.ceil((cooldownUntil - Date.now()) / 1000)
         console.log(`${stamp()} [orch] active=${live} want=${target} pending=${q.pending} cooling down ${wait}s`)
       } else if (deficit > 0) {
-        // Exactly one dispatch per tick. GitHub queues the surplus and starts it
-        // as slots free, so a burst buys nothing but quota risk.
-        try {
-          // Pass the callback URL and token as inputs so a lane never depends
-          // on repo secrets being configured correctly.
-          await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
-            method: 'POST',
-            body: {
-              ref: REF,
-              inputs: { relay_url: relayUrl, relay_token: RELAY_TOKEN },
-            },
-          })
-          dispatches.push(Date.now())
-          cooldownUntil = Date.now() + COOLDOWN_MS
-          console.log(`${stamp()} [orch] active=${active} queued=${queued} deficit=${deficit} ` +
-            `-> dispatched 1 (${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
-        } catch (e) {
-          if (/404/.test(e.message) && !warnedMissing) {
-            warnedMissing = true
-            console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO}.`)
-            console.error('[orch] lanes cannot start. Check GH_REPO and GH_WORKFLOW in baked-credentials.json.')
+        // Fire the whole deficit at once, spaced just enough to avoid the API's
+        // secondary rate limits. A cold start goes from ~30 minutes to seconds.
+        const want = Math.min(deficit, MAX_BURST, left)
+        let sent = 0
+        for (let i = 0; i < want; i++) {
+          try {
+            // Pass the callback URL and token as inputs so a lane never depends
+            // on repo secrets being configured correctly.
+            await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
+              method: 'POST',
+              body: {
+                ref: REF,
+                inputs: { relay_url: relayUrl, relay_token: RELAY_TOKEN },
+              },
+            })
+            dispatches.push(Date.now())
+            sent++
+          } catch (e) {
+            if (/404/.test(e.message) && !warnedMissing) {
+              warnedMissing = true
+              console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO}.`)
+              console.error('[orch] lanes cannot start. Check GH_REPO and GH_WORKFLOW in baked-credentials.json.')
+            }
+            console.error(`[orch] dispatch failed after ${sent}: ${e.message}`)
+            // Back off hard: a failing dispatch means the config is wrong, and
+            // hammering it is what produced thousands of useless runs.
+            cooldownUntil = Date.now() + COOLDOWN_MS * 4
+            break
           }
-          console.error(`[orch] dispatch failed: ${e.message}`)
-          // Back off hard: a failing dispatch means the config is wrong, and
-          // hammering it is what produced thousands of useless runs.
-          cooldownUntil = Date.now() + COOLDOWN_MS * 4
+          if (i < want - 1) await sleep(DISPATCH_SPACING_MS)
+        }
+        if (sent) {
+          console.log(`${stamp()} [orch] active=${active} queued=${queued} want=${target} ` +
+            `deficit=${deficit} -> dispatched ${sent} (${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
         }
       } else {
-        console.log(`${stamp()} [orch] active=${active} queued=${queued} at target`)
+        console.log(`${stamp()} [orch] active=${active} queued=${queued} at target (${target})`)
       }
     } catch (e) {
       if (/404/.test(e.message) && !warnedMissing) {

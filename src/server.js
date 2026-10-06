@@ -62,6 +62,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // Entries awaiting a lane result, keyed by queue id.
 const waiting = new Map()
 const dispatched = new WeakSet()
+// Live SSE writers for streaming clients, keyed by queue id. A lane POSTs text
+// fragments here as they arrive and the relay writes each one straight to the
+// client, so time-to-first-token is upstream TTFT rather than total generation.
+const streamers = new Map()
+let streamSeq = 0
 
 function pickLane (tried) {
   const candidates = lanes.liveLanes(45000).filter((l) => l.status !== 'exhausted')
@@ -112,7 +117,7 @@ async function dispatch (entry) {
       // that is merely flaky is not punished by the hard-failure retry budget.
       empties++
       lanes.record(lane.id, 'empty', result.ms || 0)
-      queue.requeue(entry, { front: true })
+      if (!entry.committed) queue.requeue(entry, { front: true })
       continue
     }
 
@@ -123,14 +128,21 @@ async function dispatch (entry) {
       // with a runner holding a fresh bucket, then hand the work back.
       lanes.record(lane.id, 'limited', result.ms || 0)
       lanes.retire(lane.id, 'egress bucket exhausted')
-      queue.requeue(entry, { front: true })
+      if (!entry.committed) queue.requeue(entry, { front: true })
       continue
     }
 
     lanes.record(lane.id, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
-    queue.requeue(entry, { front: true })
-    // Backoff before the next attempt so a struggling upstream is not hammered.
-    await sleep(Math.min(2000, 150 * attempt))
+    // Once text has been forwarded to the client the response is already
+    // partially written, so retrying would duplicate text. Finish the response
+    // with what arrived instead.
+    if (!entry.committed) {
+      queue.requeue(entry, { front: true })
+      // Backoff before the next attempt so a struggling upstream is not hammered.
+      await sleep(Math.min(2000, 150 * attempt))
+      continue
+    }
+    return { ...result, kind: 'partial' }
   }
   return last
 }
@@ -140,7 +152,10 @@ export function ensureDispatched (entry) {
   dispatched.add(entry)
   ;(async () => {
     const result = await dispatch(entry)
-    queue.complete(entry.id, result)
+    // Single exit point: removes the entry from pending and inflight and settles
+    // the client. Anything left behind here becomes zombie work that a lane serves
+    // for nobody and the lease reaper hands back around the loop.
+    queue.finish(entry, result)
   })()
 }
 
@@ -149,8 +164,16 @@ export function acceptLaneResult (laneId, entryId, result) {
   const entry = waiting.get(entryId)
   if (!entry) return false
   waiting.delete(entryId)
-  if (typeof entry.pendingResolve === 'function') { entry.pendingResolve(result); return true }
-  queue.complete(entryId, result)
+  if (typeof entry.pendingResolve === 'function') {
+    // Record whether the client already saw the text, so the streaming path can
+    // avoid emitting the same content twice.
+    entry.streamed = Boolean(result.streamed)
+    entry.pendingResolve(result)
+    return true
+  }
+  // No dispatcher is waiting (client gone, or the request already settled). Do
+  // not hand the result anywhere; just make sure it is not left in flight.
+  if (!entry.done && !entry.abandoned) queue.complete(entryId, result)
   return true
 }
 
@@ -211,19 +234,80 @@ async function handleChat (req, res) {
       maxTokens: maxCompletion || maxTokens,
       temperature,
       topP,
+      stream: Boolean(stream),
     },
   }
+
+  // A streaming client gets its response headers and role chunk now, and every
+  // later fragment is appended as it arrives.
+  const streamId = `chatcmpl-${Date.now().toString(36)}-${(streamSeq++).toString(36)}`
+  const streamCreated = Math.floor(Date.now() / 1000)
+  if (stream) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*',
+    })
+    res.write(`data: ${JSON.stringify({
+      id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    })}\n\n`)
+  }
+
   const queued = queue.push(entry)
   if (!queued.ok) {
+    if (stream) {
+      res.write(`data: ${JSON.stringify({ error: { message: 'relay queue is full', type: 'overloaded' } })}\n\n`)
+      res.write('data: [DONE]\n\n')
+      return res.end()
+    }
     return json(res, 503, { error: { message: 'relay queue is full', type: 'overloaded' } },
       { 'Retry-After': '5' })
   }
+
+  // Registered after push (which assigns the id) but before dispatch, so a fast
+  // lane cannot have its first delta arrive with nowhere to go.
+  if (stream) {
+    streamers.set(entry.id, (text) => {
+      if (!text) return
+      res.write(`data: ${JSON.stringify({
+        id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
+        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+      })}\n\n`)
+    })
+  }
+
   ensureDispatched(entry)
+
+  // If the client hangs up mid-flight, stop caring immediately. Otherwise the
+  // work stays queued and a lane burns a full upstream call on a response nobody
+  // will read.
+  const onClientGone = () => {
+    if (!entry.done) queue.abandon(entry)
+  }
+  res.on('close', onClientGone)
+
   const result = await new Promise((resolve) => { entry.resolve = resolve })
+  res.off?.('close', onClientGone)
+  streamers.delete(entry.id)
 
   if (result.kind !== 'ok') {
     // Upstream is unusable for this request. That is NOT a client rate limit, so
     // it must not be reported as 429.
+    if (stream) {
+      // Headers are long gone, so the failure is reported in-band.
+      const err = {
+        error: {
+          message: `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
+          type: 'upstream_unavailable',
+        },
+      }
+      res.write(`data: ${JSON.stringify(err)}\n\n`)
+      res.write('data: [DONE]\n\n')
+      return res.end()
+    }
     return json(res, 502, {
       error: {
         message: `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
@@ -236,22 +320,29 @@ async function handleChat (req, res) {
 
   if (!stream) return json(res, 200, completion)
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-  })
-  const { id, created } = completion
-  const send = (delta, finish = null) => {
+  // --- streaming ---
+  //
+  // Headers go out immediately and each fragment is written the moment it
+  // arrives, so the client starts rendering at upstream TTFT. The final chunk
+  // carries finish_reason and usage. Because headers are already committed, a
+  // late failure is reported as a terminal error chunk rather than an HTTP
+  // status -- which is what every OpenAI client expects from a stream.
+  const id = stream && streamId ? streamId : completion.id
+  const created = stream && streamCreated ? streamCreated : completion.created
+  const chunk = (delta, finish = null) => {
     res.write(`data: ${JSON.stringify({
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta, finish_reason: finish }],
     })}\n\n`)
   }
-  send({ role: 'assistant', content: '' })
-  send({ content: completion.choices[0]?.message?.content ?? '' })
-  send({}, 'stop')
+
+  // For a streaming entry the text already arrived through /lane/delta, so the
+  // buffered completion must not be replayed or the client would see it twice.
+  const alreadyStreamed = Boolean(entry.id && result.streamed)
+  if (!alreadyStreamed) {
+    chunk({ content: completion.choices[0]?.message?.content ?? '' })
+  }
+  chunk({}, completion.choices[0]?.finish_reason || 'stop')
   if (completion.usage) {
     res.write(`data: ${JSON.stringify({
       id, object: 'chat.completion.chunk', created, model, choices: [], usage: completion.usage,
@@ -346,6 +437,26 @@ async function laneResult (req, res) {
   return json(res, accepted ? 200 : 404, { ok: accepted })
 }
 
+/**
+ * Incremental text from a lane, forwarded straight to a streaming client.
+ *
+ * The lane batches fragments (see worker.js) so this is a handful of calls per
+ * response rather than one per token. Marking the entry committed here is what
+ * stops dispatch retrying a request whose text is already on the wire.
+ */
+async function laneDelta (req, res) {
+  if (!authorized(req)) return json(res, 403, { error: 'bad token' })
+  const body = await readBody(req).catch(() => ({}))
+  const entryId = body.entryId
+  const writer = streamers.get(entryId)
+  if (!writer) return json(res, 404, { ok: false, error: 'no stream for entry' })
+
+  const entry = waiting.get(entryId)
+  if (entry) entry.committed = true
+  writer(body.text ?? '')
+  return json(res, 200, { ok: true })
+}
+
 export function createServer () {
   return http.createServer(async (req, res) => {
     try {
@@ -378,6 +489,7 @@ export function createServer () {
       if (method === 'POST' && path === '/lane/heartbeat') return laneHeartbeat(req, res)
       if (method === 'GET' && path === '/lane/claim') return laneClaim(req, res)
       if (method === 'POST' && path === '/lane/result') return laneResult(req, res)
+      if (method === 'POST' && path === '/lane/delta') return laneDelta(req, res)
 
       if (method === 'GET' && (path === '/v1/models' || path === '/models')) {
         return json(res, 200, listModelsPayload())

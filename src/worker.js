@@ -7,15 +7,21 @@ const RELAY = (process.env.RELAY_URL || 'http://127.0.0.1:8791').replace(/\/$/, 
 const TOKEN = process.env.RELAY_TOKEN || 'relay'
 const LANE_ID = process.env.LANE_ID ||
   `runner-${process.env.GITHUB_RUN_ID || 'local'}-${process.env.GITHUB_RUN_ATTEMPT || '0'}`
-const MAX_LIFETIME_S = Number(process.env.LANE_LIFETIME_S || 540)
-// Exit a little earlier than the job timeout so the run exits cleanly instead of
-// being killed, which would leave the claim to expire.
-//
-// Idle lanes used to exit after 90s, which churned the pool: the orchestrator saw
-// fewer live runs and kept dispatching replacements. Measured overnight: 3212
-// workflow runs for a pool of 20. A lane now parks far longer, so a burst of
-// work does not pay for a fresh runner every minute.
-const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 420)
+// A lane should live until its egress bucket is spent (exit 75) or it genuinely
+// breaks, not because a wall-clock timer ran out. The old 540s lifetime made
+// every runner quit while its bucket still had capacity, which forced a
+// replacement runner -- new IP, cold caches, re-registered lane -- for no reason.
+// This is set below the workflow's own timeout so the JOB ends the lane, not the
+// other way round, and the exit is still a clean 0.
+const MAX_LIFETIME_S = Number(process.env.LANE_LIFETIME_S || 3300)
+// Idle lanes park rather than churn. Short idle exits were what turned into
+// thousands of workflow runs overnight.
+const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 2400)
+// Fragments are batched before being forwarded to the relay. One HTTP call per
+// token would cost more than the tokens themselves; a short window keeps
+// time-to-first-token near upstream latency while collapsing a burst of tokens
+// into one request.
+const DELTA_BATCH_MS = Number(process.env.DELTA_BATCH_MS || 40)
 
 const H = { 'Content-Type': 'application/json', 'x-relay-token': TOKEN }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -56,14 +62,32 @@ async function main () {
   const started = Date.now()
   let served = 0, limited = 0, failed = 0, timeouts = 0, empty = 0
   let lastWork = Date.now()
+  let claimFails = 0
 
   while ((Date.now() - started) / 1000 < MAX_LIFETIME_S) {
     let claim
     try {
       claim = await post(`/lane/claim?laneId=${encodeURIComponent(LANE_ID)}&wait=20000`, undefined, 'GET')
+      claimFails = 0
     } catch (e) {
-      console.error('[lane] claim failed:', e.message)
-      await sleep(2000)
+      // A lane that loses the relay is not a dead lane: the relay restarts, or the
+      // panel's proxy resets an idle long-poll. Keep the lane alive and back off,
+      // instead of exiting or logging every 2 seconds for the rest of the job.
+      claimFails++
+      const wait = Math.min(15000, 1000 * 2 ** Math.min(claimFails, 4))
+      if (claimFails === 1 || claimFails % 5 === 0) {
+        console.log(`[lane] claim failed (${claimFails}): ${e.message} -- retrying in ${wait}ms`)
+      }
+      await sleep(wait)
+      continue
+    }
+
+    // Re-register if the relay forgot us (restart wipes the registry). Without
+    // this a relay restart silently idles every lane until the job times out.
+    if (claim?.error === 'lane not registered') {
+      console.log('[lane] relay forgot this lane, re-registering')
+      const r = await post('/lane/register', { laneId: LANE_ID, rejoin: true }).catch(() => null)
+      if (!r?.ok) await sleep(3000)
       continue
     }
 
@@ -78,7 +102,35 @@ async function main () {
     }
     lastWork = Date.now()
 
-    const result = await callUpstream(claim.job)
+    // Fragments are batched before being forwarded to the relay. One HTTP call
+    // per token would cost more than the tokens themselves; a short window keeps
+    // time-to-first-token near upstream latency while collapsing a burst of
+    // tokens into one request.
+    let pending = []
+    let deltaTimer = null
+    let streamedAny = false
+    const flushDelta = async () => {
+      if (deltaTimer) { clearTimeout(deltaTimer); deltaTimer = null }
+      if (!pending.length) return
+      const text = pending.join('')
+      pending = []
+      const r = await post('/lane/delta', { laneId: LANE_ID, entryId: claim.entryId, text })
+        .catch(() => null)
+      if (r?.ok) streamedAny = true
+    }
+
+    const result = await callUpstream(claim.job, {
+      // Only stream when the client asked for a stream. Sending deltas for a
+      // non-streaming request would just be a rejected POST per batch.
+      onDelta: claim.job.stream
+        ? (text) => {
+            pending.push(text)
+            if (!deltaTimer) deltaTimer = setTimeout(flushDelta, DELTA_BATCH_MS)
+          }
+        : undefined,
+    })
+    await flushDelta()
+
     if (result.kind === 'ok') served++
     else if (result.kind === 'limited') limited++
     else if (result.kind === 'timeout') timeouts++
@@ -94,6 +146,9 @@ async function main () {
         kind: result.kind,
         status: result.status,
         ms: result.ms,
+        // Tells the relay the client already received the text through
+        // /lane/delta, so it must not replay the buffered completion.
+        streamed: streamedAny,
         raw: result.kind === 'ok' ? '' : String(result.raw || '').slice(0, 400),
         data: result.data,
       },
