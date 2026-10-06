@@ -348,7 +348,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
  *
  * This is the single-shot form. callUpstream() wraps it to handle tool calls.
  */
-async function callUpstreamOnce (job, { signal, onDelta } = {}) {
+async function callUpstreamOnce (job, { signal, onDelta, onToolCall } = {}) {
   const { model, messages, system, maxTokens, temperature, topP } = job || {}
   const protocol = protocolFor(model)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP }))
@@ -376,7 +376,7 @@ async function callUpstreamOnce (job, { signal, onDelta } = {}) {
       let carry = ''
       res.on('data', (c) => {
         chunks.push(c)
-        if (!onDelta) return
+        if (!onDelta && !onToolCall) return
         carry += c.toString('utf8')
         let nl
         while ((nl = carry.indexOf('\n')) !== -1) {
@@ -387,9 +387,17 @@ async function callUpstreamOnce (job, { signal, onDelta } = {}) {
           if (!p || p === '[DONE]') continue
           let ev
           try { ev = JSON.parse(p) } catch { continue }
+          // Announce tool calls as they arrive, not at 'end'. The caller needs to
+          // know mid-stream so it can withhold the text that precedes the call --
+          // otherwise the client is shown "I'll read that file" and only then
+          // finds out nothing will run it.
+          const tc = ev?.choices?.[0]?.delta?.tool_calls
+          if (Array.isArray(tc) && tc.length) onToolCall?.()
+          if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') onToolCall?.()
+
           const text = ev?.choices?.[0]?.delta?.content ??
             (ev?.type === 'response.output_text.delta' ? ev.delta : undefined)
-          if (typeof text === 'string' && text) onDelta(text)
+          if (typeof text === 'string' && text) onDelta?.(text)
         }
       })
       res.on('end', () => {
@@ -451,6 +459,54 @@ async function callUpstreamOnce (job, { signal, onDelta } = {}) {
  */
 const TOOL_MODE = (process.env.TOOL_MODE || 'self').toLowerCase()
 const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
+// Text is held this long before being forwarded, so a tool call arriving in the
+// same breath as the text can still cancel it. Negligible next to a multi-second
+// time-to-first-token, and it is the only way to avoid shipping the client a
+// promise the relay is about to retract.
+const TOOL_TEXT_HOLD_MS = Number(process.env.TOOL_TEXT_HOLD_MS || 250)
+
+/**
+ * Per-round text sink that can retract.
+ *
+ * The model emits "I'll read the file" and a tool call in the same response. Text
+ * forwarded eagerly is already on the client's screen when the call turns up, and
+ * SSE gives no way to take it back -- which is why the earlier self-answer fix
+ * changed nothing visible: the promise had already been streamed. So text is
+ * buffered briefly; a tool call discards the buffer and the round is redone.
+ */
+function makeRoundSink (onDelta, holdMs) {
+  let buf = []
+  let timer = null
+  let streaming = false
+  let retracted = false
+
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = null }
+    const text = buf.join('')
+    buf = []
+    streaming = true
+    if (text) onDelta(text)
+  }
+
+  return {
+    push (text) {
+      if (retracted || streaming) { if (!retracted) onDelta(text); return }
+      buf.push(text)
+      if (!timer) timer = setTimeout(flush, holdMs)
+    },
+    /** A tool call arrived: everything buffered for this round is discarded. */
+    retract () {
+      retracted = true
+      if (timer) { clearTimeout(timer); timer = null }
+      buf = []
+    },
+    /** Round finished: forward whatever is still held. */
+    finish () {
+      if (retracted) return
+      if (!streaming) flush()
+    },
+  }
+}
 const TOOL_UNAVAILABLE =
   'Unavailable. This session has no execution environment: the bash, read, grep ' +
   'and glob tools are declared only to satisfy the API contract and cannot be ' +
@@ -458,43 +514,54 @@ const TOOL_UNAVAILABLE =
   'conversation, and say plainly what you cannot do.'
 
 export async function callUpstream (job, opts = {}) {
-  const first = await callUpstreamOnce(job, opts)
-  if (TOOL_MODE === 'passthrough') return first
-  if (first.kind !== 'ok') return first
+  if (TOOL_MODE === 'passthrough') return callUpstreamOnce(job, opts)
 
-  const calls = first.data?.choices?.[0]?.message?.tool_calls
-  if (!Array.isArray(calls) || calls.length === 0) return first
+  // The self-answer loop must run for non-streaming clients too. Returning early
+  // when there is no onDelta left those clients with the raw promise plus a
+  // dangling tool call, which is the original bug for anyone not using SSE.
+  // Retraction is only needed when there is a client to retract from, so a
+  // no-op forward is correct and harmless.
+  const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : () => {}
 
-  // Only the tool-call turn was streamed so far; the real answer comes next.
+  const sink = makeRoundSink(onDelta, TOOL_TEXT_HOLD_MS)
+
+  const runRound = () => callUpstreamOnce(job, {
+    ...opts,
+    onDelta: (t) => sink.push(t),
+    onToolCall: () => sink.retract(),
+  })
+
+  let result = await runRound()
+  sink.finish()
+  if (TOOL_MODE !== 'self' || result.kind !== 'ok') return result
+
+  let calls = result.data?.choices?.[0]?.message?.tool_calls
+  if (!Array.isArray(calls) || calls.length === 0) return result
+
   const history = []
   if (job?.system) history.push({ role: 'system', content: job.system })
   for (const m of job?.messages || []) history.push(m)
-  history.push({
-    role: 'assistant',
-    content: first.data.choices[0].message.content || null,
-    tool_calls: calls,
-  })
+  history.push({ role: 'assistant', content: null, tool_calls: calls })
   for (const tc of calls) {
-    history.push({
-      role: 'tool',
-      tool_call_id: tc.id || 'call_0',
-      content: TOOL_UNAVAILABLE,
-    })
+    history.push({ role: 'tool', tool_call_id: tc.id || 'call_0', content: TOOL_UNAVAILABLE })
   }
 
-  let result = first
   for (let round = 1; round <= TOOL_ROUNDS; round++) {
-    const next = await callUpstreamOnce(
-      { ...job, messages: history },
-      // The caller must not receive the tool-call text twice.
-      opts,
-    )
-    if (next.kind !== 'ok') return result.kind === 'ok' ? result : next
+    // Each follow-up round gets a fresh sink: its text is the answer the client
+    // should see, and a further tool call retracts it in turn.
+    const nextSink = makeRoundSink(onDelta, TOOL_TEXT_HOLD_MS)
+    const next = await callUpstreamOnce({ ...job, messages: history }, {
+      ...opts,
+      onDelta: (t) => nextSink.push(t),
+      onToolCall: () => nextSink.retract(),
+    })
+    nextSink.finish()
+    if (next.kind !== 'ok') return result
     result = next
-    const more = next.data?.choices?.[0]?.message?.tool_calls
-    if (!Array.isArray(more) || more.length === 0) return result
-    history.push({ role: 'assistant', content: null, tool_calls: more })
-    for (const tc of more) {
+    calls = result.data?.choices?.[0]?.message?.tool_calls
+    if (!Array.isArray(calls) || calls.length === 0) return result
+    history.push({ role: 'assistant', content: null, tool_calls: calls })
+    for (const tc of calls) {
       history.push({ role: 'tool', tool_call_id: tc.id || 'call_0', content: TOOL_UNAVAILABLE })
     }
   }
