@@ -23,7 +23,19 @@ import {
 } from './fingerprint.js'
 import { protocolFor } from './models.js'
 
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 45000)
+/**
+ * Per-request upstream timeout.
+ *
+ * This is a socket INACTIVITY timeout, not a total budget: Node resets it on
+ * every byte received. That distinction matters because these are reasoning
+ * models -- they can emit nothing for 30-60s while thinking, and the measured
+ * cost of the old 45s cap was that it fired during exactly that gap and killed
+ * long generations mid-answer. 412 timeouts against 2308 served on the panel.
+ *
+ * A stream that keeps producing tokens can therefore run for as long as it likes;
+ * only a genuinely wedged connection is abandoned.
+ */
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 240000)
 
 const KEEPALIVE = new https.Agent({
   keepAlive: true,

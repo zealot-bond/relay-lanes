@@ -20,6 +20,11 @@ const nextId = () => `job-${Date.now().toString(36)}-${(seq++).toString(36)}`
 export class WorkQueue extends EventEmitter {
   constructor ({ maxPending = 5000, claimLeaseMs = 90000 } = {}) {
     super()
+    // Each waiting lane registers one 'work' listener, so a full pool legitimately
+    // exceeds Node's default cap of 10 and warns about a leak that does not
+    // exist. Every listener still removes itself on wake or timeout.
+    this.setMaxListeners(0)
+
     this.pending = []          // FIFO of waiting jobs
     this.inflight = new Map()  // id -> entry currently claimed by a lane
     this.maxPending = maxPending

@@ -53,7 +53,7 @@ jobs:
           LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
           LANE_LIFETIME_S: '3300'
           LANE_IDLE_EXIT_S: '2400'
-          REQUEST_TIMEOUT_MS: '45000'
+          REQUEST_TIMEOUT_MS: '240000'
           NODE_OPTIONS: '--dns-result-order=ipv4first'
           # Which source supplied each value, for diagnosing the same-mask
           # ambiguity between a dispatch input and a repo secret.

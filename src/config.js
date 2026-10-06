@@ -59,7 +59,11 @@ export const config = {
   HOST: str('HOST', '0.0.0.0'),
   RELAY_TOKEN: str('RELAY_TOKEN', 'relay'),
   MAX_LANES: num('MAX_LANES', 20),
-  MAX_HOLD_MS: num('MAX_HOLD_MS', 180000),
+  // How long a client may be held before we give up and answer honestly. Long
+  // generations legitimately take minutes, so this must exceed the upstream
+  // inactivity timeout; otherwise a slow-but-healthy answer is reported as a
+  // failure while the model is still writing.
+  MAX_HOLD_MS: num('MAX_HOLD_MS', 600000),
   RETRY_LIMIT: num('RETRY_LIMIT', 3),
   GH_TOKEN: str('GH_TOKEN', ''),
   GH_REPO: str('GH_REPO', ''),

@@ -12,7 +12,7 @@
 
 import https from 'node:https'
 import { config } from './config.js'
-import { queue } from './server.js'
+import { queue, lanes } from './server.js'
 
 const TOKEN = config.GH_TOKEN
 const REPO = config.GH_REPO
@@ -95,6 +95,10 @@ async function resolveRelayUrl () {
   return ''
 }
 
+// How recently a lane must have been seen to count as live. Generous: a lane
+// long-polls for 20s at a time and only heartbeats on that cycle.
+const LANE_FRESH_MS = Number(process.env.LANE_FRESH_MS || 120000)
+
 async function main () {
   if (!TOKEN || !REPO) {
     console.error('[orch] GH_TOKEN and GH_REPO are required; lane top-up disabled')
@@ -144,16 +148,23 @@ async function main () {
       const q = queue.stats()
       const busy = q.pending > 0 || q.inflight > 0
       const target = busy ? TARGET : STANDBY
-      const live = active + queued
-      const deficit = target - live
+
+      // Size against the lanes THIS relay can actually see, not GitHub's run
+      // count. GitHub reported active=0 while 20 lanes were demonstrably
+      // registered and serving, and the orchestrator believed it: 60 wasted
+      // dispatches in four minutes (53 -> 113 in one hour) for a pool that was
+      // already full. A run that exists upstream but whose lane has not checked in
+      // is not a lane that can take work, so only the relay's own view counts.
+      const liveLanes = lanes.liveLanes(LANE_FRESH_MS).length
+      const deficit = target - liveLanes
       const left = budgetLeft()
 
       if (left <= 0) {
-        console.log(`${stamp()} [orch] active=${live} want=${target} pending=${q.pending} ` +
+        console.log(`${stamp()} [orch] lanes=${liveLanes} want=${target} pending=${q.pending} ` +
           `but hourly dispatch budget spent (${dispatches.length}/${BUDGET_PER_HOUR}) -- holding off`)
       } else if (Date.now() < cooldownUntil) {
         const wait = Math.ceil((cooldownUntil - Date.now()) / 1000)
-        console.log(`${stamp()} [orch] active=${live} want=${target} pending=${q.pending} cooling down ${wait}s`)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} want=${target} pending=${q.pending} cooling down ${wait}s`)
       } else if (deficit > 0) {
         // Fire the whole deficit at once, spaced just enough to avoid the API's
         // secondary rate limits. A cold start goes from ~30 minutes to seconds.
@@ -187,11 +198,12 @@ async function main () {
           if (i < want - 1) await sleep(DISPATCH_SPACING_MS)
         }
         if (sent) {
-          console.log(`${stamp()} [orch] active=${active} queued=${queued} want=${target} ` +
-            `deficit=${deficit} -> dispatched ${sent} (${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
+          console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} ` +
+            `want=${target} deficit=${deficit} -> dispatched ${sent} ` +
+            `(${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
         }
       } else {
-        console.log(`${stamp()} [orch] active=${active} queued=${queued} at target (${target})`)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} at target (${target})`)
       }
     } catch (e) {
       if (/404/.test(e.message) && !warnedMissing) {

@@ -68,6 +68,66 @@ const dispatched = new WeakSet()
 const streamers = new Map()
 let streamSeq = 0
 
+/**
+ * Per-model health.
+ *
+ * Retrying is only worth it for a failure another lane could avoid. A 4xx from
+ * the endpoint itself (400 "Endpoint is unavailable") is identical from every
+ * egress IP, so retrying just holds the client for three full attempts and then
+ * reports a generic failure that reads like a rate limit.
+ *
+ * After a few consecutive hard failures a model is marked unhealthy and the next
+ * request for it is refused immediately with a specific reason. That keeps the
+ * "no lane could serve this request" path for genuinely transient problems.
+ */
+const modelHealth = new Map()
+const HEALTH_THRESHOLD = Number(process.env.MODEL_HEALTH_THRESHOLD || 3)
+
+export function noteModelResult (model, result) {
+  const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '' }
+  if (result.kind === 'ok') {
+    h.fails = 0
+    h.note = ''
+    modelHealth.set(model, h)
+    return
+  }
+  // Exhaustion and empty answers are per-egress, not per-model.
+  if (result.kind === 'limited' || result.kind === 'empty') {
+    h.fails = 0
+    modelHealth.set(model, h)
+    return
+  }
+  h.fails++
+  h.lastKind = result.kind
+  h.note = result.status ? `upstream returned HTTP ${result.status}` : `upstream ${result.kind}`
+  modelHealth.set(model, h)
+}
+
+export function modelHealthOf (model) {
+  const h = modelHealth.get(model)
+  if (!h || h.fails < HEALTH_THRESHOLD) return null
+  return h
+}
+
+export function modelHealthStats () {
+  const out = {}
+  for (const [m, h] of modelHealth) if (h.fails > 0) out[m] = { fails: h.fails, note: h.note }
+  return out
+}
+
+/**
+ * Should this failure be retried on another lane?
+ *
+ *   limited        yes - that egress IP is spent, another is fine
+ *   empty          yes - measured upstream flakiness, another lane usually works
+ *   transport/timeout yes - a 5xx or a stalled connection can be transient
+ *   provider_error no  - a 4xx is the endpoint refusing the request; identical
+ *                          from every IP, so retrying can only waste the client's
+ *                          time and produce a misleading message
+ *   gate           no  - our own fingerprint is rejected, retrying changes nothing
+ */
+const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error'])
+
 function pickLane (tried) {
   const candidates = lanes.liveLanes(45000).filter((l) => l.status !== 'exhausted')
   const fresh = candidates.filter((l) => !tried.has(l.id))
@@ -76,6 +136,11 @@ function pickLane (tried) {
   return fresh[0] || (candidates.length ? candidates[candidates.length - 1] : null)
 }
 
+// Hard ceiling on one lane attempt. Generous, because a reasoning model can
+// legitimately think for a minute before its first token. The lane's own
+// inactivity timeout is what actually abandons a wedged connection.
+const ATTEMPT_HARD_MS = Number(process.env.ATTEMPT_HARD_MS || 300000)
+
 async function dispatch (entry) {
   const tried = new Set()
   let attempt = 0
@@ -83,7 +148,10 @@ async function dispatch (entry) {
   let last = { kind: 'error', status: 0, ms: 0, data: null }
 
   while (attempt <= RETRY_LIMIT && empties <= RETRY_LIMIT) {
-    if (Date.now() - entry.enqueuedAt > MAX_HOLD_MS) return last
+    // Once a streaming client has text on the wire the response is committed, so
+    // the hold deadline no longer applies: abandoning it mid-answer would leave
+    // the client with a truncated response and no explanation.
+    if (!entry.committed && Date.now() - entry.enqueuedAt > MAX_HOLD_MS) return last
 
     const lane = pickLane(tried)
     if (!lane) {
@@ -96,7 +164,7 @@ async function dispatch (entry) {
     const result = await new Promise((resolve) => {
       let settled = false
       const fin = (v) => { if (!settled) { settled = true; resolve(v) } }
-      const timer = setTimeout(() => fin({ kind: 'timeout', status: 0, ms: 120000, data: null }), 120000)
+      const timer = setTimeout(() => fin({ kind: 'timeout', status: 0, ms: ATTEMPT_HARD_MS, data: null }), ATTEMPT_HARD_MS)
       entry.pendingResolve = (v) => { clearTimeout(timer); fin(v) }
       waiting.set(entry.id, entry)
       queue.emit('assign', { entry, laneId: lane.id, attempt })
@@ -106,6 +174,7 @@ async function dispatch (entry) {
 
     if (result.kind === 'ok') {
       lanes.record(lane.id, 'ok', result.ms || 0)
+      noteModelResult(entry.job.model, result)
       return result
     }
 
@@ -123,6 +192,12 @@ async function dispatch (entry) {
 
     attempt++
 
+    // A permanent refusal is not retried. Three attempts at a 400 just holds the
+    // client through three round trips to reach the same answer.
+    if (!RETRYABLE.has(result.kind)) {
+      return last
+    }
+
     if (result.kind === 'limited') {
       // This egress IP is spent. Retire the lane so the orchestrator replaces it
       // with a runner holding a fresh bucket, then hand the work back.
@@ -133,6 +208,7 @@ async function dispatch (entry) {
     }
 
     lanes.record(lane.id, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
+    noteModelResult(entry.job.model, result)
     // Once text has been forwarded to the client the response is already
     // partially written, so retrying would duplicate text. Finish the response
     // with what arrived instead.
@@ -221,6 +297,20 @@ async function handleChat (req, res) {
       },
     })
   }
+
+  // Refuse a model that has been failing on every lane, naming the reason. This
+  // used to surface as a retried failure that looked like a rate limit.
+  const sick = modelHealthOf(model)
+  if (sick && sick.fails >= HEALTH_THRESHOLD) {
+    return json(res, 503, {
+      error: {
+        message: `model ${PROVIDER}/${model} is not answering upstream (${sick.note}, ` +
+          `${sick.fails} consecutive attempts). This is an upstream fault, not a rate limit. ` +
+          `Try another model from /v1/models.`,
+        type: 'upstream_unavailable',
+      },
+    }, { 'Retry-After': '60' })
+  }
   if (!Array.isArray(messages) || messages.length === 0) {
     return json(res, 400, { error: { message: 'messages is required', type: 'invalid_request_error' } })
   }
@@ -308,9 +398,13 @@ async function handleChat (req, res) {
       res.write('data: [DONE]\n\n')
       return res.end()
     }
+    const health = modelHealthOf(model)
     return json(res, 502, {
       error: {
-        message: `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
+        message: health && health.fails
+          ? `model ${PROVIDER}/${model} failed upstream: ${health.note}. ` +
+            `This is an upstream fault, not a rate limit.`
+          : `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
         type: 'upstream_unavailable',
       },
     }, { 'Retry-After': '5' })

@@ -16,14 +16,28 @@ const RESPONSES_MODELS = new Set([
   'muse-spark-1.3-contributor-free',
 ])
 
+// Measured through the live relay, 1-word probe, all nine advertised ids:
+//
+//   PASS  big-pickle                      4.3s
+//   PASS  nemotron-3-ultra-free           5.1s
+//   PASS  nemotron-3.5-lightning-free    18.3s
+//   PASS  mimo-v2.5-free                  1.8s
+//   PASS  mimo-v2.6-flash-free            2.0s
+//   PASS  muse-spark-1.2-contributor-free 4.5s
+//   PASS  muse-spark-1.3-contributor-free 1.8s
+//   FAIL  ling-3.0-flash-fin-free   400 "Endpoint is unavailable", fails in 2.5s
+//   FAIL  jev-1.13-free            never answers; 122s then times out
+//
+// The two failures are permanent, not flaky: the endpoint is gone, or the model
+// never produces a token. Advertising them guaranteed a client could pick one and
+// receive "no lane could serve this request (provider_error); it was retried 3x".
+// They are omitted rather than advertised-and-failing.
 export const MODELS = [
   { id: 'big-pickle', contextWindow: 200000 },
   { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
   { id: 'mimo-v2.5-free', contextWindow: 200000 },
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
-  { id: 'ling-3.0-flash-fin-free', contextWindow: 200000 },
-  { id: 'jev-1.13-free', contextWindow: 200000 },
   { id: 'muse-spark-1.2-contributor-free', contextWindow: 200000 },
   { id: 'muse-spark-1.3-contributor-free', contextWindow: 200000 },
 ]
