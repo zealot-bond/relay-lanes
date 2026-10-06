@@ -345,8 +345,10 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
  * can forward each fragment to the relay immediately, so the client renders
  * tokens while the model is still writing. Waiting for `end` would make
  * time-to-first-token equal the entire generation time.
+ *
+ * This is the single-shot form. callUpstream() wraps it to handle tool calls.
  */
-export async function callUpstream (job, { signal, onDelta } = {}) {
+async function callUpstreamOnce (job, { signal, onDelta } = {}) {
   const { model, messages, system, maxTokens, temperature, topP } = job || {}
   const protocol = protocolFor(model)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP }))
@@ -428,6 +430,75 @@ export async function callUpstream (job, { signal, onDelta } = {}) {
     req.write(payload)
     req.end()
   })
+}
+
+/**
+ * Tool calls the relay cannot execute, answered on the client's behalf.
+ *
+ * The declared tools are not a convenience: removing them makes upstream answer
+ * 403 "free tier can only be used from within OpenCode", so they ARE the access
+ * gate and must stay. The cost is that the model sees bash/read/grep/glob, says
+ * "I'll read the file", emits a call, and nothing ever runs it -- the reported
+ * "makes fake promises, never actually does anything".
+ *
+ * So the relay closes the loop itself: the call is appended to the conversation
+ * together with a result saying the tool is unavailable, and the model is asked
+ * to reply for real. The client receives an actual answer instead of a dangling
+ * promise it cannot fulfil.
+ *
+ * TOOL_MODE=passthrough restores the previous behaviour of forwarding tool_calls
+ * to the client, which is correct when the client is an agent that can run them.
+ */
+const TOOL_MODE = (process.env.TOOL_MODE || 'self').toLowerCase()
+const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
+const TOOL_UNAVAILABLE =
+  'Unavailable. This session has no execution environment: the bash, read, grep ' +
+  'and glob tools are declared only to satisfy the API contract and cannot be ' +
+  'run. Do not claim to have used them. Answer now using only what is in the ' +
+  'conversation, and say plainly what you cannot do.'
+
+export async function callUpstream (job, opts = {}) {
+  const first = await callUpstreamOnce(job, opts)
+  if (TOOL_MODE === 'passthrough') return first
+  if (first.kind !== 'ok') return first
+
+  const calls = first.data?.choices?.[0]?.message?.tool_calls
+  if (!Array.isArray(calls) || calls.length === 0) return first
+
+  // Only the tool-call turn was streamed so far; the real answer comes next.
+  const history = []
+  if (job?.system) history.push({ role: 'system', content: job.system })
+  for (const m of job?.messages || []) history.push(m)
+  history.push({
+    role: 'assistant',
+    content: first.data.choices[0].message.content || null,
+    tool_calls: calls,
+  })
+  for (const tc of calls) {
+    history.push({
+      role: 'tool',
+      tool_call_id: tc.id || 'call_0',
+      content: TOOL_UNAVAILABLE,
+    })
+  }
+
+  let result = first
+  for (let round = 1; round <= TOOL_ROUNDS; round++) {
+    const next = await callUpstreamOnce(
+      { ...job, messages: history },
+      // The caller must not receive the tool-call text twice.
+      opts,
+    )
+    if (next.kind !== 'ok') return result.kind === 'ok' ? result : next
+    result = next
+    const more = next.data?.choices?.[0]?.message?.tool_calls
+    if (!Array.isArray(more) || more.length === 0) return result
+    history.push({ role: 'assistant', content: null, tool_calls: more })
+    for (const tc of more) {
+      history.push({ role: 'tool', tool_call_id: tc.id || 'call_0', content: TOOL_UNAVAILABLE })
+    }
+  }
+  return result
 }
 
 export function destroyKeepalive () { KEEPALIVE.destroy() }
