@@ -82,6 +82,25 @@ let streamSeq = 0
  */
 const modelHealth = new Map()
 const HEALTH_THRESHOLD = Number(process.env.MODEL_HEALTH_THRESHOLD || 3)
+// Rolling log of upstream rejections. Without this the only thing visible was
+// "no lane could serve this request", which says nothing about why.
+const recentFailures = []
+
+function noteFailure (model, result) {
+  const raw = String(result.raw || '')
+  const detail = result.status
+    ? `HTTP ${result.status}${raw ? ` ${raw.slice(0, 160).replace(/\s+/g, ' ').trim()}` : ''}`
+    : result.kind
+  recentFailures.unshift({
+    at: new Date().toISOString().slice(11, 19),
+    model,
+    kind: result.kind,
+    status: result.status || 0,
+    detail: detail.slice(0, 200),
+  })
+  if (recentFailures.length > 40) recentFailures.length = 40
+  console.error(`[relay] upstream rejected ${model}: ${detail.slice(0, 200)}`)
+}
 
 export function noteModelResult (model, result) {
   const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '' }
@@ -99,8 +118,11 @@ export function noteModelResult (model, result) {
   }
   h.fails++
   h.lastKind = result.kind
-  h.note = result.status ? `upstream returned HTTP ${result.status}` : `upstream ${result.kind}`
+  h.note = result.status
+    ? `upstream returned HTTP ${result.status} (${String(result.raw || '').slice(0, 140).replace(/\s+/g, ' ').trim() || 'no body'})`
+    : `upstream ${result.kind}`
   modelHealth.set(model, h)
+  noteFailure(model, result)
 }
 
 export function modelHealthOf (model) {
@@ -126,7 +148,9 @@ export function modelHealthStats () {
  *                          time and produce a misleading message
  *   gate           no  - our own fingerprint is rejected, retrying changes nothing
  */
-const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error'])
+// Retried at most once (see dispatch). `gate` is excluded: a rejected
+// fingerprint is identical from every egress IP, so retrying cannot help.
+const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error', 'provider_error'])
 
 function pickLane (tried) {
   const candidates = lanes.liveLanes(45000).filter((l) => l.status !== 'exhausted')
@@ -192,9 +216,19 @@ async function dispatch (entry) {
 
     attempt++
 
-    // A permanent refusal is not retried. Three attempts at a 400 just holds the
-    // client through three round trips to reach the same answer.
-    if (!RETRYABLE.has(result.kind)) {
+    // Record the outcome BEFORE deciding whether to retry. An earlier version
+    // returned here first, so a permanent failure was never counted: the panel
+    // showed failed=0 while clients were being refused, and model health never
+    // tripped, which is why the misleading message kept coming back.
+    lanes.record(lane.id, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
+    noteModelResult(entry.job.model, result)
+
+    // A rejected fingerprint is not going to change on another IP. Everything
+    // else gets at most one more attempt: the two models whose endpoint was
+    // permanently gone are no longer advertised, so a 4xx on a listed model is
+    // most likely transient and deserves a second try -- but not three, which is
+    // what turned one rejection into three full round trips for the client.
+    if (result.kind === 'gate' || attempt >= 2 || !RETRYABLE.has(result.kind)) {
       return last
     }
 
@@ -207,8 +241,7 @@ async function dispatch (entry) {
       continue
     }
 
-    lanes.record(lane.id, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
-    noteModelResult(entry.job.model, result)
+    // Already recorded above; this pass only decides whether to try again.
     // Once text has been forwarded to the client the response is already
     // partially written, so retrying would duplicate text. Finish the response
     // with what arrived instead.
@@ -398,13 +431,15 @@ async function handleChat (req, res) {
       res.write('data: [DONE]\n\n')
       return res.end()
     }
-    const health = modelHealthOf(model)
+    // Use the failure in hand, not just quarantined state: the very first rejection
+    // must name the upstream reason, otherwise the client is told nothing useful.
+    const body = String(result.raw || '').slice(0, 180).replace(/\s+/g, ' ').trim()
+    const detail = body || (modelHealthOf(model) || {}).note || result.kind
     return json(res, 502, {
       error: {
-        message: health && health.fails
-          ? `model ${PROVIDER}/${model} failed upstream: ${health.note}. ` +
-            `This is an upstream fault, not a rate limit.`
-          : `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
+        message: `upstream rejected ${PROVIDER}/${model}: ${detail}` +
+          `${result.status ? ` (HTTP ${result.status})` : ''}. ` +
+          `This is an upstream fault, not a rate limit.`,
         type: 'upstream_unavailable',
       },
     }, { 'Retry-After': '5' })
@@ -571,6 +606,11 @@ export function createServer () {
         return json(res, 200, {
           ok: true, provider: PROVIDER, models: MODELS.length,
           ...lanes.stats(), queue: queue.stats(),
+          // Upstream rejections are the fastest way to see what the provider is
+          // doing wrong, so they are in the health payload rather than only in
+          // the client error.
+          modelHealth: modelHealthStats(),
+          recentFailures: recentFailures.slice(0, 10),
         })
       }
       if (path === '/dashboard') {
