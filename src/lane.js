@@ -185,33 +185,144 @@ function outputBudget (maxTokens) {
   return DEFAULT_OUTPUT_TOKENS
 }
 
+/**
+ * Normalise one message's content for the /v1/responses `input` array.
+ *
+ * The responses API is strict: a content part must be input_text or output_text,
+ * chosen by role, and a bare `String(content)` turns a client's content-parts
+ * array into the literal "[object Object]", which is how a multimodal turn became
+ * an unusable request. Returns null when there is nothing worth sending, so an
+ * empty assistant turn is dropped rather than sent as empty output_text.
+ */
+function responsesContent (content, role) {
+  const partType = role === 'assistant' ? 'output_text' : 'input_text'
+  if (content === null || content === undefined) return null
+
+  if (typeof content === 'string') {
+    return content.length ? [{ type: partType, text: content }] : null
+  }
+
+  if (Array.isArray(content)) {
+    const parts = []
+    for (const p of content) {
+      if (typeof p === 'string') {
+        if (p) parts.push({ type: partType, text: p })
+        continue
+      }
+      if (!p || typeof p !== 'object') continue
+      // Preserve images and other real parts; only rewrite text shape.
+      if (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') {
+        if (p.text) parts.push({ type: partType, text: p.text })
+        continue
+      }
+      if (p.type === 'image_url' || p.type === 'image') {
+        const url = p.image_url?.url ?? p.url ?? p.image_url
+        if (url) parts.push({ type: 'input_image', image_url: typeof url === 'string' ? url : url })
+        continue
+      }
+      if (p.type) { parts.push({ ...p, type: partType === 'output_text' ? 'output_text' : p.type }); continue }
+    }
+    return parts.length ? parts : null
+  }
+
+  if (typeof content === 'object') {
+    if (content.text) return [{ type: partType, text: content.text }]
+    return null
+  }
+  const s = String(content)
+  return s.length ? [{ type: partType, text: s }] : null
+}
+
+/**
+ * Translate OpenAI chat messages into the responses `input` array.
+ *
+ * This is the part that was wrong. Every message was emitted as
+ * `{type:'message', role:<role>, content:[...]}` -- including tool results. The
+ * responses API has no `role:'tool'` message: a tool result is a separate
+ * function_call_output item keyed by call_id, and an assistant turn that called a
+ * tool is a function_call item. Sending the message form produced
+ *
+ *   HTTP 400  `input[8]` did not match any supported type
+ *
+ * which surfaced to clients as "model is not answering upstream" and, because the
+ * position depends on conversation length, only failed once a conversation was
+ * long enough to contain a tool result -- so short tests always passed.
+ */
+function toResponsesInput (messages) {
+  const input = []
+  for (const m of messages || []) {
+    const role = m?.role
+
+    // Tool result -> function_call_output. This is the shape the API accepts.
+    if (role === 'tool' || role === 'function') {
+      const out = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
+      input.push({
+        type: 'function_call_output',
+        call_id: m.tool_call_id || m.call_id || m.id || 'call_0',
+        output: out,
+      })
+      continue
+    }
+
+    // An assistant turn that invoked tools is a function_call item, not a message.
+    if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      for (const tc of m.tool_calls) {
+        input.push({
+          type: 'function_call',
+          call_id: tc.id || tc.tool_call_id || 'call_0',
+          name: tc.function?.name || tc.name || '',
+          arguments: typeof tc.function?.arguments === 'string'
+            ? tc.function.arguments
+            : JSON.stringify(tc.function?.arguments ?? {}),
+        })
+      }
+      // A turn can carry both a tool call and text; keep the text as a message.
+    }
+
+    const responsesRole = role === 'assistant' ? 'assistant'
+      : (role === 'system' || role === 'developer') ? role
+        : 'user'
+
+    const content = responsesContent(m?.content, responsesRole)
+    if (content) input.push({ role: responsesRole, content })
+  }
+  return input
+}
+
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP }) {
   const protocol = protocolFor(model)
+
+  if (protocol === 'responses') {
+    // `system` is folded in as a leading message so ordering is preserved.
+    const merged = system
+      ? [{ role: 'system', content: system }, ...(messages || [])]
+      : (messages || [])
+    return {
+      model,
+      input: toResponsesInput(merged),
+      stream: true,                          // the responses endpoint requires it
+      tools: fingerprintToolSpecsResponses(),
+      max_output_tokens: outputBudget(maxTokens),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(topP !== undefined ? { top_p: topP } : {}),
+    }
+  }
+
+  // Chat dialect: keep the original messages, only normalise tool entries.
   const msgs = []
   if (system) msgs.push({ role: 'system', content: system })
   for (const m of messages || []) {
     if (m.role === 'tool') {
-      msgs.push({ role: 'tool', tool_call_id: m.tool_call_id || 'call_0', content: String(m.content ?? '') })
+      msgs.push({
+        role: 'tool',
+        tool_call_id: m.tool_call_id || 'call_0',
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+      })
+    } else if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      msgs.push({ role: 'assistant', content: m.content ?? null, tool_calls: m.tool_calls })
     } else {
       msgs.push({ role: m.role, content: m.content ?? '' })
     }
-  }
-
-  if (protocol === 'responses') {
-    const body = {
-      model,
-      input: msgs.map((m) => ({
-        type: 'message',
-        role: m.role,
-        content: [{ type: m.role === 'assistant' ? 'output_text' : 'input_text', text: String(m.content ?? '') }],
-      })),
-      stream: true,                          // the responses endpoint requires it
-      tools: fingerprintToolSpecsResponses(),
-      max_output_tokens: outputBudget(maxTokens),
-    }
-    if (temperature !== undefined) body.temperature = temperature
-    if (topP !== undefined) body.top_p = topP
-    return body
   }
 
   const body = {
@@ -325,3 +436,7 @@ export function destroyKeepalive () { KEEPALIVE.destroy() }
 // issuing a request. Same code path the lane uses, so a difference in behaviour
 // cannot be hidden by a second implementation.
 export const parseForTest = parseUpstream
+
+// The converter is unit-tested offline against a tool-using conversation, which
+// is how the `input[8]` shape bug was caught without needing a live request.
+export const buildForTest = buildUpstreamBody
