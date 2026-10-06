@@ -299,7 +299,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       : (messages || [])
     return {
       model,
-      input: toResponsesInput(merged),
+      input: toResponsesInput([ENVIRONMENT_PREAMBLE, ...merged]),
       stream: true,                          // the responses endpoint requires it
       tools: fingerprintToolSpecsResponses(),
       max_output_tokens: outputBudget(maxTokens),
@@ -309,7 +309,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
   }
 
   // Chat dialect: keep the original messages, only normalise tool entries.
-  const msgs = []
+  const msgs = [{ role: 'system', content: ENVIRONMENT_PREAMBLE }]
   if (system) msgs.push({ role: 'system', content: system })
   for (const m of messages || []) {
     if (m.role === 'tool') {
@@ -463,50 +463,51 @@ const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
 // same breath as the text can still cancel it. Negligible next to a multi-second
 // time-to-first-token, and it is the only way to avoid shipping the client a
 // promise the relay is about to retract.
-const TOOL_TEXT_HOLD_MS = Number(process.env.TOOL_TEXT_HOLD_MS || 250)
 
 /**
- * Per-round text sink that can retract.
+ * Injected into every request.
  *
- * The model emits "I'll read the file" and a tool call in the same response. Text
- * forwarded eagerly is already on the client's screen when the call turns up, and
- * SSE gives no way to take it back -- which is why the earlier self-answer fix
- * changed nothing visible: the promise had already been streamed. So text is
- * buffered briefly; a tool call discards the buffer and the round is redone.
+ * The tool declarations cannot be removed (upstream answers 403 without them), so
+ * the model keeps seeing bash/read/grep/glob and keeps narrating intent. Telling
+ * it up front that it has no execution environment stops the promise at the source
+ * rather than retracting it afterwards, which also avoids the two-rounds-
+ * interleaved garbling that retraction leaves behind when a call arrives late.
  */
-function makeRoundSink (onDelta, holdMs) {
-  let buf = []
-  let timer = null
-  let streaming = false
-  let retracted = false
+const ENVIRONMENT_PREAMBLE =
+  'You have no execution environment. The bash, read, grep and glob tools are ' +
+  'declared only to satisfy an API contract and cannot be run: there are no ' +
+  'files, no shell, and no network of your own.\n' +
+  'Rules you must follow:\n' +
+  '1. Never say you will, are going to, or have just read, run, opened or ' +
+  'checked anything. Do not narrate intentions.\n' +
+  '2. Answer directly with the information in the conversation. If a request ' +
+  'needs something you cannot access, say plainly that you cannot access it and ' +
+  'what the user should provide instead.\n' +
+  '3. To propose code, changes or commands, just show them. Treat showing code ' +
+  'as doing the work, not as promising it.\n' +
+  '4. Ask for what you need instead of waiting on tools that will never run.'
 
-  const flush = () => {
-    if (timer) { clearTimeout(timer); timer = null }
-    const text = buf.join('')
-    buf = []
-    streaming = true
-    if (text) onDelta(text)
-  }
-
-  return {
-    push (text) {
-      if (retracted || streaming) { if (!retracted) onDelta(text); return }
-      buf.push(text)
-      if (!timer) timer = setTimeout(flush, holdMs)
-    },
-    /** A tool call arrived: everything buffered for this round is discarded. */
-    retract () {
-      retracted = true
-      if (timer) { clearTimeout(timer); timer = null }
-      buf = []
-    },
-    /** Round finished: forward whatever is still held. */
-    finish () {
-      if (retracted) return
-      if (!streaming) flush()
-    },
-  }
-}
+/**
+ * Decide what to do with a tool call, given what the client has already seen.
+ *
+ * The three tempting behaviours are mutually exclusive once SSE is involved:
+ *
+ *   buffer then retract  retraction cannot unsend what already streamed, so a
+ *                        late call left partial text plus a second answer. That
+ *                        produced literal duplicates ("...help with it.I can't
+ *                        read README.md directly") and mid-sentence interleaving
+ *                        ("so I can't access you paste the contents of ` it").
+ *
+ *   re-ask unconditionally that duplication, every time.
+ *
+ *   never re-ask            true streaming, but a client that cannot execute
+ *                        tools gets a promise and nothing else.
+ *
+ * So: self-answer only when no text has been forwarded yet, which is the common
+ * case for a pure tool call. Once text is out, keep it and stop. The result is
+ * coherent output in every case, at the cost of not retrying a text+call turn --
+ * and the preamble makes that turn rare in the first place.
+ */
 const TOOL_UNAVAILABLE =
   'Unavailable. This session has no execution environment: the bash, read, grep ' +
   'and glob tools are declared only to satisfy the API contract and cannot be ' +
@@ -523,47 +524,42 @@ export async function callUpstream (job, opts = {}) {
   // no-op forward is correct and harmless.
   const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : () => {}
 
-  const sink = makeRoundSink(onDelta, TOOL_TEXT_HOLD_MS)
+  // One round: forward text as it arrives and remember whether any was sent.
+  const runRound = (roundJob) => {
+    let sentText = false
+    return callUpstreamOnce(roundJob, {
+      ...opts,
+      onDelta: (t) => { sentText = true; onDelta(t) },
+    }).then((r) => ({ r, sentText }))
+  }
 
-  const runRound = () => callUpstreamOnce(job, {
-    ...opts,
-    onDelta: (t) => sink.push(t),
-    onToolCall: () => sink.retract(),
-  })
-
-  let result = await runRound()
-  sink.finish()
+  let { r: result, sentText } = await runRound(job)
   if (TOOL_MODE !== 'self' || result.kind !== 'ok') return result
 
-  let calls = result.data?.choices?.[0]?.message?.tool_calls
+  const toolCallsOf = (r) => r.data?.choices?.[0]?.message?.tool_calls
+
+  // Text already delivered and a call alongside it: keep the text. Retracting is
+  // impossible in SSE and re-asking would duplicate it.
+  let calls = toolCallsOf(result)
   if (!Array.isArray(calls) || calls.length === 0) return result
+  if (sentText) return result
 
   const history = []
   if (job?.system) history.push({ role: 'system', content: job.system })
   for (const m of job?.messages || []) history.push(m)
-  history.push({ role: 'assistant', content: null, tool_calls: calls })
-  for (const tc of calls) {
-    history.push({ role: 'tool', tool_call_id: tc.id || 'call_0', content: TOOL_UNAVAILABLE })
-  }
 
   for (let round = 1; round <= TOOL_ROUNDS; round++) {
-    // Each follow-up round gets a fresh sink: its text is the answer the client
-    // should see, and a further tool call retracts it in turn.
-    const nextSink = makeRoundSink(onDelta, TOOL_TEXT_HOLD_MS)
-    const next = await callUpstreamOnce({ ...job, messages: history }, {
-      ...opts,
-      onDelta: (t) => nextSink.push(t),
-      onToolCall: () => nextSink.retract(),
-    })
-    nextSink.finish()
-    if (next.kind !== 'ok') return result
-    result = next
-    calls = result.data?.choices?.[0]?.message?.tool_calls
-    if (!Array.isArray(calls) || calls.length === 0) return result
     history.push({ role: 'assistant', content: null, tool_calls: calls })
     for (const tc of calls) {
       history.push({ role: 'tool', tool_call_id: tc.id || 'call_0', content: TOOL_UNAVAILABLE })
     }
+    const out = await runRound({ ...job, messages: history })
+    if (out.r.kind !== 'ok') return result
+    result = out.r
+    calls = toolCallsOf(result)
+    if (!Array.isArray(calls) || calls.length === 0) return result
+    // This round spoke before calling a tool: stop here and keep its text.
+    if (out.sentText) return result
   }
   return result
 }
