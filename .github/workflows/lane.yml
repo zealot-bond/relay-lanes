@@ -55,8 +55,20 @@ jobs:
           LANE_IDLE_EXIT_S: '420'
           REQUEST_TIMEOUT_MS: '45000'
           NODE_OPTIONS: '--dns-result-order=ipv4first'
+          # Which source supplied each value, for diagnosing the same-mask
+          # ambiguity between a dispatch input and a repo secret.
+          TOKEN_SOURCE: ${{ inputs.relay_token && 'input' || (secrets.RELAY_TOKEN && 'secret') || 'none' }}
         run: |
           set -uo pipefail
+          # Never print the token. A hash prefix plus the length is enough to tell
+          # "the dispatch input arrived" from "the repo secret fallback won",
+          # which is otherwise invisible because GitHub masks both values.
+          if [ -n "${RELAY_TOKEN:-}" ]; then
+            echo "token len=${#RELAY_TOKEN} sha=$(printf '%s' "$RELAY_TOKEN" | sha256sum | cut -c1-12)"
+          else
+            echo "token EMPTY"
+          fi
+          echo "relay set=$([ -n "${RELAY_URL:-}" ] && echo yes || echo no) token_source=${TOKEN_SOURCE:-unknown}"
           if [ -z "${RELAY_URL:-}" ]; then
             echo "no relay URL (dispatch input and RELAY_URL secret both empty); exiting"
             exit 0
