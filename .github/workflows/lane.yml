@@ -53,7 +53,11 @@ jobs:
           LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
           LANE_LIFETIME_S: '3300'
           LANE_IDLE_EXIT_S: '2400'
-          REQUEST_TIMEOUT_MS: '240000'
+          # Split by phase: prefill on a large prompt is slow but healthy,
+          # so allow a long wait for the first byte, then tighten once
+          # tokens are flowing.
+          FIRST_BYTE_TIMEOUT_MS: '600000'
+          STREAM_IDLE_TIMEOUT_MS: '120000'
           NODE_OPTIONS: '--dns-result-order=ipv4first'
           # Which source supplied each value, for diagnosing the same-mask
           # ambiguity between a dispatch input and a repo secret.

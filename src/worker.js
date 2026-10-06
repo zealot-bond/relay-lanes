@@ -23,6 +23,39 @@ const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 2400)
 // into one request.
 const DELTA_BATCH_MS = Number(process.env.DELTA_BATCH_MS || 40)
 
+/**
+ * Collapse streamed tool-call fragments into one entry per index.
+ *
+ * Batching is what makes streaming affordable, but naively concatenating the
+ * fragments produced this on the wire:
+ *
+ *   delta.tool_calls = [ {index:0, function:{name:null, arguments:"{\"file_path\": "}},
+ *                         {index:0, function:{name:null, arguments:"\""}}, ... ]
+ *
+ * Every fragment was its own array element, all sharing index 0, with no `id` and
+ * a null `name`. A strict tool-use validator reads that as one call missing its
+ * required properties -- which is exactly the reported failure:
+ *   invalid arguments: missing required property "file_path" / "old_string" / "new_string"
+ *
+ * One entry per index, arguments concatenated, identity fields taken from the first
+ * fragment that carries them, is what a client expects to reassemble.
+ */
+function mergeToolDeltas (frags) {
+  const byIndex = new Map()
+  for (const d of frags) {
+    const i = typeof d.index === 'number' ? d.index : 0
+    const cur = byIndex.get(i) || { index: i, type: 'function', function: { name: '', arguments: '' } }
+    if (d.id && !cur.id) cur.id = d.id
+    if (d.type && !cur.type) cur.type = d.type
+    if (d.function) {
+      if (d.function.name) cur.function.name += d.function.name
+      if (d.function.arguments) cur.function.arguments += d.function.arguments
+    }
+    byIndex.set(i, cur)
+  }
+  return [...byIndex.values()]
+}
+
 const H = { 'Content-Type': 'application/json', 'x-relay-token': TOKEN }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -117,7 +150,7 @@ async function main () {
       if (!hasText && !hasTools) return
       const body = { laneId: LANE_ID, entryId: claim.entryId }
       if (hasText) body.text = pending.join('')
-      if (hasTools) body.toolCalls = pendingTools
+      if (hasTools) body.toolCalls = mergeToolDeltas(pendingTools)
       pending = []
       pendingTools = []
       const r = await post('/lane/delta', body).catch(() => null)
@@ -126,6 +159,15 @@ async function main () {
     const schedule = () => {
       if (!deltaTimer) deltaTimer = setTimeout(flushDelta, DELTA_BATCH_MS)
     }
+
+    // A lane can legitimately be busy for minutes on a large prompt. Without this it
+    // stops heartbeating, the relay stops counting it as live, and it gets pruned
+    // as dead while it is actually working -- which shrinks the pool exactly when
+    // load is high.
+const busyHeartbeat = setInterval(() => {
+  post('/lane/heartbeat', { laneId: LANE_ID }).catch(() => {})
+}, 20000)
+busyHeartbeat.unref?.()
 
     const result = await callUpstream(claim.job, {
       // Only stream when the client asked for a stream. Sending deltas for a
@@ -146,6 +188,7 @@ async function main () {
         : undefined,
     })
     await flushDelta()
+    clearInterval(busyHeartbeat)
 
     if (result.kind === 'ok') served++
     else if (result.kind === 'limited') limited++

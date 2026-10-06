@@ -171,12 +171,33 @@ export function modelHealthStats () {
 // fingerprint is identical from every egress IP, so retrying cannot help.
 const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error', 'provider_error'])
 
+/**
+ * Choose a lane.
+ *
+ * This used to return `candidates[0]`, which is Map insertion order -- the
+ * oldest-registered lane. Six identical requests in a row all went to one lane
+ * while the other 19 sat idle, and a lane mid-way through a 200s request was the
+ * only reason any other got used at all.
+ *
+ * Now: lanes that have not yet seen this request are eligible, and among them the
+ * least-recently-used wins (the opposite of insertion order), with average
+ * observed latency as a tiebreak. A lane this request already failed on is only
+ * reused once every other option is exhausted.
+ */
 function pickLane (tried) {
   const candidates = lanes.liveLanes(45000).filter((l) => l.status !== 'exhausted')
+  if (!candidates.length) return null
+
   const fresh = candidates.filter((l) => !tried.has(l.id))
-  // Prefer a lane that has not already failed this request; only fall back to a
-  // reused lane once every known lane has been tried.
-  return fresh[0] || (candidates.length ? candidates[candidates.length - 1] : null)
+  const pool = fresh.length ? fresh : candidates
+
+  // Fewest observations first (unknown lanes get a trial), then lowest measured
+  // latency, then least recently seen.
+  return pool.slice().sort((a, b) => {
+    if (a.served !== b.served) return a.served - b.served
+    if (a.avgMs !== b.avgMs) return a.avgMs - b.avgMs
+    return a.lastSeen - b.lastSeen
+  })[0]
 }
 
 // Hard ceiling on one lane attempt. Generous, because a reasoning model can

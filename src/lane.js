@@ -24,25 +24,29 @@ import {
 import { protocolFor } from './models.js'
 
 /**
- * Per-request upstream timeout.
+ * Upstream timeouts, split by phase.
  *
- * This is a socket INACTIVITY timeout, not a total budget: Node resets it on
- * every byte received. That distinction matters because these are reasoning
- * models -- they can emit nothing for 30-60s while thinking, and the measured
- * cost of the old 45s cap was that it fired during exactly that gap and killed
- * long generations mid-answer. 412 timeouts against 2308 served on the panel.
+ * A single inactivity timeout cannot serve both phases. Measured: ~225k input
+ * tokens -> 6s TTFT, ~567k -> 7-14s, ~852k -> 237s. The large-input cost is
+ * prefill, during which the socket is silent but healthy. With one 240s
+ * inactivity cap, a big-but-successful prefill was killed at 240s and retried, so
+ * TTFT arrived as 240s x attempts -- the clean 4-minute figures users reported.
  *
- * A stream that keeps producing tokens can therefore run for as long as it likes;
- * only a genuinely wedged connection is abandoned.
+ * So: a generous budget until the FIRST byte (prefill is allowed to be slow),
+ * then a tight inactivity budget, because once tokens are flowing a stall is
+ * genuinely wedged.
  */
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 240000)
+const FIRST_BYTE_TIMEOUT_MS = Number(process.env.FIRST_BYTE_TIMEOUT_MS || 600000)
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env.STREAM_IDLE_TIMEOUT_MS || 120000)
 
 const KEEPALIVE = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
   maxSockets: 16,
   maxFreeSockets: 8,
-  timeout: REQUEST_TIMEOUT_MS,
+  // Must outlast the first-byte budget, otherwise the agent kills the socket
+  // before prefill completes.
+  timeout: FIRST_BYTE_TIMEOUT_MS + 60000,
 })
 
 /**
@@ -109,9 +113,11 @@ function parseUpstream (raw, model, onText) {
         if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
       }
     }
-    // The responses dialect reports tool activity differently.
+    // The responses dialect reports tool activity differently. Keyed by
+    // output_index rather than append order: interleaved calls would otherwise merge
+    // their arguments into whichever entry happened to be last.
     if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
-      const at = toolCalls.length
+      const at = typeof ev.output_index === 'number' ? ev.output_index : toolCalls.length
       toolCalls[at] = {
         id: ev.item.id || '',
         type: 'function',
@@ -289,6 +295,11 @@ function toResponsesInput (messages) {
   return input
 }
 
+/** Tool name from either dialect: chat nests it, responses flattens it. */
+function nameOfTool (t) {
+  return t?.function?.name || t?.name || null
+}
+
 /**
  * Chat-completions tool specs -> responses tool specs.
  *
@@ -314,17 +325,25 @@ function toResponsesTools (tools) {
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools }) {
   const protocol = protocolFor(model)
 
-  // The client's own tool list is forwarded when it supplies one.
+  // The client's tools are ADDED to the fingerprint tools, never substituted.
   //
-  // The gateway needs *a* tool declaration to grant free-tier access (without any
-  // it answers 403), but hardcoded placeholders describe tools the caller does not
-  // have. For an agent harness that is actively harmful: it declares read/bash and
-  // the relay advertises read/bash/glob/grep with no `write` or `edit`, so the model
-  // calls tools the harness never offered and the harness never sees a call it can
-  // run. The client's real specs satisfy the gateway and describe reality.
-  const useClientTools = Array.isArray(tools) && tools.length > 0
-  const chatTools = useClientTools ? tools : fingerprintToolSpecs()
-  const respTools = useClientTools ? toResponsesTools(tools) : fingerprintToolSpecsResponses()
+  // The gateway needs the fingerprint tool names present to grant free-tier
+  // access. Substituting the client's list broke that: a client declaring only
+  // `edit` removed bash/glob/grep/read and upstream answered 403, which surfaced
+  // as "no lane could serve this request (gate)". A union keeps the gate satisfied
+  // while still advertising the real tools the harness will run -- so the model can
+  // actually call `edit`, `write`, or anything else the caller provides.
+  const clientTools = Array.isArray(tools) ? tools : []
+  const clientNames = new Set(clientTools.map(nameOfTool).filter(Boolean))
+
+  const chatTools = [
+    ...fingerprintToolSpecs().filter((t) => !clientNames.has(t.function.name)),
+    ...clientTools,
+  ]
+  const respTools = [
+    ...fingerprintToolSpecsResponses().filter((t) => !clientNames.has(t.name)),
+    ...toResponsesTools(clientTools),
+  ]
 
   if (protocol === 'responses') {
     // `system` is folded in as a leading message so ordering is preserved.
@@ -391,6 +410,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
   const started = Date.now()
   return new Promise((resolve) => {
     let settled = false
+    let sawByte = false
     const fin = (v) => { if (!settled) { settled = true; resolve(v) } }
 
     const req = https.request({
@@ -408,7 +428,18 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       // Incremental SSE decode. Only complete `data:` lines are parsed, so a
       // frame split across two TCP reads is never mangled into invalid JSON.
       let carry = ''
+      // Tracks which output_index is currently receiving arguments, and the last
+      // index seen, so the responses dialect can assign real positions.
+      let activeCall = -1
+      let nextOutputIndex = 0
+      const callsByIndex = new Map()
       res.on('data', (c) => {
+        if (!sawByte) {
+          sawByte = true
+          // First byte arrived, so the slow-prefill budget is spent; from here a
+          // silent socket is a stall rather than legitimate prefill.
+          req.setTimeout(STREAM_IDLE_TIMEOUT_MS)
+        }
         chunks.push(c)
         if (!onDelta && !onToolCall && !onToolDelta) return
         carry += c.toString('utf8')
@@ -440,17 +471,22 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
           }
           if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
             onToolCall?.()
-            // The responses dialect reports tools differently; translate to the
-            // chat shape so a chat client sees one consistent format.
-            onToolDelta?.([{
-              index: 0,
-              id: ev.item.id || '',
-              type: 'function',
-              function: { name: ev.item.name || '', arguments: '' },
-            }])
+            // The responses dialect reports tools differently; translate to the chat
+            // shape so a chat client sees one consistent format.
+            //
+            // output_index is the real position. Hardcoding 0 -- as this did -- made
+            // every parallel call collide on one index, so a client reassembling by
+            // index merged separate calls' arguments into one malformed object.
+            activeCall = typeof ev.output_index === 'number' ? ev.output_index : nextOutputIndex++
+            callsByIndex.set(activeCall, { index: activeCall, id: ev.item.id || '', type: 'function', function: { name: ev.item.name || '', arguments: '' } })
+            onToolDelta?.([{ ...callsByIndex.get(activeCall) }])
           }
           if (ev?.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
-            onToolDelta?.([{ index: 0, function: { arguments: ev.delta } }])
+            const cur = callsByIndex.get(activeCall)
+            if (cur) {
+              cur.function.arguments += ev.delta
+              onToolDelta?.([{ index: cur.index, function: { arguments: ev.delta } }])
+            }
           }
 
           const text = ev?.choices?.[0]?.delta?.content ??
@@ -482,9 +518,16 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       })
     })
 
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy()
-      fin({ kind: 'timeout', status: 0, raw: '', data: null, ms: Date.now() - started })
+    // Phase 1: waiting on the first byte. Prefill on a large prompt is slow but
+    // healthy, so the budget is long. Phase 2: after tokens start, a silent
+    // socket means something is wedged, so the budget tightens sharply.
+    req.setTimeout(FIRST_BYTE_TIMEOUT_MS, () => {
+      if (sawByte) {
+        req.destroy()
+        fin({ kind: 'timeout', status: 0, raw: '', data: null, ms: Date.now() - started })
+      } else {
+        req.setTimeout(STREAM_IDLE_TIMEOUT_MS)
+      }
     })
     req.on('error', (e) => fin({ kind: 'error', status: 0, raw: String(e.message), data: null, ms: Date.now() - started }))
     if (signal) {
