@@ -149,22 +149,31 @@ async function main () {
       const busy = q.pending > 0 || q.inflight > 0
       const target = busy ? TARGET : STANDBY
 
-      // Size against the lanes THIS relay can actually see, not GitHub's run
-      // count. GitHub reported active=0 while 20 lanes were demonstrably
-      // registered and serving, and the orchestrator believed it: 60 wasted
-      // dispatches in four minutes (53 -> 113 in one hour) for a pool that was
-      // already full. A run that exists upstream but whose lane has not checked in
-      // is not a lane that can take work, so only the relay's own view counts.
+      // Count capacity as whichever view is HIGHER, because they fail in opposite
+      // directions and each failure mode was observed live:
+      //
+      //   GitHub under-reports: reported active=0 while 20 lanes were registered
+      //   and serving -> 60 wasted dispatches in four minutes.
+      //
+      //   lanes under-reports: immediately after a relay restart the registry is
+      //   empty while 100+ runs are already queued -> the relay fired 20 more per
+      //   tick, pushing the queue past 120.
+      //
+      // A queued run is a lane that will exist, so max() is the safe reading: it
+      // dispatches only when neither view shows a pool.
       const liveLanes = lanes.liveLanes(LANE_FRESH_MS).length
-      const deficit = target - liveLanes
+      const capacity = Math.max(liveLanes, active + queued)
+      const deficit = target - capacity
       const left = budgetLeft()
 
       if (left <= 0) {
-        console.log(`${stamp()} [orch] lanes=${liveLanes} want=${target} pending=${q.pending} ` +
-          `but hourly dispatch budget spent (${dispatches.length}/${BUDGET_PER_HOUR}) -- holding off`)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} want=${target} ` +
+          `pending=${q.pending} but hourly dispatch budget spent ` +
+          `(${dispatches.length}/${BUDGET_PER_HOUR}) -- holding off`)
       } else if (Date.now() < cooldownUntil) {
         const wait = Math.ceil((cooldownUntil - Date.now()) / 1000)
-        console.log(`${stamp()} [orch] lanes=${liveLanes} want=${target} pending=${q.pending} cooling down ${wait}s`)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} want=${target} ` +
+          `pending=${q.pending} cooling down ${wait}s`)
       } else if (deficit > 0) {
         // Fire the whole deficit at once, spaced just enough to avoid the API's
         // secondary rate limits. A cold start goes from ~30 minutes to seconds.
@@ -203,7 +212,8 @@ async function main () {
             `(${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
         }
       } else {
-        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} at target (${target})`)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} ` +
+          `capacity=${capacity} at target (${target})`)
       }
     } catch (e) {
       if (/404/.test(e.message) && !warnedMissing) {

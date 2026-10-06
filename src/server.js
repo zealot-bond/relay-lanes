@@ -82,6 +82,11 @@ let streamSeq = 0
  */
 const modelHealth = new Map()
 const HEALTH_THRESHOLD = Number(process.env.MODEL_HEALTH_THRESHOLD || 3)
+// How long a quarantined model stays refused before one probe request is let
+// through. Without this the quarantine is permanent: a short burst of upstream
+// 400s left muse-spark 1.3 refusing every request -- including plain ones -- until
+// the process was restarted. Half-open, like a circuit breaker.
+const QUARANTINE_MS = Number(process.env.MODEL_QUARANTINE_MS || 120000)
 // Rolling log of upstream rejections. Without this the only thing visible was
 // "no lane could serve this request", which says nothing about why.
 const recentFailures = []
@@ -103,21 +108,24 @@ function noteFailure (model, result) {
 }
 
 export function noteModelResult (model, result) {
-  const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '' }
+  const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '', until: 0 }
   if (result.kind === 'ok') {
     h.fails = 0
     h.note = ''
+    h.until = 0
     modelHealth.set(model, h)
     return
   }
   // Exhaustion and empty answers are per-egress, not per-model.
   if (result.kind === 'limited' || result.kind === 'empty') {
     h.fails = 0
+    h.until = 0
     modelHealth.set(model, h)
     return
   }
   h.fails++
   h.lastKind = result.kind
+  h.until = Date.now() + QUARANTINE_MS
   h.note = result.status
     ? `upstream returned HTTP ${result.status} (${String(result.raw || '').slice(0, 140).replace(/\s+/g, ' ').trim() || 'no body'})`
     : `upstream ${result.kind}`
@@ -128,12 +136,23 @@ export function noteModelResult (model, result) {
 export function modelHealthOf (model) {
   const h = modelHealth.get(model)
   if (!h || h.fails < HEALTH_THRESHOLD) return null
+  // Expired: let a probe through so a recovered model comes back on its own.
+  if (h.until && Date.now() > h.until) return null
   return h
 }
 
 export function modelHealthStats () {
   const out = {}
-  for (const [m, h] of modelHealth) if (h.fails > 0) out[m] = { fails: h.fails, note: h.note }
+  const now = Date.now()
+  for (const [m, h] of modelHealth) {
+    if (h.fails <= 0) continue
+    out[m] = {
+      fails: h.fails,
+      note: h.note,
+      quarantined: h.fails >= HEALTH_THRESHOLD && (!h.until || now <= h.until),
+      retryInS: h.until > now ? Math.ceil((h.until - now) / 1000) : 0,
+    }
+  }
   return out
 }
 
@@ -335,14 +354,15 @@ async function handleChat (req, res) {
   // used to surface as a retried failure that looked like a rate limit.
   const sick = modelHealthOf(model)
   if (sick && sick.fails >= HEALTH_THRESHOLD) {
+    const retryIn = Math.max(1, Math.ceil(((sick.until || Date.now()) - Date.now()) / 1000))
     return json(res, 503, {
       error: {
         message: `model ${PROVIDER}/${model} is not answering upstream (${sick.note}, ` +
           `${sick.fails} consecutive attempts). This is an upstream fault, not a rate limit. ` +
-          `Try another model from /v1/models.`,
+          `Retrying automatically in ${retryIn}s, or use another model from /v1/models.`,
         type: 'upstream_unavailable',
       },
-    }, { 'Retry-After': '60' })
+    }, { 'Retry-After': String(retryIn) })
   }
   if (!Array.isArray(messages) || messages.length === 0) {
     return json(res, 400, { error: { message: 'messages is required', type: 'invalid_request_error' } })
