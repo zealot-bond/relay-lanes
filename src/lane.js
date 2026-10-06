@@ -289,8 +289,42 @@ function toResponsesInput (messages) {
   return input
 }
 
-function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP }) {
+/**
+ * Chat-completions tool specs -> responses tool specs.
+ *
+ * The two dialects nest the function definition differently: chat puts it under
+ * `function`, the responses endpoint flattens it to the top level. Forwarding a
+ * client's specs unchanged made the responses endpoint reject the request.
+ */
+function toResponsesTools (tools) {
+  return tools.map((t) => {
+    if (t.type !== 'function' || !t.function) {
+      // Already flat (responses-shaped) or a non-function tool: pass through.
+      return t
+    }
+    return {
+      type: 'function',
+      name: t.function.name,
+      description: t.function.description || '',
+      parameters: t.function.parameters || { type: 'object', properties: {} },
+    }
+  })
+}
+
+function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools }) {
   const protocol = protocolFor(model)
+
+  // The client's own tool list is forwarded when it supplies one.
+  //
+  // The gateway needs *a* tool declaration to grant free-tier access (without any
+  // it answers 403), but hardcoded placeholders describe tools the caller does not
+  // have. For an agent harness that is actively harmful: it declares read/bash and
+  // the relay advertises read/bash/glob/grep with no `write` or `edit`, so the model
+  // calls tools the harness never offered and the harness never sees a call it can
+  // run. The client's real specs satisfy the gateway and describe reality.
+  const useClientTools = Array.isArray(tools) && tools.length > 0
+  const chatTools = useClientTools ? tools : fingerprintToolSpecs()
+  const respTools = useClientTools ? toResponsesTools(tools) : fingerprintToolSpecsResponses()
 
   if (protocol === 'responses') {
     // `system` is folded in as a leading message so ordering is preserved.
@@ -299,9 +333,9 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       : (messages || [])
     return {
       model,
-      input: toResponsesInput([ENVIRONMENT_PREAMBLE, ...merged]),
+      input: toResponsesInput(merged),
       stream: true,                          // the responses endpoint requires it
-      tools: fingerprintToolSpecsResponses(),
+      tools: respTools,
       max_output_tokens: outputBudget(maxTokens),
       ...(temperature !== undefined ? { temperature } : {}),
       ...(topP !== undefined ? { top_p: topP } : {}),
@@ -309,7 +343,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
   }
 
   // Chat dialect: keep the original messages, only normalise tool entries.
-  const msgs = [{ role: 'system', content: ENVIRONMENT_PREAMBLE }]
+  const msgs = []
   if (system) msgs.push({ role: 'system', content: system })
   for (const m of messages || []) {
     if (m.role === 'tool') {
@@ -329,7 +363,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
     model,
     messages: msgs,
     stream: true,                            // free tier refuses stream:false
-    tools: fingerprintToolSpecs(),
+    tools: chatTools,
     max_tokens: outputBudget(maxTokens),
   }
   if (temperature !== undefined) body.temperature = temperature
@@ -348,10 +382,10 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
  *
  * This is the single-shot form. callUpstream() wraps it to handle tool calls.
  */
-async function callUpstreamOnce (job, { signal, onDelta, onToolCall } = {}) {
-  const { model, messages, system, maxTokens, temperature, topP } = job || {}
+async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta } = {}) {
+  const { model, messages, system, maxTokens, temperature, topP, tools } = job || {}
   const protocol = protocolFor(model)
-  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP }))
+  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools }))
   const url = new URL(ZEN_BASE + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
 
   const started = Date.now()
@@ -376,7 +410,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall } = {}) {
       let carry = ''
       res.on('data', (c) => {
         chunks.push(c)
-        if (!onDelta && !onToolCall) return
+        if (!onDelta && !onToolCall && !onToolDelta) return
         carry += c.toString('utf8')
         let nl
         while ((nl = carry.indexOf('\n')) !== -1) {
@@ -392,8 +426,32 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall } = {}) {
           // otherwise the client is shown "I'll read that file" and only then
           // finds out nothing will run it.
           const tc = ev?.choices?.[0]?.delta?.tool_calls
-          if (Array.isArray(tc) && tc.length) onToolCall?.()
-          if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') onToolCall?.()
+          if (Array.isArray(tc) && tc.length) {
+            onToolCall?.()
+            // Forwarded verbatim: an agent harness reassembles tool_calls from these
+            // deltas, and dropping them is why a harness saw the model's intent
+            // text and then nothing at all.
+            onToolDelta?.(tc.map((d) => ({
+              index: typeof d.index === 'number' ? d.index : 0,
+              ...(d.id ? { id: d.id } : {}),
+              ...(d.type ? { type: d.type } : {}),
+              ...(d.function ? { function: d.function } : {}),
+            })))
+          }
+          if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
+            onToolCall?.()
+            // The responses dialect reports tools differently; translate to the
+            // chat shape so a chat client sees one consistent format.
+            onToolDelta?.([{
+              index: 0,
+              id: ev.item.id || '',
+              type: 'function',
+              function: { name: ev.item.name || '', arguments: '' },
+            }])
+          }
+          if (ev?.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
+            onToolDelta?.([{ index: 0, function: { arguments: ev.delta } }])
+          }
 
           const text = ev?.choices?.[0]?.delta?.content ??
             (ev?.type === 'response.output_text.delta' ? ev.delta : undefined)
@@ -457,36 +515,12 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall } = {}) {
  * TOOL_MODE=passthrough restores the previous behaviour of forwarding tool_calls
  * to the client, which is correct when the client is an agent that can run them.
  */
-const TOOL_MODE = (process.env.TOOL_MODE || 'self').toLowerCase()
-const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
-// Text is held this long before being forwarded, so a tool call arriving in the
-// same breath as the text can still cancel it. Negligible next to a multi-second
-// time-to-first-token, and it is the only way to avoid shipping the client a
-// promise the relay is about to retract.
-
-/**
- * Injected into every request.
- *
- * The tool declarations cannot be removed (upstream answers 403 without them), so
- * the model keeps seeing bash/read/grep/glob and keeps narrating intent. Telling
- * it up front that it has no execution environment stops the promise at the source
- * rather than retracting it afterwards, which also avoids the two-rounds-
- * interleaved garbling that retraction leaves behind when a call arrives late.
- */
-const ENVIRONMENT_PREAMBLE =
-  'You have no execution environment. The bash, read, grep and glob tools are ' +
-  'declared only to satisfy an API contract and cannot be run: there are no ' +
-  'files, no shell, and no network of your own.\n' +
-  'Rules you must follow:\n' +
-  '1. Never say you will, are going to, or have just read, run, opened or ' +
-  'checked anything. Do not narrate intentions.\n' +
-  '2. Answer directly with the information in the conversation. If a request ' +
-  'needs something you cannot access, say plainly that you cannot access it and ' +
-  'what the user should provide instead.\n' +
-  '3. To propose code, changes or commands, just show them. Treat showing code ' +
-  'as doing the work, not as promising it.\n' +
-  '4. Ask for what you need instead of waiting on tools that will never run.'
-
+// Default is passthrough: the caller is an agent harness that runs its own tools,
+// so a tool_call must reach it untouched. 'self' (answering tool calls with prose
+// and forbidding them in a preamble) is wrong for a harness -- it turned every
+// "I'll read the configs" into narration followed by nothing, which is exactly the
+// "fake promise" symptom.
+const TOOL_MODE = (process.env.TOOL_MODE || 'passthrough').toLowerCase()
 /**
  * Decide what to do with a tool call, given what the client has already seen.
  *
@@ -548,6 +582,7 @@ export async function callUpstream (job, opts = {}) {
   if (job?.system) history.push({ role: 'system', content: job.system })
   for (const m of job?.messages || []) history.push(m)
 
+  const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
   for (let round = 1; round <= TOOL_ROUNDS; round++) {
     history.push({ role: 'assistant', content: null, tool_calls: calls })
     for (const tc of calls) {

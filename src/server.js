@@ -413,11 +413,17 @@ async function handleChat (req, res) {
   // Registered after push (which assigns the id) but before dispatch, so a fast
   // lane cannot have its first delta arrive with nowhere to go.
   if (stream) {
-    streamers.set(entry.id, (text) => {
-      if (!text) return
+    streamers.set(entry.id, (text, toolCalls) => {
+      // Text and tool calls are separate delta shapes. An agent harness reads
+      // delta.tool_calls and delta.tool_calls[].function to decide what to run, so
+      // these must be emitted in the standard chat format, not folded into text.
+      const delta = {}
+      if (text) delta.content = text
+      if (toolCalls && toolCalls.length) delta.tool_calls = toolCalls
+      if (!Object.keys(delta).length) return
       res.write(`data: ${JSON.stringify({
         id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
-        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+        choices: [{ index: 0, delta, finish_reason: null }],
       })}\n\n`)
     })
   }
@@ -491,7 +497,15 @@ async function handleChat (req, res) {
   if (!alreadyStreamed) {
     chunk({ content: completion.choices[0]?.message?.content ?? '' })
   }
-  chunk({}, completion.choices[0]?.finish_reason || 'stop')
+  // A tool call must surface as finish_reason "tool_calls" so the harness stops
+// reading text and executes the call. Defaulting to "stop" made a harness treat
+// the turn as a finished answer -- the model said what it was about to do and the
+// stream ended, which is precisely the "fake promise" symptom.
+const buffered = completion.choices[0]?.message
+const finishReason = buffered?.tool_calls?.length
+  ? 'tool_calls'
+  : (completion.choices[0]?.finish_reason || 'stop')
+chunk({}, finishReason)
   if (completion.usage) {
     res.write(`data: ${JSON.stringify({
       id, object: 'chat.completion.chunk', created, model, choices: [], usage: completion.usage,
@@ -602,7 +616,7 @@ async function laneDelta (req, res) {
 
   const entry = waiting.get(entryId)
   if (entry) entry.committed = true
-  writer(body.text ?? '')
+  writer(body.text ?? '', Array.isArray(body.toolCalls) ? body.toolCalls : null)
   return json(res, 200, { ok: true })
 }
 

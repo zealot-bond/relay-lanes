@@ -107,16 +107,24 @@ async function main () {
     // time-to-first-token near upstream latency while collapsing a burst of
     // tokens into one request.
     let pending = []
+    let pendingTools = []
     let deltaTimer = null
     let streamedAny = false
     const flushDelta = async () => {
       if (deltaTimer) { clearTimeout(deltaTimer); deltaTimer = null }
-      if (!pending.length) return
-      const text = pending.join('')
+      const hasText = pending.length > 0
+      const hasTools = pendingTools.length > 0
+      if (!hasText && !hasTools) return
+      const body = { laneId: LANE_ID, entryId: claim.entryId }
+      if (hasText) body.text = pending.join('')
+      if (hasTools) body.toolCalls = pendingTools
       pending = []
-      const r = await post('/lane/delta', { laneId: LANE_ID, entryId: claim.entryId, text })
-        .catch(() => null)
+      pendingTools = []
+      const r = await post('/lane/delta', body).catch(() => null)
       if (r?.ok) streamedAny = true
+    }
+    const schedule = () => {
+      if (!deltaTimer) deltaTimer = setTimeout(flushDelta, DELTA_BATCH_MS)
     }
 
     const result = await callUpstream(claim.job, {
@@ -125,7 +133,15 @@ async function main () {
       onDelta: claim.job.stream
         ? (text) => {
             pending.push(text)
-            if (!deltaTimer) deltaTimer = setTimeout(flushDelta, DELTA_BATCH_MS)
+            schedule()
+          }
+        : undefined,
+      // Tool-call deltas must reach an agent harness exactly like text does:
+      // it reassembles the call from these to know which tool to run.
+      onToolDelta: claim.job.stream
+        ? (deltas) => {
+            pendingTools.push(...deltas)
+            schedule()
           }
         : undefined,
     })
