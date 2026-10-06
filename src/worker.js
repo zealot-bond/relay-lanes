@@ -7,10 +7,15 @@ const RELAY = (process.env.RELAY_URL || 'http://127.0.0.1:8791').replace(/\/$/, 
 const TOKEN = process.env.RELAY_TOKEN || 'relay'
 const LANE_ID = process.env.LANE_ID ||
   `runner-${process.env.GITHUB_RUN_ID || 'local'}-${process.env.GITHUB_RUN_ATTEMPT || '0'}`
-const MAX_LIFETIME_S = Number(process.env.LANE_LIFETIME_S || 270)
+const MAX_LIFETIME_S = Number(process.env.LANE_LIFETIME_S || 540)
 // Exit a little earlier than the job timeout so the run exits cleanly instead of
 // being killed, which would leave the claim to expire.
-const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 100)
+//
+// Idle lanes used to exit after 90s, which churned the pool: the orchestrator saw
+// fewer live runs and kept dispatching replacements. Measured overnight: 3212
+// workflow runs for a pool of 20. A lane now parks far longer, so a burst of
+// work does not pay for a fresh runner every minute.
+const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 420)
 
 const H = { 'Content-Type': 'application/json', 'x-relay-token': TOKEN }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -36,13 +41,20 @@ async function main () {
     repo: process.env.GITHUB_REPOSITORY,
   })
   if (!reg?.ok) {
+    if (reg?.error === 'lane capacity reached') {
+      // Not a failure. The pool is full, so this runner has no work to do and
+      // exiting immediately avoids burning runner minutes for nothing.
+      console.log('[lane] relay is at lane capacity; nothing to do')
+      destroyKeepalive()
+      process.exit(0)
+    }
     console.error('[lane] registration failed:', JSON.stringify(reg))
     process.exit(1)
   }
   console.log(`[lane] registered ${LANE_ID} (queue depth ${reg.queueDepth})`)
 
   const started = Date.now()
-  let served = 0, limited = 0, failed = 0, timeouts = 0
+  let served = 0, limited = 0, failed = 0, timeouts = 0, empty = 0
   let lastWork = Date.now()
 
   while ((Date.now() - started) / 1000 < MAX_LIFETIME_S) {
@@ -70,6 +82,7 @@ async function main () {
     if (result.kind === 'ok') served++
     else if (result.kind === 'limited') limited++
     else if (result.kind === 'timeout') timeouts++
+    else if (result.kind === 'empty') empty++
     else failed++
 
     console.log(`[lane] ${claim.job?.model} -> ${result.kind} (${result.ms}ms)`)
@@ -90,13 +103,13 @@ async function main () {
       // This egress IP is spent. Exit so the orchestrator starts a replacement
       // runner, which gets a fresh bucket.
       console.log(`[lane] bucket exhausted after ${served} served; retiring this lane`)
-      console.log(`[lane] totals served=${served} limited=${limited} timeouts=${timeouts} failed=${failed}`)
+      console.log(`[lane] totals served=${served} limited=${limited} timeouts=${timeouts} empty=${empty} failed=${failed}`)
       destroyKeepalive()
       process.exit(75)   // distinctive: burned IP, not a crash
     }
   }
 
-  console.log(`[lane] lifetime done served=${served} limited=${limited} timeouts=${timeouts} failed=${failed}`)
+  console.log(`[lane] lifetime done served=${served} limited=${limited} timeouts=${timeouts} empty=${empty} failed=${failed}`)
   destroyKeepalive()
   process.exit(0)
 }

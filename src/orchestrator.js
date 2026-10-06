@@ -11,20 +11,25 @@
 // own lane registry is the source of truth for liveness.
 
 import https from 'node:https'
+import { config } from './config.js'
+import { queue } from './server.js'
 
-const TOKEN = process.env.GH_TOKEN || ''
-const REPO = process.env.GH_REPO || ''
-const WORKFLOW = process.env.GH_WORKFLOW || 'lane.yml'
-const REF = process.env.GH_REF || 'main'
-const TARGET = Number(process.env.LANES_TARGET || 20)
-const TICK_MS = Number(process.env.ORCH_TICK_MS || 20000)
+const TOKEN = config.GH_TOKEN
+const REPO = config.GH_REPO
+const WORKFLOW = config.GH_WORKFLOW
+const REF = config.GH_REF
+const TARGET = config.LANES_TARGET
+const TICK_MS = config.ORCH_TICK_MS
+// Lanes kept warm while the relay is idle: enough to absorb a burst instantly,
+// without paying for a full pool around an empty queue.
+const STANDBY = Number(process.env.LANES_STANDBY || 4)
 const API = 'https://api.github.com'
-const PORT = Number(process.env.PORT || 8791)
+const PORT = config.PORT
 // The lane needs to reach this relay. Passing it as a dispatch input means the
 // jar never has to be told its own public URL, which is the one value that is
 // impossible to know reliably from inside a container.
-const RELAY_TOKEN = process.env.RELAY_TOKEN || ''
-const PUBLIC_URL = (process.env.RELAY_PUBLIC_URL || '').replace(/\/$/, '')
+const RELAY_TOKEN = config.RELAY_TOKEN
+const PUBLIC_URL = config.RELAY_PUBLIC_URL.replace(/\/$/, '')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const stamp = () => new Date().toISOString().slice(11, 19)
@@ -93,7 +98,8 @@ async function main () {
     return
   }
   const relayUrl = await resolveRelayUrl()
-  console.log(`[orch] repo=${REPO} workflow=${WORKFLOW} target=${TARGET} every ${TICK_MS / 1000}s`)
+  console.log(`[orch] repo=${REPO} workflow=${WORKFLOW} target=${TARGET} standby=${STANDBY} ` +
+    `every ${TICK_MS / 1000}s`)
   console.log(`[orch] lanes will call back on ${relayUrl || '(unknown: dispatching without a url!)'}`)
   if (!relayUrl) {
     console.error('[orch] no relay URL could be determined; set RELAY_PUBLIC_URL in baked-credentials.json')
@@ -103,44 +109,77 @@ async function main () {
   // otherwise repeats forever and the pool silently stays empty, which looks
   // exactly like "the code is broken" from the outside.
   let warnedMissing = false
+
+  // Runaway guard. Overnight this dispatched 3212 workflow runs in ~10 hours for a
+  // pool of 20 lanes, because every lane exited after 90s idle and each exit
+  // looked like a deficit. A free account has a monthly minutes budget, so an
+  // unbounded dispatch loop is an account-level risk, not just noise.
+  //
+  // Three brakes, each independent:
+  //   DISPATCH_BUDGET  hard cap on dispatches per hour
+  //   cooldown        a run that fails fast must not be retried immediately
+  //   single-per-tick  one dispatch per tick, so a refill takes minutes not seconds
+  const BUDGET_PER_HOUR = Number(process.env.DISPATCH_BUDGET || 120)
+  const COOLDOWN_MS = Number(process.env.DISPATCH_COOLDOWN_MS || 90000)
+  let dispatches = []
+  let cooldownUntil = 0
+
+  const budgetLeft = () => {
+    const hourAgo = Date.now() - 3600000
+    dispatches = dispatches.filter((t) => t > hourAgo)
+    return BUDGET_PER_HOUR - dispatches.length
+  }
+
   for (;;) {
     try {
       const { active, queued } = await counts()
+
+      // Demand-driven sizing. The orchestrator shares a process with the relay,
+      // so it can read the real queue instead of guessing. Holding a full pool of
+      // TARGET lanes around an idle relay is what burned the account overnight
+      // (3212 runs in ~10h), because runners are charged by the minute whether
+      // or not they are used. A small standby pool absorbs bursts; the rest is
+      // spun up only when there is work waiting for it.
+      const q = queue.stats()
+      const busy = q.pending > 0 || q.inflight > 0
+      const target = busy ? TARGET : STANDBY
       const live = active + queued
-      const deficit = TARGET - live
-      if (deficit > 0) {
-        // Dispatch in small batches: GitHub queues the surplus itself, and a
-        // burst of 20 dispatches can trip secondary rate limits on the API.
-        const batch = Math.min(deficit, 4)
-        let sent = 0
-        for (let i = 0; i < batch; i++) {
-          try {
-            // Pass the callback URL and token as inputs so a lane never depends
-            // on repo secrets being configured correctly.
-            await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
-              method: 'POST',
-              body: {
-                ref: REF,
-                inputs: {
-                  relay_url: relayUrl,
-                  relay_token: RELAY_TOKEN,
-                },
-              },
-            })
-            sent++
-          } catch (e) {
-            if (/404/.test(e.message) && !warnedMissing) {
-              warnedMissing = true
-              console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO}.`)
-              console.error('[orch] lanes cannot start. Check GH_REPO and GH_WORKFLOW in baked-credentials.json.')
-            }
-            console.error(`[orch] dispatch failed: ${e.message}`)
-            break
+      const deficit = target - live
+      const left = budgetLeft()
+
+      if (left <= 0) {
+        console.log(`${stamp()} [orch] active=${live} want=${target} pending=${q.pending} ` +
+          `but hourly dispatch budget spent (${dispatches.length}/${BUDGET_PER_HOUR}) -- holding off`)
+      } else if (Date.now() < cooldownUntil) {
+        const wait = Math.ceil((cooldownUntil - Date.now()) / 1000)
+        console.log(`${stamp()} [orch] active=${live} want=${target} pending=${q.pending} cooling down ${wait}s`)
+      } else if (deficit > 0) {
+        // Exactly one dispatch per tick. GitHub queues the surplus and starts it
+        // as slots free, so a burst buys nothing but quota risk.
+        try {
+          // Pass the callback URL and token as inputs so a lane never depends
+          // on repo secrets being configured correctly.
+          await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
+            method: 'POST',
+            body: {
+              ref: REF,
+              inputs: { relay_url: relayUrl, relay_token: RELAY_TOKEN },
+            },
+          })
+          dispatches.push(Date.now())
+          cooldownUntil = Date.now() + COOLDOWN_MS
+          console.log(`${stamp()} [orch] active=${active} queued=${queued} deficit=${deficit} ` +
+            `-> dispatched 1 (${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
+        } catch (e) {
+          if (/404/.test(e.message) && !warnedMissing) {
+            warnedMissing = true
+            console.error(`[orch] WORKFLOW NOT FOUND: ${WORKFLOW} in ${REPO}.`)
+            console.error('[orch] lanes cannot start. Check GH_REPO and GH_WORKFLOW in baked-credentials.json.')
           }
-          await sleep(1200)
-        }
-        if (!warnedMissing) {
-          console.log(`${stamp()} [orch] active=${active} queued=${queued} deficit=${deficit} -> dispatched ${sent}`)
+          console.error(`[orch] dispatch failed: ${e.message}`)
+          // Back off hard: a failing dispatch means the config is wrong, and
+          // hammering it is what produced thousands of useless runs.
+          cooldownUntil = Date.now() + COOLDOWN_MS * 4
         }
       } else {
         console.log(`${stamp()} [orch] active=${active} queued=${queued} at target`)

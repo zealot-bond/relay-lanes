@@ -51,8 +51,8 @@ jobs:
           RELAY_URL: ${{ inputs.relay_url || secrets.RELAY_URL }}
           RELAY_TOKEN: ${{ inputs.relay_token || secrets.RELAY_TOKEN }}
           LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
-          LANE_LIFETIME_S: '240'
-          LANE_IDLE_EXIT_S: '90'
+          LANE_LIFETIME_S: '540'
+          LANE_IDLE_EXIT_S: '420'
           REQUEST_TIMEOUT_MS: '45000'
           NODE_OPTIONS: '--dns-result-order=ipv4first'
         run: |

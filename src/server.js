@@ -18,15 +18,17 @@
 import http from 'node:http'
 import { WorkQueue, LaneRegistry } from './queue.js'
 import { listModelsPayload, findModel, splitModelId, PROVIDER, MODELS } from './models.js'
+import { config } from './config.js'
 
-const PORT = Number(process.env.PORT || 8791)
-const HOST = process.env.HOST || '0.0.0.0'
-const RELAY_TOKEN = process.env.RELAY_TOKEN || 'relay'
-const MAX_LANES = Number(process.env.MAX_LANES || 20)
-// How long a client may be held before we give up and answer honestly.
-const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || 180000)
-// Background retries per request. The client is never told about these.
-const RETRY_LIMIT = Number(process.env.RETRY_LIMIT || 3)
+// Config is read from config.js, which resolves baked credentials, then
+// start.properties, then the environment -- so a baked PORT is honoured even
+// though main.js is the process entry point.
+const PORT = config.PORT
+const HOST = config.HOST
+const RELAY_TOKEN = config.RELAY_TOKEN
+const MAX_LANES = config.MAX_LANES
+const MAX_HOLD_MS = config.MAX_HOLD_MS
+const RETRY_LIMIT = config.RETRY_LIMIT
 
 export const queue = new WorkQueue({ claimLeaseMs: 120000 })
 export const lanes = new LaneRegistry({ maxLanes: MAX_LANES })
@@ -72,9 +74,10 @@ function pickLane (tried) {
 async function dispatch (entry) {
   const tried = new Set()
   let attempt = 0
+  let empties = 0
   let last = { kind: 'error', status: 0, ms: 0, data: null }
 
-  while (attempt <= RETRY_LIMIT) {
+  while (attempt <= RETRY_LIMIT && empties <= RETRY_LIMIT) {
     if (Date.now() - entry.enqueuedAt > MAX_HOLD_MS) return last
 
     const lane = pickLane(tried)
@@ -84,7 +87,6 @@ async function dispatch (entry) {
       continue
     }
     tried.add(lane.id)
-    attempt++
 
     const result = await new Promise((resolve) => {
       let settled = false
@@ -97,7 +99,24 @@ async function dispatch (entry) {
     waiting.delete(entry.id)
     last = result
 
-    if (result.kind === 'ok') return result
+    if (result.kind === 'ok') {
+      lanes.record(lane.id, 'ok', result.ms || 0)
+      return result
+    }
+
+    if (result.kind === 'empty') {
+      // Upstream returned 200 with no text. Measured on muse-spark: 4 of 5
+      // requests came back this way while 1 in 5 was fine, so this is upstream
+      // flakiness, not a dead lane. Retry on a different egress IP instead of
+      // handing the client an empty answer, but count it separately so a model
+      // that is merely flaky is not punished by the hard-failure retry budget.
+      empties++
+      lanes.record(lane.id, 'empty', result.ms || 0)
+      queue.requeue(entry, { front: true })
+      continue
+    }
+
+    attempt++
 
     if (result.kind === 'limited') {
       // This egress IP is spent. Retire the lane so the orchestrator replaces it
@@ -284,6 +303,12 @@ async function laneRegister (req, res) {
   if (!authorized(req)) return json(res, 403, { error: 'bad token' })
   const body = await readBody(req).catch(() => ({}))
   const lane = lanes.register(body.laneId, body)
+  if (!lane) {
+    // Already at capacity. Refusing is better than admitting a lane the pool
+    // cannot use: the runner exits immediately instead of idling for minutes.
+    return json(res, 503, { error: 'lane capacity reached', maxLanes: MAX_LANES },
+      { 'Retry-After': '10' })
+  }
   return json(res, 200, { ok: true, laneId: lane.id, queueDepth: queue.pending.length })
 }
 
@@ -301,9 +326,14 @@ async function laneClaim (req, res) {
   const laneId = url.searchParams.get('laneId')
   // Never auto-register here: that would resurrect a lane just retired for an
   // exhausted bucket and hand work to a dead egress IP.
-  if (!lanes.liveLanes(600000).some((l) => l.id === laneId)) {
+  if (!lanes.lanes.has(laneId)) {
     return json(res, 409, { error: 'lane not registered', laneId })
   }
+  // The claim call IS the heartbeat. A lane blocked in a long-poll has nothing
+  // else to report with, and dispatch only considers lanes fresh within 45s, so
+  // without this an idle-but-healthy lane silently vanishes from the pool.
+  lanes.heartbeat(laneId)
+
   const entry = await queue.take(laneId, Number(url.searchParams.get('wait') || 20000))
   if (!entry) return json(res, 204, {})
   return json(res, 200, { entryId: entry.id, job: entry.job })

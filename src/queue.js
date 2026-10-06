@@ -142,6 +142,10 @@ export class LaneRegistry extends EventEmitter {
       existing.heartbeats++
       return existing
     }
+    // Prune before enforcing the cap: runners that died without reporting would
+    // otherwise hold slots forever and make the pool look permanently full.
+    this.prune()
+    if (this.lanes.size >= this.maxLanes) return null
     const lane = {
       id: laneId,
       registeredAt: Date.now(),
@@ -149,6 +153,7 @@ export class LaneRegistry extends EventEmitter {
       heartbeats: 0,
       served: 0,
       failed: 0,
+      empty: 0,
       limited: 0,
       timeouts: 0,
       avgMs: 0,
@@ -158,6 +163,21 @@ export class LaneRegistry extends EventEmitter {
     this.lanes.set(laneId, lane)
     this.emit('lane:up', lane)
     return lane
+  }
+
+  /** Forget lanes that have stopped reporting. Returns the ids removed. */
+  prune (staleMs = 300000) {
+    const now = Date.now()
+    const gone = []
+    for (const [id, lane] of this.lanes) {
+      if (now - lane.lastSeen > staleMs) {
+        this.lanes.delete(id)
+        lane.status = 'dead'
+        gone.push(id)
+        this.emit('lane:down', lane)
+      }
+    }
+    return gone
   }
 
   heartbeat (laneId) {
@@ -176,6 +196,7 @@ export class LaneRegistry extends EventEmitter {
     if (outcome === 'ok') { lane.served++; lane.status = 'idle' }
     else if (outcome === 'limited') { lane.limited++; lane.status = 'exhausted' }
     else if (outcome === 'timeout') { lane.timeouts++; lane.status = 'idle' }
+    else if (outcome === 'empty') { lane.empty++; lane.status = 'idle' }
     else { lane.failed++; lane.status = 'idle' }
     return lane
   }
@@ -215,11 +236,13 @@ export class LaneRegistry extends EventEmitter {
     return {
       lanes: all.length,
       maxLanes: this.maxLanes,
+      stale: all.filter((l) => Date.now() - l.lastSeen > 45000).length,
       available: all.filter((l) => l.status !== 'exhausted').length,
       exhausted: all.filter((l) => l.status === 'exhausted').length,
       retired: gone.length,
       served: sum(all, 'served') + sum(gone, 'served'),
       limited: sum(all, 'limited') + sum(gone, 'limited'),
+      empty: sum(all, 'empty') + sum(gone, 'empty'),
       timeouts: sum(all, 'timeouts') + sum(gone, 'timeouts'),
       failed: sum(all, 'failed') + sum(gone, 'failed'),
       avgMs: all.length ? Math.round(sum(all, 'avgMs') / all.length) : 0,

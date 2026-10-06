@@ -59,6 +59,7 @@ function parseUpstream (raw, model) {
     choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
   }
   const parts = []
+  const toolCalls = []
   let usage = null
   let finishReason = null
   let sawDone = false
@@ -72,8 +73,40 @@ function parseUpstream (raw, model) {
     let ev
     try { ev = JSON.parse(payload) } catch { continue }
 
-    const cd = ev?.choices?.[0]?.delta?.content
+    const delta = ev?.choices?.[0]?.delta
+    const cd = delta?.content
     if (typeof cd === 'string') parts.push(cd)
+    // Tool calls arrive as deltas keyed by index, so they must be merged by index
+    // rather than appended. They also carry the whole answer for models that
+    // decide to call a tool instead of replying in text: dropping them made the
+    // completion look empty even though upstream had produced a valid response.
+    if (Array.isArray(delta?.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const at = typeof tc.index === 'number' ? tc.index : toolCalls.length
+        const cur = toolCalls[at] ||= {
+          id: '', type: 'function',
+          function: { name: '', arguments: '' },
+        }
+        if (tc.id) cur.id = tc.id
+        if (tc.type) cur.type = tc.type
+        if (tc.function?.name) cur.function.name += tc.function.name
+        if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
+      }
+    }
+    // The responses dialect reports tool activity differently.
+    if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
+      const at = toolCalls.length
+      toolCalls[at] = {
+        id: ev.item.id || '',
+        type: 'function',
+        function: { name: ev.item.name || '', arguments: '' },
+      }
+    }
+    if (ev?.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
+      const at = toolCalls.length - 1
+      if (at >= 0) toolCalls[at].function.arguments += ev.delta
+    }
+
     const fr = ev?.choices?.[0]?.finish_reason
     if (typeof fr === 'string' && fr) finishReason = fr
     if (ev?.usage) usage = ev.usage
@@ -81,6 +114,12 @@ function parseUpstream (raw, model) {
     if (ev?.type === 'response.output_text.delta' && typeof ev.delta === 'string') {
       parts.push(ev.delta)
     }
+    // The responses dialect has NO [DONE] sentinel; response.completed is the
+    // terminal event. Without this the stream looks unterminated and an empty
+    // response used to escape as a raw string instead of a structured result,
+    // which made it impossible to detect or retry.
+    if (ev?.type === 'response.completed') { sawDone = true }
+    if (ev?.type === 'response.failed' || ev?.type === 'response.incomplete') { sawDone = true }
     if (ev?.type === 'response.completed') {
       const final = ev?.response?.output_text
       if (typeof final === 'string' && parts.length === 0) parts.push(final)
@@ -89,10 +128,16 @@ function parseUpstream (raw, model) {
   }
 
   const text = parts.join('')
+  const calls = toolCalls.filter(Boolean)
   out.choices[0].message.content = text
+  if (calls.length) {
+    out.choices[0].message.tool_calls = calls
+    if (finishReason !== 'stop') out.choices[0].finish_reason = 'tool_calls'
+  }
   if (finishReason) out.choices[0].finish_reason = finishReason
   out.usage = usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  if (!text && !usage) return sawDone ? out : raw
+  // Always return the structured shape. Returning `raw` here put a bare string
+  // into the completion path, where it read as a successful but empty answer.
   return out
 }
 
@@ -103,6 +148,16 @@ function parseUpstream (raw, model) {
  * relay always sends chat-shaped work to the lane, and the lane decides the
  * upstream shape from the model id.
  */
+/**
+ * Small output budgets silently produce nothing.
+ *
+ * These models are reasoning models: with max_output_tokens=32 the entire budget
+ * is spent on hidden reasoning and the stream ends with zero answer text, which
+ * looked like an upstream failure. Measured: 32 tokens gave an empty completion,
+ * 200 gave "ok". So the client's request is treated as a floor, not a hard cap.
+ */
+const MIN_OUTPUT_TOKENS = Number(process.env.MIN_OUTPUT_TOKENS || 512)
+
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP }) {
   const protocol = protocolFor(model)
   const msgs = []
@@ -125,8 +180,8 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       })),
       stream: true,                          // the responses endpoint requires it
       tools: fingerprintToolSpecsResponses(),
+      max_output_tokens: Math.max(maxTokens || 0, MIN_OUTPUT_TOKENS),
     }
-    if (maxTokens && maxTokens > 0) body.max_output_tokens = maxTokens
     if (temperature !== undefined) body.temperature = temperature
     if (topP !== undefined) body.top_p = topP
     return body
@@ -137,8 +192,8 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
     messages: msgs,
     stream: true,                            // free tier refuses stream:false
     tools: fingerprintToolSpecs(),
+    max_tokens: Math.max(maxTokens || 0, MIN_OUTPUT_TOKENS),
   }
-  if (maxTokens && maxTokens > 0) body.max_tokens = maxTokens
   if (temperature !== undefined) body.temperature = temperature
   if (topP !== undefined) body.top_p = topP
   return body
@@ -172,11 +227,22 @@ export async function callUpstream (job, { signal } = {}) {
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString()
         const verdict = classifyUpstream(res.statusCode, raw)
+        const data = verdict.kind === 'ok' ? parseUpstream(raw, model) : null
+        const msg = data?.choices?.[0]?.message
+        // A 200 that carries neither text nor tool calls is upstream flakiness,
+        // not an answer. Measured on muse-spark: 4 of 5 requests. Reported as
+        // 'empty' so the relay retries on another egress IP instead of handing
+        // the client a blank completion.
+        const isEmpty = verdict.kind === 'ok' &&
+          data?.choices &&
+          !String(msg?.content ?? '').trim() &&
+          !Array.isArray(msg?.tool_calls)
         fin({
           ...verdict,
+          ...(isEmpty ? { kind: 'empty' } : {}),
           status: res.statusCode,
           raw,
-          data: verdict.kind === 'ok' ? parseUpstream(raw, model) : null,
+          data,
           ms: Date.now() - started,
         })
       })
@@ -199,3 +265,8 @@ export async function callUpstream (job, { signal } = {}) {
 }
 
 export function destroyKeepalive () { KEEPALIVE.destroy() }
+
+// Exposed for the diagnostic test, which needs to fold a captured stream without
+// issuing a request. Same code path the lane uses, so a difference in behaviour
+// cannot be hidden by a second implementation.
+export const parseForTest = parseUpstream
