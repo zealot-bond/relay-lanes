@@ -8,14 +8,20 @@
 // baked PORT is honoured and can still be overridden after upload.
 
 import { config, applyConfigToEnv } from './config.js'
-import { start, lanes, queue } from './server.js'
 
+// Applied before server.js/orchestrator.js are LOADED (the dynamic imports below
+// run after this statement), so every module sees the same resolved values that
+// config.js itself used. A static import would be hoisted above this call and any
+// module reading process.env at import time would see the un-baked value.
 applyConfigToEnv()
 
 const say = (m) => console.log(`[main] ${m}`)
 
+say(`build=${config.BUILD_ID} built=${config.BUILD_BUILT}`)
 say(`starting: port=${config.PORT} lanes=${config.LANES_TARGET} ` +
   `repo=${config.GH_REPO || '(unset)'} workflow=${config.GH_WORKFLOW}`)
+
+const { start, lanes, queue, laneCodeStats } = await import('./server.js')
 
 const server = start()
 
@@ -39,10 +45,20 @@ const supervisor = setInterval(() => {
 supervisor.unref?.()
 
 setInterval(() => {
+  // Forget lanes that stopped reporting, not only on registration. Otherwise the
+  // dashboard and /health keep counting runners that are long gone, and a dead
+  // lane holds its slot until the next register call happens to prune it.
+  lanes.prune()
   const l = lanes.stats()
   const q = queue.stats()
+  const c = laneCodeStats()
+  // Anything other than "all current" is the drift that hid a bug for days, so it is
+  // printed in the line an operator already reads, not only in /health.
+  const code = (c.stale || c.unreported)
+    ? ` code=${c.current}ok/${c.stale}STALE/${c.unreported}unversioned(want ${c.expected})`
+    : ` code=all-current(${c.expected})`
   console.log(`[main] lanes=${l.lanes}/${l.maxLanes} served=${l.served} burned=${l.retired} ` +
-    `timeouts=${l.timeouts} pending=${q.pending} inflight=${q.inflight} avg=${l.avgMs}ms`)
+    `timeouts=${l.timeouts} pending=${q.pending} inflight=${q.inflight} avg=${l.avgMs}ms${code}`)
 }, 60000).unref?.()
 
 const shutdown = () => {

@@ -73,6 +73,14 @@ This serves OpenCode-style agent harnesses, so tool use must survive intact:
   reach the client. Emitting each fragment as its own array element produced
   `name: null` with no `id`, which strict validators reject with
   `missing required property "file_path"`.
+- **The merge accumulator outlives one 40ms batch.** Identity (`id`, `name`) and
+  arguments arrive in *different* windows, so a per-batch fold emitted an
+  arguments-only entry with no id and no name — the same malformed call, moved to a
+  later boundary. Identity is sent once per call; arguments are appended.
+- **Arguments the client never received are restated.** The relay records how much of
+  each call actually reached the client and appends only the missing suffix before
+  `finish_reason`, so a batch lost in flight cannot leave a harness holding truncated
+  JSON (the `file_path` / `old_string` / `new_string` failure).
 - The responses dialect's `output_index` is used for real indices. Hardcoding `0`
   merged parallel calls into one malformed object.
 - Tool results from the client (`role: 'tool'`) are converted to
@@ -87,9 +95,24 @@ This serves OpenCode-style agent harnesses, so tool use must survive intact:
 - **Clients never receive 429.** Upstream exhaustion is internal: the lane is retired
   and the work requeued. `RETRYABLE` decides what is retried; a 4xx is not retried
   three times because another egress IP would return the same 4xx.
+- **A request gets two attempts, not `RETRY_LIMIT`.** `RETRY_LIMIT` bounds the loop
+  counter; the effective ceiling is `MAX_ATTEMPTS = 2`. A 4xx is identical from every
+  egress IP, so a second attempt covers real transients and a third only holds the
+  client longer before the same answer. The client-facing message reports the real
+  number, which it did not before.
 - **Requests are never dropped.** Every dispatch exits through `queue.finish()`.
   Anything left behind becomes zombie work that a lane serves for nobody while the
   lease reaper hands it back around a loop.
+- **A lane a request already failed is not its retry target.** Failed attempts are
+  marked on the entry (`queue.avoidLane`) and `claim()` skips that lane while another
+  entry is available. The mark expires (`avoidTtlMs`), so it cannot strand work.
+- **A claim held by a live lane is never requeued.** The reaper takes a `laneAlive`
+  predicate and heartbeats refresh the lease, because claim age and lane liveness are
+  different questions. Requeueing work a live lane is serving is what put two lanes
+  on one client — interleaved text and doubled tool arguments.
+- **A retired lane cannot come back.** `LaneRegistry` tombstones the id, so the
+  worker's re-register-after-relay-restart path answers 410 and the runner exits
+  instead of spending a dead IP.
 - **Model quarantine is half-open.** After `MODEL_HEALTH_THRESHOLD` consecutive hard
   failures a model is refused for `MODEL_QUARANTINE_MS`, then one probe is allowed
   through. Without the expiry a transient burst killed a model until restart.
@@ -103,6 +126,34 @@ Upstream timeouts are split by phase:
 
 A single inactivity cap was the cause of multi-minute TTFT: a big-but-successful
 prefill was killed at 240s and retried, so latency arrived as 240s × attempts.
+
+Both phases use one re-armable timer that always carries a handler. The previous
+form re-armed with `req.setTimeout(ms)` and no callback, which registered no
+`timeout` listener at all for the second window — a connection that never sent a
+byte then hung the lane until the job's own limit instead of retrying elsewhere.
+
+The relay's own ceiling layers on top:
+
+- `ATTEMPT_HARD_MS` (300s) — one lane attempt. **Renewed** while that lane is still
+  heartbeating, up to `ATTEMPT_MAX_MS` (1800s). A fixed ceiling requeued work a live
+  lane was still serving, which put two lanes on one client.
+- A lane that stops heartbeating is detected within ~2s and the work is requeued,
+  instead of waiting out the full ceiling and reporting "no lane could serve this".
+
+## Config resolution — read it through `config.js`
+
+`config.js` resolves env → `start.properties` → `baked-credentials.json`, and
+`main.js` applies the result to `process.env` before **dynamically** importing the
+server. Two rules follow:
+
+1. A module must not read `process.env.X` for a tunable at import time. ES imports
+   are hoisted, so that read happens before any resolution and a value living only
+   in `baked-credentials.json` is silently ignored. This bit `LANES_STANDBY`,
+   `DISPATCH_*`, `MODEL_*`, `TOOL_*`, both phase timeouts, the output budgets and
+   `ZEN_BASE` (use `zenBase()`, which resolves at call time).
+2. A new tunable belongs in `config.js`. If it is absent there it will work from an
+   env var and from nowhere else, which looks like a bug in the value.
+
 
 ## Measured latency behaviour
 

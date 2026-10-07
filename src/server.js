@@ -19,6 +19,7 @@ import http from 'node:http'
 import { WorkQueue, LaneRegistry } from './queue.js'
 import { listModelsPayload, findModel, splitModelId, PROVIDER, MODELS } from './models.js'
 import { config } from './config.js'
+import { CODE_VERSION } from './codeversion.js'
 
 // Config is read from config.js, which resolves baked credentials, then
 // start.properties, then the environment -- so a baked PORT is honoured even
@@ -29,8 +30,10 @@ const RELAY_TOKEN = config.RELAY_TOKEN
 const MAX_LANES = config.MAX_LANES
 const MAX_HOLD_MS = config.MAX_HOLD_MS
 const RETRY_LIMIT = config.RETRY_LIMIT
+const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
+const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
 
-export const queue = new WorkQueue({ claimLeaseMs: 120000 })
+export const queue = new WorkQueue({ claimLeaseMs: 120000, avoidTtlMs: 60000 })
 export const lanes = new LaneRegistry({ maxLanes: MAX_LANES })
 
 const json = (res, status, obj, headers = {}) => {
@@ -59,14 +62,15 @@ function readBody (req, limitBytes = 16 * 1024 * 1024) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// Entries awaiting a lane result, keyed by queue id.
-const waiting = new Map()
 const dispatched = new WeakSet()
 // Live SSE writers for streaming clients, keyed by queue id. A lane POSTs text
 // fragments here as they arrive and the relay writes each one straight to the
 // client, so time-to-first-token is upstream TTFT rather than total generation.
 const streamers = new Map()
 let streamSeq = 0
+// Monotonic per-attempt id. A lane echoes it back on every delta and on its
+// result so output from a superseded attempt can be rejected.
+let attemptSeq = 0
 
 /**
  * Per-model health.
@@ -81,12 +85,12 @@ let streamSeq = 0
  * "no lane could serve this request" path for genuinely transient problems.
  */
 const modelHealth = new Map()
-const HEALTH_THRESHOLD = Number(process.env.MODEL_HEALTH_THRESHOLD || 3)
+const HEALTH_THRESHOLD = config.MODEL_HEALTH_THRESHOLD
 // How long a quarantined model stays refused before one probe request is let
 // through. Without this the quarantine is permanent: a short burst of upstream
 // 400s left muse-spark 1.3 refusing every request -- including plain ones -- until
 // the process was restarted. Half-open, like a circuit breaker.
-const QUARANTINE_MS = Number(process.env.MODEL_QUARANTINE_MS || 120000)
+const QUARANTINE_MS = config.MODEL_QUARANTINE_MS
 // Rolling log of upstream rejections. Without this the only thing visible was
 // "no lane could serve this request", which says nothing about why.
 const recentFailures = []
@@ -116,8 +120,13 @@ export function noteModelResult (model, result) {
     modelHealth.set(model, h)
     return
   }
-  // Exhaustion and empty answers are per-egress, not per-model.
-  if (result.kind === 'limited' || result.kind === 'empty') {
+  // Per-egress conditions, not per-model: a spent bucket, an empty answer, and a
+  // dead connection are all properties of the lane that drew them. Counting them
+  // against the model let three consecutive lane-level blips (an upstream 5xx, a
+  // reset socket) take a whole model offline for the quarantine window -- even
+  // though the same outcomes are treated as retryable on another lane.
+  if (result.kind === 'limited' || result.kind === 'empty' ||
+      result.kind === 'transport' || result.kind === 'timeout' || result.kind === 'error') {
     h.fails = 0
     h.until = 0
     modelHealth.set(model, h)
@@ -170,6 +179,16 @@ export function modelHealthStats () {
 // Retried at most once (see dispatch). `gate` is excluded: a rejected
 // fingerprint is identical from every egress IP, so retrying cannot help.
 const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error', 'provider_error'])
+// Attempts per request, including the first. Two is deliberate: a 4xx is identical
+// from every egress IP, so a second try covers genuine transients and a third only
+// holds the client longer before the same answer.
+const MAX_ATTEMPTS = 2
+
+// How recently a lane must have been seen to count as live. One value, used by
+// lane selection, attempt supervision and the claim reaper: when these drifted
+// apart a lane could be "live" for selection and "stale" for the reaper at the
+// same moment, which is how work got requeued while a lane was still serving it.
+const LANE_STALE_MS = config.LANE_STALE_MS
 
 /**
  * Choose a lane.
@@ -184,60 +203,229 @@ const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error', 
  * observed latency as a tiebreak. A lane this request already failed on is only
  * reused once every other option is exhausted.
  */
-function pickLane (tried) {
-  const candidates = lanes.liveLanes(45000).filter((l) => l.status !== 'exhausted')
+/** Breakdown of which lane-side code the live lanes are running. */
+export function laneCodeStats () {
+  const versions = {}
+  let current = 0, stale = 0, unreported = 0
+  for (const l of lanes.live()) {
+    const v = l.codeVersion
+    if (!v) { unreported++; versions.unreported = (versions.unreported || 0) + 1; continue }
+    versions[v] = (versions[v] || 0) + 1
+    if (v === CODE_VERSION) current++; else stale++
+  }
+  return { expected: CODE_VERSION, current, stale, unreported, versions }
+}
+
+function pickLane (tried, busy = new Set()) {
+  // A lane already assigned an attempt is skipped: it serves one entry at a
+  // time, so sending a second request at it parks the client behind work another
+  // idle lane could start immediately. This is the main cause of tool-turn
+  // latency growth -- a tool-heavy request holds a lane for many seconds, and
+  // without this every concurrent client queued behind that one busy lane.
+  const candidates = lanes.liveLanes(LANE_STALE_MS)
+    .filter((l) => l.status !== 'exhausted' && !busy.has(l.id))
   if (!candidates.length) return null
 
   const fresh = candidates.filter((l) => !tried.has(l.id))
   const pool = fresh.length ? fresh : candidates
 
   // Fewest observations first (unknown lanes get a trial), then lowest measured
-  // latency, then least recently seen.
+  // latency, then least recently seen, then id: the final tiebreak must be total,
+  // or two entries can sort a different "first" out of the same pool and pile onto
+  // one lane while the rest idle.
   return pool.slice().sort((a, b) => {
+    // Lanes running current code come first. A lane on stale code can corrupt tool
+    // calls, so it only gets work when no current lane is available.
+    const sa = a.codeVersion === CODE_VERSION ? 0 : 1
+    const sb = b.codeVersion === CODE_VERSION ? 0 : 1
+    if (sa !== sb) return sa - sb
     if (a.served !== b.served) return a.served - b.served
     if (a.avgMs !== b.avgMs) return a.avgMs - b.avgMs
-    return a.lastSeen - b.lastSeen
+    if (a.lastSeen !== b.lastSeen) return a.lastSeen - b.lastSeen
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   })[0]
 }
 
 // Hard ceiling on one lane attempt. Generous, because a reasoning model can
 // legitimately think for a minute before its first token. The lane's own
 // inactivity timeout is what actually abandons a wedged connection.
-const ATTEMPT_HARD_MS = Number(process.env.ATTEMPT_HARD_MS || 300000)
+const ATTEMPT_HARD_MS = config.ATTEMPT_HARD_MS
+// However, an attempt is NOT abandoned merely because this much time passed: a
+// long tool turn or a large prefill holds the claim while the lane keeps
+// heartbeating. The ceiling renews while that lane is provably alive, up to this
+// absolute bound. Without the renewal the relay gave up at 300s and requeued work
+// a lane was still actively serving -- two lanes then streamed into one client,
+// which is interleaved text and doubled tool-call arguments.
+const ATTEMPT_MAX_MS = config.ATTEMPT_MAX_MS
+// How long an entry may sit claimed before its holder is judged on liveness. A
+// lane that just claimed work has not necessarily heartbeated since, so judging
+// it immediately would requeue work that was picked up milliseconds ago.
+const CLAIM_GRACE_MS = config.CLAIM_GRACE_MS
+
+// Lanes currently assigned an attempt. The lane itself serves one entry at a
+// time, so dispatching a second request at it only parks the client behind work
+// that a different idle lane could take now.
+const busyLanes = new Set()
+
+/** The lane that actually served an attempt, for attribution and avoidance. */
+const servedLaneId = (result, lane) => result.laneId || lane.id
+
+/**
+ * Hand a result to the dispatcher, buffering it when the dispatcher is not
+ * currently parked on a promise.
+ *
+ * This is not optional politeness: after a requeue, the dispatcher sleeps before
+ * its next attempt, and a fast lane can claim and answer inside that window. The
+ * old code looked up a resolver that had already been cleared, dropped the result
+ * on the floor, and the client hung forever while the entry sat in `inflight`
+ * until the lease expired. Buffering makes the handoff independent of timing.
+ */
+function deliverResult (entry, result) {
+  if (typeof entry.resultWaiter === 'function') {
+    const wake = entry.resultWaiter
+    entry.resultWaiter = null
+    wake(result)
+    return
+  }
+  entry.results.push(result)
+}
+
+/** Resolve with the next result for this entry, waiting if none has arrived. */
+function nextResult (entry) {
+  if (entry.results.length) return Promise.resolve(entry.results.shift())
+  return new Promise((resolve) => { entry.resultWaiter = resolve })
+}
+
+/** One attempt: wait for the result of whichever lane serves this entry. */
+function waitForAttempt (entry, lane) {
+  return new Promise((resolve) => {
+    let settled = false
+    let waited = 0
+    let timer = null
+    let poll = null
+    const fin = (v) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (poll) clearInterval(poll)
+      // A promise left dangling would swallow the result of the next attempt.
+      if (typeof entry.resultWaiter === 'function') entry.resultWaiter = null
+      resolve(v)
+    }
+
+    // The dispatcher is parked here for the whole attempt, so any result that
+    // arrives is delivered through entry.resultWaiter.
+    nextResult(entry).then(fin)
+
+    const stale = (laneId) => {
+      const rec = laneId ? lanes.lanes.get(laneId) : null
+      return !rec || Date.now() - rec.lastSeen > LANE_STALE_MS
+    }
+    // Check the lane that actually HOLDS the claim, not the one pickLane guessed.
+    // The queue hands work to whichever lane claims first, so the hint can be a
+    // different lane entirely; requeueing on the hint's staleness would abandon
+    // work that another lane was serving correctly.
+    const laneGone = () => {
+      const held = queue.inflight.get(entry.id)
+      if (held && held.claimedAt && Date.now() - held.claimedAt < CLAIM_GRACE_MS) return false
+      return stale(held?.claimedBy || lane.id)
+    }
+
+    // A lane can exit cleanly (idle timeout, lifetime end, job cancelled) and
+    // simply stop claiming. It stays in the registry until it goes stale, so
+    // waiting for it burns the full attempt ceiling: measured as a 300s stall
+    // reported to the client as "no lane could serve this request". Polling the
+    // lane's liveness turns that into a prompt retry on another lane, which is
+    // the whole point of having twenty of them.
+    poll = setInterval(() => {
+      // Only safe while nothing has been streamed: once the client has text, the
+      // response is committed and a retry would duplicate it.
+      if (!entry.committed && laneGone()) {
+        fin({ kind: 'requeued', status: 0, ms: Date.now() - entry.enqueuedAt, data: null, laneId: lane.id })
+      }
+    }, 2000)
+    poll.unref?.()
+
+    const arm = () => {
+      timer = setTimeout(() => {
+        waited += ATTEMPT_HARD_MS
+        const rec = lanes.lanes.get(lane.id)
+        const alive = rec && Date.now() - rec.lastSeen < LANE_STALE_MS
+        if (alive && waited < ATTEMPT_MAX_MS) return arm()
+        fin({ kind: 'timeout', status: 0, ms: waited, data: null, laneId: lane.id })
+      }, ATTEMPT_HARD_MS)
+      timer.unref?.()
+    }
+    arm()
+  })
+}
 
 async function dispatch (entry) {
-  const tried = new Set()
+  // Lanes that already served this request and failed it. The queue consults
+  // this when handing out work, so a retry lands on a different egress IP -- a
+  // rejection or an exhausted bucket is identical from the IP that just produced
+  // it. `tried` mirrors it for the local pickLane hint.
+  const tried = entry.avoid instanceof Map ? new Set(entry.avoid.keys()) : new Set()
+  entry.results = entry.results || []
+  entry.resultWaiter = null
   let attempt = 0
   let empties = 0
   let last = { kind: 'error', status: 0, ms: 0, data: null }
 
   while (attempt <= RETRY_LIMIT && empties <= RETRY_LIMIT) {
+    if (entry.done || entry.abandoned) return { kind: 'abandoned', status: 0, ms: 0, data: null }
+
     // Once a streaming client has text on the wire the response is committed, so
     // the hold deadline no longer applies: abandoning it mid-answer would leave
-    // the client with a truncated response and no explanation.
-    if (!entry.committed && Date.now() - entry.enqueuedAt > MAX_HOLD_MS) return last
+    // the client with a truncated response and no explanation. A committed stream
+    // still gets an absolute bound, or a lane that keeps dying would hold the
+    // socket open forever.
+    const held = Date.now() - entry.enqueuedAt
+    if (!entry.committed && held > MAX_HOLD_MS) return last
+    if (held > MAX_HOLD_MS * 2) return entry.committed ? { ...last, kind: 'partial' } : last
 
-    const lane = pickLane(tried)
+    const lane = pickLane(tried, busyLanes)
     if (!lane) {
       // No lane available. Hold the client rather than failing them.
       await sleep(250)
       continue
     }
-    tried.add(lane.id)
 
-    const result = await new Promise((resolve) => {
-      let settled = false
-      const fin = (v) => { if (!settled) { settled = true; resolve(v) } }
-      const timer = setTimeout(() => fin({ kind: 'timeout', status: 0, ms: ATTEMPT_HARD_MS, data: null }), ATTEMPT_HARD_MS)
-      entry.pendingResolve = (v) => { clearTimeout(timer); fin(v) }
-      waiting.set(entry.id, entry)
-      queue.emit('assign', { entry, laneId: lane.id, attempt })
-    })
-    waiting.delete(entry.id)
+    busyLanes.add(lane.id)
+    let result
+    try {
+      result = await waitForAttempt(entry, lane)
+    } finally {
+      busyLanes.delete(lane.id)
+    }
+
+    // The lane vanished mid-claim (exited, or the relay reaped its claim). The
+    // entry is either already back in `pending` (reaped) or still held in
+    // `inflight` (the lane simply stopped), and it must be made claimable before
+    // looping -- otherwise this spins on a claim no lane can ever take. The lane
+    // is marked so the retry lands somewhere else, and no attempt is consumed:
+    // the request was never actually served.
+    if (result.kind === 'requeued') {
+      queue.avoidLane(entry, servedLaneId(result, lane))
+      tried.add(servedLaneId(result, lane))
+      queue.requeue(entry, { front: true })
+      await sleep(200)
+      continue
+    }
+    if (result.kind === 'abandoned' || entry.abandoned) {
+      return { kind: 'abandoned', status: 0, ms: 0, data: null }
+    }
+
+    // Attribute the outcome to the lane that actually served it, not to the one
+    // pickLane guessed: the queue hands work to whichever lane claims next.
+    const served = servedLaneId(result, lane)
+    tried.add(served)
+    // Remember it so the queue routes the retry to a different egress IP: the
+    // same lane would reproduce the same rejection or exhausted bucket.
+    queue.avoidLane(entry, served)
     last = result
-
     if (result.kind === 'ok') {
-      lanes.record(lane.id, 'ok', result.ms || 0)
+      lanes.record(served, 'ok', result.ms || 0)
       noteModelResult(entry.job.model, result)
       return result
     }
@@ -249,9 +437,14 @@ async function dispatch (entry) {
       // handing the client an empty answer, but count it separately so a model
       // that is merely flaky is not punished by the hard-failure retry budget.
       empties++
-      lanes.record(lane.id, 'empty', result.ms || 0)
-      if (!entry.committed) queue.requeue(entry, { front: true })
-      continue
+      lanes.record(served, 'empty', result.ms || 0)
+      noteModelResult(entry.job.model, result)
+      if (!entry.committed) {
+        queue.requeue(entry, { front: true })
+        await sleep(Math.min(2000, 150 * empties))
+        continue
+      }
+      return result
     }
 
     attempt++
@@ -260,7 +453,31 @@ async function dispatch (entry) {
     // returned here first, so a permanent failure was never counted: the panel
     // showed failed=0 while clients were being refused, and model health never
     // tripped, which is why the misleading message kept coming back.
-    lanes.record(lane.id, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
+    if (result.kind === 'limited') {
+      // This egress IP is spent. Retire the lane so the orchestrator replaces it
+      // with a runner holding a fresh bucket, then hand the work back. Recorded
+      // once, as limited: counting it as a failure too inflated failed= and
+      // tripped model quarantine for what is a per-IP quota event.
+      lanes.record(served, 'limited', result.ms || 0)
+      lanes.retire(served, 'egress bucket exhausted')
+      // A retired lane is gone from the registry, so this only matters if retire
+      // could not find it; keeping it costs nothing and closes the case where the
+      // record was pruned first.
+      queue.avoidLane(entry, served)
+      noteModelResult(entry.job.model, result)
+      // `limited` retires a lane on every pass, so it must respect the attempt
+      // cap like every other outcome. It previously requeued unconditionally,
+      // burning RETRY_LIMIT+2 attempts and retiring that many lanes from a single
+      // request -- seven such requests destroyed the whole pool.
+      if (!entry.committed && attempt < MAX_ATTEMPTS) {
+        queue.requeue(entry, { front: true })
+        await sleep(Math.min(2000, 150 * attempt))
+        continue
+      }
+      return { ...result, kind: 'partial' }
+    }
+
+    lanes.record(served, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
     noteModelResult(entry.job.model, result)
 
     // A rejected fingerprint is not going to change on another IP. Everything
@@ -268,17 +485,8 @@ async function dispatch (entry) {
     // permanently gone are no longer advertised, so a 4xx on a listed model is
     // most likely transient and deserves a second try -- but not three, which is
     // what turned one rejection into three full round trips for the client.
-    if (result.kind === 'gate' || attempt >= 2 || !RETRYABLE.has(result.kind)) {
+    if (result.kind === 'gate' || attempt >= MAX_ATTEMPTS || !RETRYABLE.has(result.kind)) {
       return last
-    }
-
-    if (result.kind === 'limited') {
-      // This egress IP is spent. Retire the lane so the orchestrator replaces it
-      // with a runner holding a fresh bucket, then hand the work back.
-      lanes.record(lane.id, 'limited', result.ms || 0)
-      lanes.retire(lane.id, 'egress bucket exhausted')
-      if (!entry.committed) queue.requeue(entry, { front: true })
-      continue
     }
 
     // Already recorded above; this pass only decides whether to try again.
@@ -300,7 +508,16 @@ export function ensureDispatched (entry) {
   if (dispatched.has(entry)) return
   dispatched.add(entry)
   ;(async () => {
-    const result = await dispatch(entry)
+    let result
+    try {
+      result = await dispatch(entry)
+    } catch (e) {
+      // A throw here must still settle the client and leave the queue clean:
+      // an entry left behind is served later by a lane for nobody, and the lease
+      // reaper hands it back in a loop.
+      console.error('[relay] dispatch threw:', e?.stack || e)
+      result = { kind: 'error', status: 0, ms: 0, data: null, raw: String(e?.message || e) }
+    }
     // Single exit point: removes the entry from pending and inflight and settles
     // the client. Anything left behind here becomes zombie work that a lane serves
     // for nobody and the lease reaper hands back around the loop.
@@ -310,19 +527,29 @@ export function ensureDispatched (entry) {
 
 export function acceptLaneResult (laneId, entryId, result) {
   lanes.heartbeat(laneId)
-  const entry = waiting.get(entryId)
-  if (!entry) return false
-  waiting.delete(entryId)
-  if (typeof entry.pendingResolve === 'function') {
-    // Record whether the client already saw the text, so the streaming path can
-    // avoid emitting the same content twice.
-    entry.streamed = Boolean(result.streamed)
-    entry.pendingResolve(result)
-    return true
-  }
-  // No dispatcher is waiting (client gone, or the request already settled). Do
-  // not hand the result anywhere; just make sure it is not left in flight.
-  if (!entry.done && !entry.abandoned) queue.complete(entryId, result)
+  // The entry is looked up in `inflight`, not in a dispatcher-registered map.
+  // Delivery used to require a parked dispatcher, but after a requeue the
+  // dispatcher sleeps before its next attempt, and a fast lane can claim and
+  // answer inside that window -- the result was then dropped and the client hung
+  // until the process restarted. The entry object outlives every requeue, so
+  // keying on it makes the handoff independent of timing.
+  const entry = queue.inflight.get(entryId)
+  if (!entry) return false   // unknown, finished, or abandoned: nothing is owed
+  // A result from a lane that no longer holds the claim must be dropped. That
+  // lane's work was handed back to the queue and may already be served by another
+  // lane; accepting this one would settle the client with the wrong answer and
+  // leave the live lane streaming into a closed response.
+  if (entry.claimedBy && entry.claimedBy !== laneId) return false
+
+  // Record which parts the client already saw, so the streaming path can avoid
+  // emitting the same content twice while still sending what it never got.
+  entry.streamedText = Boolean(result.streamedText ?? result.streamed)
+  entry.streamedTools = Boolean(result.streamedTools)
+  entry.streamed = Boolean(result.streamed)
+  if (typeof result.streamedTextLen === 'number') entry.streamedTextLen = result.streamedTextLen
+
+  // Which lane really served this, for retry attribution and retirement.
+  deliverResult(entry, { ...result, laneId })
   return true
 }
 
@@ -406,6 +633,15 @@ async function handleChat (req, res) {
   // later fragment is appended as it arrives.
   const streamId = `chatcmpl-${Date.now().toString(36)}-${(streamSeq++).toString(36)}`
   const streamCreated = Math.floor(Date.now() / 1000)
+
+  // Declared at function scope because the terminal frames below reuse them.
+  // Before streaming is set up they are no-ops, so nothing can throw if the
+  // request turned out not to be a stream.
+  let backlog = []
+  let backlogBytes = 0
+  let writeSse = () => {}
+  let drainBacklog = () => {}
+
   if (stream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -414,7 +650,61 @@ async function handleChat (req, res) {
       'X-Accel-Buffering': 'no',
       'Access-Control-Allow-Origin': '*',
     })
-    res.write(`data: ${JSON.stringify({
+
+    // Every write to this response goes through writeSse, so the keepalive can
+    // never jump ahead of real data that is still queued behind a full socket
+    // buffer. That ordering matters: a client reading a comment before the text
+    // it belongs to is harmless, but interleaving out of order is not.
+    backlog = []
+    backlogBytes = 0
+
+    writeSse = (chunk) => {
+      if (res.writableEnded || res.destroyed) return
+      if (backlog.length) {
+        // Something is already waiting: queue behind it to preserve order.
+        backlog.push(chunk)
+        backlogBytes += chunk.length
+        if (backlogBytes > MAX_BACKLOG_BYTES) {
+          // The client has stopped reading entirely. Nothing else can help it, and
+          // buffering without limit is how the relay runs out of memory.
+          console.error(`[relay] client too far behind (${backlogBytes} bytes queued); ` +
+            'closing the stream')
+          res.destroy()
+        }
+        return
+      }
+      if (!res.write(chunk)) {
+        backlog.push(chunk)
+        backlogBytes += chunk.length
+      }
+    }
+
+    drainBacklog = () => {
+      while (backlog.length && !res.writableEnded && !res.destroyed) {
+        const chunk = backlog[0]
+        if (!res.write(chunk)) return
+        backlog.shift()
+        backlogBytes -= chunk.length
+      }
+    }
+    res.on('drain', drainBacklog)
+
+    // A comment line: every conformant SSE client ignores it, but it resets the
+    // idle timers of any proxy in between. Without it a large prefill (measured
+    // 237s TTFT at 850k tokens) is silently dropped by the proxy at its idle
+    // timeout, and because the 200 and content-type are already committed the
+    // client sees a network error instead of a diagnosable one.
+    //
+    // It cannot add latency: 15 bytes every 15s, and it *removes* the wasted
+    // round trip of a dropped-and-retried request.
+    const keepalive = setInterval(() => {
+      writeSse(`: keepalive ${Date.now()}\n\n`)
+    }, STREAM_KEEPALIVE_MS)
+    keepalive.unref?.()
+    const stopKeepalive = () => clearInterval(keepalive)
+    res.on('close', stopKeepalive)
+
+    writeSse(`data: ${JSON.stringify({
       id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
       choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
     })}\n\n`)
@@ -442,26 +732,40 @@ async function handleChat (req, res) {
       if (text) delta.content = text
       if (toolCalls && toolCalls.length) delta.tool_calls = toolCalls
       if (!Object.keys(delta).length) return
-      res.write(`data: ${JSON.stringify({
+      // writeSse checks writability, so a client that disconnected mid-stream does
+      // not turn an in-flight delta into a throw.
+      writeSse(`data: ${JSON.stringify({
         id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
         choices: [{ index: 0, delta, finish_reason: null }],
       })}\n\n`)
     })
   }
 
-  ensureDispatched(entry)
+  // The resolver is installed BEFORE dispatch starts. Dispatch reaches
+  // queue.finish() -> entry.resolve() on a fast path (an immediately available
+  // lane), and if that ran first the resolve would be missing and the client's
+  // promise would never settle -- a request held until the process restarts.
+  const settled = new Promise((resolve) => { entry.resolve = resolve })
 
   // If the client hangs up mid-flight, stop caring immediately. Otherwise the
   // work stays queued and a lane burns a full upstream call on a response nobody
   // will read.
-  const onClientGone = () => {
-    if (!entry.done) queue.abandon(entry)
-  }
+  const onClientGone = () => { if (!entry.done) queue.abandon(entry) }
   res.on('close', onClientGone)
 
-  const result = await new Promise((resolve) => { entry.resolve = resolve })
+  ensureDispatched(entry)
+
+  const result = await settled
   res.off?.('close', onClientGone)
   streamers.delete(entry.id)
+
+  // The client disconnected (or the entry was dropped) while the lane worked.
+  // Nothing can be written to it, so finish silently rather than throwing
+  // ERR_STREAM_WRITE_AFTER_END into the request handler.
+  if (result.kind === 'abandoned' || entry.abandoned || res.writableEnded || res.destroyed) {
+    try { if (!res.writableEnded) res.end() } catch { /* client already gone */ }
+    return
+  }
 
   if (result.kind !== 'ok') {
     // Upstream is unusable for this request. That is NOT a client rate limit, so
@@ -470,13 +774,33 @@ async function handleChat (req, res) {
       // Headers are long gone, so the failure is reported in-band.
       const err = {
         error: {
-          message: `no lane could serve this request (${result.kind}); it was retried ${RETRY_LIMIT}x`,
+          // The retry ceiling is 2 attempts, not RETRY_LIMIT: a failure that
+          // another egress IP cannot fix is not worth three round trips. Reporting
+          // "retried 3x" when only one retry happened sent people looking for
+          // retries that were never made.
+          // Report how many times the request was actually handed to a lane, not the
+          // generic cap. `empty` outcomes are retried on their own counter, so
+          // quoting MAX_ATTEMPTS-1 was frequently wrong -- it said "retried 1x"
+          // on requests that had actually been tried several times, which made a
+          // token-budget problem look like a single unlucky attempt.
+          message: `no lane could serve this request (${result.kind}); ` +
+            `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}`,
           type: 'upstream_unavailable',
         },
       }
-      res.write(`data: ${JSON.stringify(err)}\n\n`)
-      res.write('data: [DONE]\n\n')
-      return res.end()
+      if (!res.writableEnded && !res.destroyed) {
+        try {
+          // Through writeSse so the terminal frames cannot jump ahead of data still
+          // queued behind a full socket buffer.
+          writeSse(`data: ${JSON.stringify(err)}\n\n`)
+          writeSse('data: [DONE]\n\n')
+          // Flush whatever is still backlogged before closing, otherwise a slow but
+          // live client loses the tail of the answer.
+          drainBacklog()
+          res.end()
+        } catch { /* client already gone */ }
+      }
+      return
     }
     // Use the failure in hand, not just quarantined state: the very first rejection
     // must name the upstream reason, otherwise the client is told nothing useful.
@@ -505,39 +829,85 @@ async function handleChat (req, res) {
   // status -- which is what every OpenAI client expects from a stream.
   const id = stream && streamId ? streamId : completion.id
   const created = stream && streamCreated ? streamCreated : completion.created
-  const chunk = (delta, finish = null) => {
-    res.write(`data: ${JSON.stringify({
-      id, object: 'chat.completion.chunk', created, model,
-      choices: [{ index: 0, delta, finish_reason: finish }],
-    })}\n\n`)
+  // Every terminal write goes through one guard: the client may have hung up
+  // while the lane was still working, and writing to a finished response throws.
+  // writeSse additionally preserves ordering against anything still backlogged.
+  const safeWrite = (frame) => {
+    if (res.writableEnded || res.destroyed) return false
+    try { writeSse(frame); return true } catch { return false }
+  }
+  const chunk = (delta, finish = null) => safeWrite(`data: ${JSON.stringify({
+    id, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  })}\n\n`)
+
+  // Text that already arrived through /lane/delta must not be replayed, or the
+  // client sees it twice. The comparison is by length, not by a flag: a lost batch
+  // leaves the streamed text shorter than the folded answer, and the missing tail
+  // is exactly what the client needs to finish the sentence it was shown.
+  const streamedTextLen = entry.streamedTextLen || 0
+  const fullText = completion.choices[0]?.message?.content ?? ''
+  if (streamedTextLen < fullText.length) {
+    // Send only the part the client has not seen. When nothing was streamed this
+    // is the whole answer; when a batch was lost it is the missing suffix.
+    chunk({ content: fullText.slice(streamedTextLen) })
   }
 
-  // For a streaming entry the text already arrived through /lane/delta, so the
-  // buffered completion must not be replayed or the client would see it twice.
-  const alreadyStreamed = Boolean(entry.id && result.streamed)
-  if (!alreadyStreamed) {
-    chunk({ content: completion.choices[0]?.message?.content ?? '' })
+  const buffered = completion.choices[0]?.message
+  const bufferedCalls = Array.isArray(buffered?.tool_calls) ? buffered.tool_calls : []
+  // Reconcile each call against what the client actually received. Fragments are
+  // concatenated by a harness, so a call whose streamed arguments stopped short is
+  // completed by sending ONLY the missing suffix -- appending it yields exactly the
+  // folded arguments. This is what repairs a batch lost in flight: before, the
+  // client was left holding a truncated JSON string and reported the call as
+  // missing required properties ("file_path" / "old_string" / "new_string").
+  if (bufferedCalls.length) {
+    const sent = entry.streamedToolArgs || new Map()
+    const repair = []
+    for (let i = 0; i < bufferedCalls.length; i++) {
+      const c = bufferedCalls[i]
+      const fullArgs = typeof c.function?.arguments === 'string' ? c.function.arguments : ''
+      const got = sent.get(i) || ''
+      if (!entry.streamedTools) {
+        // Nothing was streamed: send the whole call, name and id included.
+        repair.push({ ...c, index: i })
+        continue
+      }
+      // Identity is never repeated: a client appending name fragments would turn
+      // "edit" into "editedit". Only the argument tail, when one is missing.
+      if (fullArgs.length > got.length && fullArgs.startsWith(got)) {
+        repair.push({ index: i, function: { arguments: fullArgs.slice(got.length) } })
+      } else if (fullArgs !== got) {
+        // The client's copy is not a prefix of the folded call, so appending
+        // cannot repair it. Restate the call in full rather than leave a harness
+        // with JSON it cannot parse.
+        repair.push({ index: i, ...c })
+      }
+    }
+    if (repair.length) chunk({ tool_calls: repair })
   }
   // A tool call must surface as finish_reason "tool_calls" so the harness stops
-// reading text and executes the call. Defaulting to "stop" made a harness treat
-// the turn as a finished answer -- the model said what it was about to do and the
-// stream ended, which is precisely the "fake promise" symptom.
-const buffered = completion.choices[0]?.message
-const finishReason = buffered?.tool_calls?.length
-  ? 'tool_calls'
-  : (completion.choices[0]?.finish_reason || 'stop')
-chunk({}, finishReason)
+  // reading text and executes the call. Defaulting to "stop" made a harness treat
+  // the turn as a finished answer -- the model said what it was about to do and
+  // the stream ended, which is precisely the "fake promise" symptom.
+  const finishReason = bufferedCalls.length
+    ? 'tool_calls'
+    : (completion.choices[0]?.finish_reason || 'stop')
+  chunk({}, finishReason)
   if (completion.usage) {
-    res.write(`data: ${JSON.stringify({
+    safeWrite(`data: ${JSON.stringify({
       id, object: 'chat.completion.chunk', created, model, choices: [], usage: completion.usage,
     })}\n\n`)
   }
-  res.write('data: [DONE]\n\n')
-  res.end()
+  // [DONE] is emitted on every completed stream, including the ones the client has
+  // already walked away from: a harness that half-read the stream depends on it to
+  // close its own parser rather than treating the connection drop as a crash.
+  safeWrite('data: [DONE]\n\n')
+  if (!res.writableEnded && !res.destroyed) res.end()
 }
 
 function dashboard () {
-  const q = queue.stats()
+      const q = queue.stats()
   const l = lanes.stats()
   const rows = lanes.live().sort((a, b) => b.served - a.served).map((x) =>
     `<tr><td>${x.id}</td><td>${x.status}</td><td>${x.served}</td><td>${x.limited}</td>` +
@@ -584,7 +954,21 @@ async function laneRegister (req, res) {
     return json(res, 503, { error: 'lane capacity reached', maxLanes: MAX_LANES },
       { 'Retry-After': '10' })
   }
-  return json(res, 200, { ok: true, laneId: lane.id, queueDepth: queue.pending.length })
+  if (lane.retired) {
+    // This egress IP's bucket is spent. Admitting it again would send work to a
+    // lane that can only answer 429, which then retires it in a loop.
+    return json(res, 410, { error: 'lane retired', laneId: body.laneId, retiredAt: lane.retiredAt })
+  }
+  // A lane running different code than this relay was built with is the failure
+  // that hid tool-call corruption for days. Say so in the log the moment it joins.
+  if (!lane.codeWarned && lane.codeVersion !== CODE_VERSION) {
+    lane.codeWarned = true
+    console.error(`[relay] STALE LANE CODE: ${lane.id} runs ` +
+      `${lane.codeVersion || 'an unversioned build (predates version reporting)'}, ` +
+      `relay expects ${CODE_VERSION}. The runners are executing different lane code than ` +
+      'this jar was built from -- push src/ to the runner repo and restart the runs.')
+  }
+  return json(res, 200, { ok: true, laneId: lane.id, queueDepth: queue.pending.length, codeVersion: CODE_VERSION })
 }
 
 async function laneHeartbeat (req, res) {
@@ -592,6 +976,9 @@ async function laneHeartbeat (req, res) {
   const body = await readBody(req).catch(() => ({}))
   const lane = lanes.heartbeat(body.laneId)
   if (!lane) return json(res, 404, { error: 'unknown lane' })
+  // A lane heartbeats while it works, so everything it holds is provably live
+  // and must not be handed to another lane as a stale claim.
+  queue.touchLane(body.laneId)
   return json(res, 200, { ok: true, queueDepth: queue.pending.length })
 }
 
@@ -635,8 +1022,38 @@ async function laneDelta (req, res) {
   const writer = streamers.get(entryId)
   if (!writer) return json(res, 404, { ok: false, error: 'no stream for entry' })
 
-  const entry = waiting.get(entryId)
-  if (entry) entry.committed = true
+  // The entry is resolved through the queue, the same way a result is: `inflight`
+  // is the one place an entry is guaranteed to be while a lane is serving it.
+  const entry = queue.inflight.get(entryId)
+  if (entry) {
+    // Same claim guard as /lane/result. Without it, a lane that lost its claim
+    // (lease reaped after a heartbeat gap, relay stall, GC pause) keeps streaming
+    // into a client that another lane is now also streaming into. Its final result
+    // is correctly rejected, so the client silently ends up with interleaved text
+    // from two different answers.
+    if (entry.claimedBy && entry.claimedBy !== body.laneId) {
+      return json(res, 409, { ok: false, error: 'lane does not hold this claim' })
+    }
+    entry.committed = true
+    // Exactly how much of each stream was delivered, not just whether any was.
+    // A batch can be lost in flight (relay restart, proxy reset), and the boolean
+    // form then claimed the client was complete when its tool arguments were a
+    // truncated JSON string -- the "missing required property" failure. Recording
+    // the actual bytes lets the finalizer send only what is missing.
+    if (typeof body.text === 'string' && body.text) {
+      entry.streamedText = true
+      entry.streamedTextLen = (entry.streamedTextLen || 0) + body.text.length
+    }
+    if (Array.isArray(body.toolCalls) && body.toolCalls.length) {
+      entry.streamedTools = true
+      const args = entry.streamedToolArgs || (entry.streamedToolArgs = new Map())
+      for (const c of body.toolCalls) {
+        const i = typeof c.index === 'number' ? c.index : 0
+        const prev = args.get(i) || ''
+        args.set(i, prev + (c.function?.arguments || ''))
+      }
+    }
+  }
   writer(body.text ?? '', Array.isArray(body.toolCalls) ? body.toolCalls : null)
   return json(res, 200, { ok: true })
 }
@@ -660,6 +1077,8 @@ export function createServer () {
       if (path === '/' || path === '/health' || path === '/healthz') {
         return json(res, 200, {
           ok: true, provider: PROVIDER, models: MODELS.length,
+          build: `${config.BUILD_ID} (${config.BUILD_BUILT})`,
+          laneCode: laneCodeStats(),
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is
           // doing wrong, so they are in the health payload rather than only in
@@ -673,7 +1092,15 @@ export function createServer () {
         return res.end(dashboard())
       }
 
-      if (path.startsWith('/lane/')) queue.reapStaleClaims()
+      // A lane's claim is only stale if the LANE is stale. Claim age alone is not
+      // enough: a large prefill or a long tool turn legitimately holds a claim for
+      // minutes while the lane heartbeats the whole time.
+      if (path.startsWith('/lane/')) {
+        queue.reapStaleClaims((laneId) => {
+          const rec = laneId ? lanes.lanes.get(laneId) : null
+          return Boolean(rec && Date.now() - rec.lastSeen < LANE_STALE_MS)
+        })
+      }
       if (method === 'POST' && path === '/lane/register') return laneRegister(req, res)
       if (method === 'POST' && path === '/lane/heartbeat') return laneHeartbeat(req, res)
       if (method === 'GET' && path === '/lane/claim') return laneClaim(req, res)
@@ -681,7 +1108,7 @@ export function createServer () {
       if (method === 'POST' && path === '/lane/delta') return laneDelta(req, res)
 
       if (method === 'GET' && (path === '/v1/models' || path === '/models')) {
-        return json(res, 200, listModelsPayload())
+        return json(res, 200, listModelsPayload(`${config.BUILD_ID} (${config.BUILD_BUILT})`))
       }
       const m = path.match(/^\/v1\/models\/(.+)$/)
       if (method === 'GET' && m) {
@@ -708,6 +1135,7 @@ export function createServer () {
 export function start () {
   const server = createServer()
   server.listen(PORT, HOST, () => {
+    console.log(`[relay] build ${config.BUILD_ID} built ${config.BUILD_BUILT}`)
     console.log(`[relay] listening on http://${HOST}:${PORT}`)
     console.log(`[relay] client API: /v1/models, /v1/chat/completions  (models: ${MODELS.length})`)
     console.log(`[relay] dashboard:  /dashboard`)

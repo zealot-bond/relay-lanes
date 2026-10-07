@@ -21,20 +21,96 @@ export const ZEN_BASE = process.env.ZEN_BASE || 'https://opencode.ai/zen'
 export const RESPONSES_PATH = '/v1/responses'
 export const CHAT_PATH = '/v1/chat/completions'
 
+/**
+ * Resolve ZEN_BASE at CALL time, not import time.
+ *
+ * The worker's import graph reaches this module before applyConfigToEnv() has
+ * run, so a ZEN_BASE that came from start.properties or baked-credentials.json
+ * was invisible here and the lane silently used the built-in default. The
+ * constant above is kept because it is exported, but every request path uses
+ * this function.
+ */
+export const zenBase = () => process.env.ZEN_BASE || ZEN_BASE
+
 // The gateway rejects a request that does not advertise these four tools, so the
 // relay declares them itself and executes them server-side. The calling agent
 // therefore never sees a tool it cannot run.
 export const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read']
+
+/**
+ * The tools the gateway requires, described as genuinely usable.
+ *
+ * These four declarations exist because the gateway rejects a request carrying no
+ * tool list at all. Forwarding the client's own tool specs alongside them was
+ * tried and measured: upstream answered HTTP 400 "Missing required parameter:
+ * `tools[4].type`" for every arrangement tried (any shape, any name casing, any
+ * count, with or without a `required` array). Only the unmodified set of four is
+ * accepted, so the client's specs cannot be passed through and the four below are
+ * the whole tool surface.
+ *
+ * They were previously described as placeholders that "must never be called",
+ * which made the model refuse: it answered "I don't have access to a bash tool"
+ * instead of calling one. They are now described as ordinary working tools, with
+ * the conventional argument shapes, so a call comes back populated. The tool
+ * EXECUTION remains the client's job -- the relay only carries the call.
+ */
+const FINGERPRINT_TOOL_INFO = {
+  bash: {
+    description: 'Execute a bash command in a persistent shell session and return its output.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The bash command to execute' },
+        description: { type: 'string', description: 'Clear, concise description of what this command does' },
+      },
+      required: ['command', 'description'],
+    },
+  },
+  glob: {
+    description: 'Fast file pattern matching tool that works with any codebase size.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'The glob pattern to match files against, such as **/*.js' },
+        path: { type: 'string', description: 'The directory to search in' },
+      },
+      required: ['pattern'],
+    },
+  },
+  grep: {
+    description: 'Search file contents with a regular expression.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'The regular expression to search for' },
+        path: { type: 'string', description: 'File or directory to search' },
+        include: { type: 'string', description: 'File extension filter, such as js or py' },
+        output_mode: { type: 'string', description: 'One of content, files_with_matches, or count' },
+      },
+      required: ['pattern'],
+    },
+  },
+  read: {
+    description: 'Read the contents of a file from the filesystem.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'The absolute path to the file to read' },
+        offset: { type: 'number', description: 'Line number to start reading from' },
+        limit: { type: 'number', description: 'Number of lines to read' },
+      },
+      required: ['file_path'],
+    },
+  },
+}
 
 export function fingerprintToolSpecs () {
   return FINGERPRINT_TOOLS.map((name) => ({
     type: 'function',
     function: {
       name,
-      description:
-        `Placeholder for the "${name}" tool. It is NOT available in this session and must never be called: ` +
-        'this declaration only exists to satisfy the upstream API contract. Calling it has no effect and any such call is discarded.',
-      parameters: { type: 'object', properties: {} },
+      description: FINGERPRINT_TOOL_INFO[name].description,
+      parameters: FINGERPRINT_TOOL_INFO[name].parameters,
     },
   }))
 }
@@ -43,10 +119,8 @@ export function fingerprintToolSpecsResponses () {
   return FINGERPRINT_TOOLS.map((name) => ({
     type: 'function',
     name,
-    description:
-      `Placeholder for the "${name}" tool. It is NOT available in this session and must never be called: ` +
-      'this declaration only exists to satisfy the upstream API contract. Calling it has no effect and any such call is discarded.',
-    parameters: { type: 'object', properties: {} },
+    description: FINGERPRINT_TOOL_INFO[name].description,
+    parameters: FINGERPRINT_TOOL_INFO[name].parameters,
   }))
 }
 
@@ -89,12 +163,28 @@ export function headers ({ sessionId, requestId, protocol }) {
 // lane is exhausted, our fingerprint is wrong, or the request merely failed.
 export function classifyUpstream (status, raw) {
   const text = typeof raw === 'string' ? raw : ''
+
+  // Only the STATUS or an ERROR ENVELOPE may declare exhaustion. The previous
+  // check scanned the whole raw body, which for a 200 is the model's own answer --
+  // so asking "how do I raise my rate limit?" produced a correct reply that was
+  // classified as bucket exhaustion, the answer was discarded, and the lane was
+  // retired and replaced. Twenty such replies destroyed the whole pool.
+  //
+  // `raw` is consulted only when the response is not a success, so a success body
+  // can never be mistaken for an error.
+  if (status < 400) return { kind: 'ok' }
+
   const limited = status === 429 || text.includes('FreeUsageLimitError') ||
-    text.includes('rate_limit_error') || /rate limit/i.test(text)
-  const gate = !limited && text.includes('FreeTierError')
+    text.includes('rate_limit_error') || /rate[_ -]?limit/i.test(text)
+  // The gateway reports its own access gate two ways: a FreeTierError envelope,
+  // and a prose message from the upstream provider. Only the first was recognised,
+  // so the second fell through to provider_error -- which is retried on another IP
+  // (pointless, the fingerprint does not change) and counted against model health
+  // (wrong, a gate is a config problem, not a sick model).
+  const gate = !limited && (text.includes('FreeTierError') ||
+    /free tier can only be used from within/i.test(text))
   if (limited) return { kind: 'limited', retryAfter: null }
   if (gate) return { kind: 'gate' }
   if (status >= 500) return { kind: 'transport' }
-  if (status >= 400) return { kind: 'provider_error' }
-  return { kind: 'ok' }
+  return { kind: 'provider_error' }
 }

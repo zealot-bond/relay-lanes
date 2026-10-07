@@ -17,11 +17,12 @@
 
 import https from 'node:https'
 import {
-  ZEN_BASE, CHAT_PATH, RESPONSES_PATH,
+  zenBase, CHAT_PATH, RESPONSES_PATH,
   fingerprintToolSpecs, fingerprintToolSpecsResponses,
   newSessionId, newRequestId, headers, classifyUpstream,
 } from './fingerprint.js'
 import { protocolFor } from './models.js'
+import { config } from './config.js'
 
 /**
  * Upstream timeouts, split by phase.
@@ -36,14 +37,19 @@ import { protocolFor } from './models.js'
  * then a tight inactivity budget, because once tokens are flowing a stall is
  * genuinely wedged.
  */
-const FIRST_BYTE_TIMEOUT_MS = Number(process.env.FIRST_BYTE_TIMEOUT_MS || 600000)
-const STREAM_IDLE_TIMEOUT_MS = Number(process.env.STREAM_IDLE_TIMEOUT_MS || 120000)
+const FIRST_BYTE_TIMEOUT_MS = config.FIRST_BYTE_TIMEOUT_MS
+const STREAM_IDLE_TIMEOUT_MS = config.STREAM_IDLE_TIMEOUT_MS
 
 const KEEPALIVE = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
-  maxSockets: 16,
-  maxFreeSockets: 8,
+  // A lane serves ONE upstream request at a time, so a pool of 16 sockets is not
+  // about parallelism -- it is headroom so a socket left in TIME_WAIT is never a
+  // reason to build a new TLS connection. maxFreeSockets is kept low because an
+  // idle socket is dropped by the upstream gateway anyway; holding 8 dead ones
+  // meant the first request after a quiet period paid a full handshake.
+  maxSockets: 8,
+  maxFreeSockets: 2,
   // Must outlast the first-byte budget, otherwise the agent kills the socket
   // before prefill completes.
   timeout: FIRST_BYTE_TIMEOUT_MS + 60000,
@@ -80,18 +86,34 @@ function parseUpstream (raw, model, onText) {
   }
   const parts = []
   const toolCalls = []
+  // responses-dialect calls are keyed by output_index, which is NOT the array
+  // position: a reasoning item takes a slot of its own. Map it to the call's own
+  // real index so an interleaved or sparse stream still folds into one entry per
+  // call with the right arguments attached.
+  const callIndexByOutput = new Map()
   let usage = null
   let finishReason = null
   let sawDone = false
+  // Accumulates the pieces of a multi-line `data:` field until it parses.
+  let dataParts = []
 
   for (const line of raw.split(/\n/)) {
     if (!line.startsWith('data:')) continue
-    const payload = line.slice(5).trim()
-    if (!payload) continue
-    if (payload === '[DONE]') { sawDone = true; continue }
-
+    // SSE allows a field to be split across several `data:` lines, which must be
+    // joined with a newline before parsing. Reading each line independently made a
+    // wrapped frame fail JSON.parse and get dropped -- which surfaced as an empty
+    // answer that then retried forever while the client never saw the text.
+    const piece = line.slice(5).replace(/^ /, '')
+    if (!piece) continue
+    if (sawDone) continue
+    if (piece.trim() === '[DONE]') { sawDone = true; dataParts = []; continue }
+    dataParts.push(piece)
+    // A frame is complete when the next line is not a continuation. Blank-line
+    // framing is handled by the outer split, so flush here when the JSON parses.
+    const payload = dataParts.join('\n')
     let ev
     try { ev = JSON.parse(payload) } catch { continue }
+    dataParts = []
 
     const delta = ev?.choices?.[0]?.delta
     const cd = delta?.content
@@ -109,6 +131,10 @@ function parseUpstream (raw, model, onText) {
         }
         if (tc.id) cur.id = tc.id
         if (tc.type) cur.type = tc.type
+        // Both fields are appended here, and that is correct for the chat dialect:
+        // upstream splits the name across chunks ("ed"+"it") exactly as it splits
+        // arguments, so a client reassembling fragments gets the right name. The
+        // batch boundary is handled in worker.js, which sends each field once.
         if (tc.function?.name) cur.function.name += tc.function.name
         if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
       }
@@ -117,7 +143,11 @@ function parseUpstream (raw, model, onText) {
     // output_index rather than append order: interleaved calls would otherwise merge
     // their arguments into whichever entry happened to be last.
     if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
-      const at = typeof ev.output_index === 'number' ? ev.output_index : toolCalls.length
+      const at = toolCalls.length
+      if (typeof ev.output_index === 'number') callIndexByOutput.set(ev.output_index, at)
+      else callIndexByOutput.set(`pos:${at}`, at)
+      // Name and id are complete in this event, so they are assigned, never
+      // appended: a repeated item event would otherwise double the name.
       toolCalls[at] = {
         id: ev.item.id || '',
         type: 'function',
@@ -125,8 +155,16 @@ function parseUpstream (raw, model, onText) {
       }
     }
     if (ev?.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
-      const at = toolCalls.length - 1
-      if (at >= 0) toolCalls[at].function.arguments += ev.delta
+      // Route by output_index. Using "the last call seen" attached arguments to
+      // the wrong call whenever two ran in parallel, which is what produced a
+      // malformed call with missing required properties.
+      let at = -1
+      if (typeof ev.output_index === 'number') at = callIndexByOutput.get(ev.output_index) ?? -1
+      if (at < 0 && typeof ev.item_id === 'string') {
+        at = toolCalls.findIndex((c) => c && c.id === ev.item_id)
+      }
+      if (at < 0) at = toolCalls.length - 1
+      if (at >= 0 && toolCalls[at]) toolCalls[at].function.arguments += ev.delta
     }
 
     const fr = ev?.choices?.[0]?.finish_reason
@@ -174,17 +212,22 @@ function parseUpstream (raw, model, onText) {
 /**
  * Output budget.
  *
- * These models are reasoning models: with max_output_tokens=32 the entire budget
- * is spent on hidden reasoning and the stream ends with zero answer text. So a
- * tiny explicit request is raised to MIN_OUTPUT_TOKENS.
+ * These are reasoning models: the budget is consumed by reasoning tokens before
+ * any visible text appears. Measured on muse-spark-1.3, prompt asking ~200 words:
  *
- * But when the client sets NO limit the budget must not be small. Upstream stops
- * on its own end-of-sequence, so imposing 512 here truncated long answers
- * mid-sentence -- the reported "only half the text" bug, arriving with
- * finish_reason "length". A missing limit now means effectively unbounded.
+ *   max_tokens=800      empty answer, 40s
+ *   max_tokens=1200     empty answer, 43s
+ *   max_tokens=2000     empty answer, 49s
+ *   max_tokens=4000     215 words, 22s
+ *   max_tokens=omitted  214 words, 14s
+ *
+ * A budget under roughly 4000 yields NOTHING rather than a short answer, which
+ * surfaced as "no lane could serve this request (empty)" and was misdiagnosed as
+ * upstream flakiness for hours. The floor is therefore 4096. A client that sets no
+ * limit gets the much larger default, so nothing is imposed on it.
  */
-const MIN_OUTPUT_TOKENS = Number(process.env.MIN_OUTPUT_TOKENS || 512)
-const DEFAULT_OUTPUT_TOKENS = Number(process.env.DEFAULT_OUTPUT_TOKENS || 32768)
+const MIN_OUTPUT_TOKENS = config.MIN_OUTPUT_TOKENS
+const DEFAULT_OUTPUT_TOKENS = config.DEFAULT_OUTPUT_TOKENS
 
 function outputBudget (maxTokens) {
   if (Number(maxTokens) > 0) return Math.max(maxTokens, MIN_OUTPUT_TOKENS)
@@ -223,7 +266,7 @@ function responsesContent (content, role) {
       }
       if (p.type === 'image_url' || p.type === 'image') {
         const url = p.image_url?.url ?? p.url ?? p.image_url
-        if (url) parts.push({ type: 'input_image', image_url: typeof url === 'string' ? url : url })
+        if (url) parts.push({ type: 'input_image', image_url: url })
         continue
       }
       if (p.type) { parts.push({ ...p, type: partType === 'output_text' ? 'output_text' : p.type }); continue }
@@ -256,6 +299,12 @@ function responsesContent (content, role) {
  */
 function toResponsesInput (messages) {
   const input = []
+  // Fallback call ids must be UNIQUE. Two parallel calls that arrive without ids
+  // both used "call_0", so their function_call items and their results collapsed
+  // into one call: the model then saw a single tool invocation with the wrong
+  // output, which is a silent wrong answer rather than a visible error.
+  let anonymous = 0
+  const nextAnonId = () => `call_${anonymous++}`
   for (const m of messages || []) {
     const role = m?.role
 
@@ -264,7 +313,7 @@ function toResponsesInput (messages) {
       const out = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
       input.push({
         type: 'function_call_output',
-        call_id: m.tool_call_id || m.call_id || m.id || 'call_0',
+        call_id: m.tool_call_id || m.call_id || m.id || nextAnonId(),
         output: out,
       })
       continue
@@ -275,7 +324,7 @@ function toResponsesInput (messages) {
       for (const tc of m.tool_calls) {
         input.push({
           type: 'function_call',
-          call_id: tc.id || tc.tool_call_id || 'call_0',
+          call_id: tc.id || tc.tool_call_id || nextAnonId(),
           name: tc.function?.name || tc.name || '',
           arguments: typeof tc.function?.arguments === 'string'
             ? tc.function.arguments
@@ -292,7 +341,26 @@ function toResponsesInput (messages) {
     const content = responsesContent(m?.content, responsesRole)
     if (content) input.push({ role: responsesRole, content })
   }
+  // An empty input is rejected by the endpoint, and it is reachable: a
+  // conversation of empty turns folds to nothing. Sending one placeholder keeps
+  // the failure a model answer rather than an opaque HTTP 400.
+  if (!input.length) input.push({ role: 'user', content: [{ type: 'input_text', text: '(empty)' }] })
   return input
+}
+
+/**
+ * Canonical form of a tool name for de-duplication.
+ *
+ * Harnesses capitalise: Claude-style clients send `Bash`, `Read`, `Edit`. The
+ * fingerprint placeholders are lowercase (`bash`, `read`, `edit`). A
+ * case-sensitive comparison therefore did not recognise the client's `Bash` as
+ * the same tool, so the relay advertised SEVEN tools for a three-tool client:
+ * the client's real schemas alongside placeholders with `properties: {}`. The
+ * model was offered two bash tools, one accepting nothing, and tool calls landed
+ * on whichever it picked.
+ */
+function normToolName (n) {
+  return String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '')
 }
 
 /** Tool name from either dialect: chat nests it, responses flattens it. */
@@ -301,44 +369,87 @@ function nameOfTool (t) {
 }
 
 /**
+ * Reduce a tool spec of ANY dialect to {name, description, parameters}.
+ *
+ * Harnesses send tool schemas in three different shapes and all of them reach this
+ * relay, because clients post whatever their own SDK expects:
+ *
+ *   chat       { type:'function', function:{ name, description, parameters } }
+ *   responses  { type:'function', name, description, parameters }
+ *   anthropic  { name, description, input_schema }
+ *
+ * Previously anything without `t.function` was forwarded untouched. An
+ * Anthropic-style spec therefore reached upstream as
+ * `{name:'edit', input_schema:{...}}` -- no `type`, and crucially no
+ * `parameters`. The model was never told that file_path, old_string and
+ * new_string were required, so it emitted a call without them and the harness
+ * reported:
+ *
+ *   invalid arguments: missing required property "file_path"
+ *
+ * The same passthrough also broke a responses-shaped spec sent to a chat model,
+ * because chat nests the definition and responses flattens it.
+ */
+function toolShape (t) {
+  const fn = t?.function || {}
+  const parameters = t?.parameters || fn.parameters || t?.input_schema || t?.inputSchema ||
+    t?.schema || null
+  return {
+    name: t?.name || fn.name || null,
+    description: t?.description || fn.description || '',
+    parameters: parameters && typeof parameters === 'object'
+      ? parameters
+      : { type: 'object', properties: {} },
+  }
+}
+
+/** Chat completions shape: the definition lives under `function`. */
+function toChatTool (t) {
+  const { name, description, parameters } = toolShape(t)
+  return { type: 'function', function: { name, description, parameters } }
+}
+
+/** Responses shape: the definition is flat at the top level. */
+function toResponsesTool (t) {
+  const { name, description, parameters } = toolShape(t)
+  return { type: 'function', name, description, parameters }
+}
+
+/** Drop only specs with no name at all -- nothing upstream can address them. */
+function usableTool (t) {
+  return Boolean(toolShape(t).name)
+}
+
+/**
  * Chat-completions tool specs -> responses tool specs.
  *
- * The two dialects nest the function definition differently: chat puts it under
- * `function`, the responses endpoint flattens it to the top level. Forwarding a
- * client's specs unchanged made the responses endpoint reject the request.
+ * The two dialects nest the function definition differently, so a client's specs
+ * are renormalised rather than forwarded: whatever shape arrived, the model must
+ * still be told what each tool's required arguments are.
  */
 function toResponsesTools (tools) {
-  return tools.map((t) => {
-    if (t.type !== 'function' || !t.function) {
-      // Already flat (responses-shaped) or a non-function tool: pass through.
-      return t
-    }
-    return {
-      type: 'function',
-      name: t.function.name,
-      description: t.function.description || '',
-      parameters: t.function.parameters || { type: 'object', properties: {} },
-    }
-  })
+  return tools.filter(usableTool).map(toResponsesTool)
 }
 
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools }) {
   const protocol = protocolFor(model)
 
-  // The client's tools are ADDED to the fingerprint tools, never substituted.
+  // Client tool specs are normalised into the target dialect's shape and unioned
+  // with the gateway's own tools; they are never substituted for them.
   //
-  // The gateway needs the fingerprint tool names present to grant free-tier
-  // access. Substituting the client's list broke that: a client declaring only
-  // `edit` removed bash/glob/grep/read and upstream answered 403, which surfaced
-  // as "no lane could serve this request (gate)". A union keeps the gate satisfied
-  // while still advertising the real tools the harness will run -- so the model can
-  // actually call `edit`, `write`, or anything else the caller provides.
-  const clientTools = Array.isArray(tools) ? tools : []
+  // The gateway's access check needs its four tool names present EXACTLY as spelled
+  // (bash, glob, grep, read). A gateway tool is therefore suppressed only when the
+  // client declares a tool with that identical name. An earlier version matched
+  // case-insensitively, so a client declaring `Bash` removed the gateway's `bash`,
+  // and every request answered `403 FreeTierError` -- measured on big-pickle,
+  // exo-free and muse-spark with an Anthropic-style Bash/Edit tool set, while the
+  // same tools spelled lowercase passed.
+  const clientTools = (Array.isArray(tools) ? tools : []).filter(usableTool)
   const clientNames = new Set(clientTools.map(nameOfTool).filter(Boolean))
 
   const chatTools = [
     ...fingerprintToolSpecs().filter((t) => !clientNames.has(t.function.name)),
-    ...clientTools,
+    ...clientTools.map(toChatTool),
   ]
   const respTools = [
     ...fingerprintToolSpecsResponses().filter((t) => !clientNames.has(t.name)),
@@ -363,12 +474,17 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
 
   // Chat dialect: keep the original messages, only normalise tool entries.
   const msgs = []
+  let anonIds = 0
   if (system) msgs.push({ role: 'system', content: system })
   for (const m of messages || []) {
     if (m.role === 'tool') {
       msgs.push({
+        // Distinct fallback ids, not a shared literal. A turn carrying several
+        // tool results without tool_call_id gave them all `call_0`, so the first
+        // was answered N times and the rest were orphaned. Matching the assistant
+        // tool_calls order is the only reliable correlation available here.
         role: 'tool',
-        tool_call_id: m.tool_call_id || 'call_0',
+        tool_call_id: m.tool_call_id || `call_${anonIds++}`,
         content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
       })
     } else if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
@@ -405,13 +521,20 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
   const { model, messages, system, maxTokens, temperature, topP, tools } = job || {}
   const protocol = protocolFor(model)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools }))
-  const url = new URL(ZEN_BASE + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
+  const url = new URL(zenBase() + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
 
   const started = Date.now()
   return new Promise((resolve) => {
     let settled = false
     let sawByte = false
-    const fin = (v) => { if (!settled) { settled = true; resolve(v) } }
+    let idleTimer = null
+    const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null } }
+    const fin = (v) => {
+      if (settled) return
+      settled = true
+      clearIdle()
+      resolve(v)
+    }
 
     const req = https.request({
       hostname: url.hostname,
@@ -431,15 +554,14 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       // Tracks which output_index is currently receiving arguments, and the last
       // index seen, so the responses dialect can assign real positions.
       let activeCall = -1
-      let nextOutputIndex = 0
+      let nextFoldedPos = 0
       const callsByIndex = new Map()
+      const outIdxToCall = new Map()
       res.on('data', (c) => {
-        if (!sawByte) {
-          sawByte = true
-          // First byte arrived, so the slow-prefill budget is spent; from here a
-          // silent socket is a stall rather than legitimate prefill.
-          req.setTimeout(STREAM_IDLE_TIMEOUT_MS)
-        }
+        // Every byte is progress. The first one spends the long prefill budget;
+        // from then on a silent socket is a stall rather than legitimate prefill.
+        sawByte = true
+        armIdle(STREAM_IDLE_TIMEOUT_MS)
         chunks.push(c)
         if (!onDelta && !onToolCall && !onToolDelta) return
         carry += c.toString('utf8')
@@ -477,12 +599,39 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
             // output_index is the real position. Hardcoding 0 -- as this did -- made
             // every parallel call collide on one index, so a client reassembling by
             // index merged separate calls' arguments into one malformed object.
-            activeCall = typeof ev.output_index === 'number' ? ev.output_index : nextOutputIndex++
+            // Use the FOLDED array position, not output_index. parseUpstream places a call at
+            // toolCalls[length], and the relay's finaliser keys streamed arguments
+            // by that same position. Emitting output_index here made the two
+            // disagree whenever a reasoning item occupied an earlier output slot
+            // -- calls merged, ids landed on the wrong entry, and arguments became
+            // unparseable.
+            activeCall = nextFoldedPos++
+            if (typeof ev.output_index === 'number') outIdxToCall.set(ev.output_index, activeCall)
             callsByIndex.set(activeCall, { index: activeCall, id: ev.item.id || '', type: 'function', function: { name: ev.item.name || '', arguments: '' } })
-            onToolDelta?.([{ ...callsByIndex.get(activeCall) }])
+            // Emit ONLY the identity here. A shallow spread shares the nested
+            // `function` object, so the arguments accumulated below would also
+            // appear on this fragment -- and since the worker serialises fragments
+            // at flush time (DELTA_BATCH_MS later), it would carry the *whole*
+            // argument string and then be concatenated a second time by the
+            // batch merger. That produced unparseable arguments and the client-side
+            // "missing required property file_path" failure.
+            onToolDelta?.([{
+              index: activeCall,
+              id: callsByIndex.get(activeCall).id,
+              type: 'function',
+              function: { name: callsByIndex.get(activeCall).function.name, arguments: '' },
+            }])
           }
           if (ev?.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
-            const cur = callsByIndex.get(activeCall)
+            // Route by output_index, falling back to item_id. "The last call seen"
+            // attached arguments to the wrong call whenever two ran in parallel.
+            let at = activeCall
+            if (typeof ev.output_index === 'number' && outIdxToCall.has(ev.output_index)) {
+              at = outIdxToCall.get(ev.output_index)
+            } else if (typeof ev.item_id === 'string') {
+              for (const [k, v] of callsByIndex) { if (v.id && v.id === ev.item_id) { at = k; break } }
+            }
+            const cur = callsByIndex.get(at)
             if (cur) {
               cur.function.arguments += ev.delta
               onToolDelta?.([{ index: cur.index, function: { arguments: ev.delta } }])
@@ -503,12 +652,18 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
         // not an answer. Measured on muse-spark: 4 of 5 requests. Reported as
         // 'empty' so the relay retries on another egress IP instead of handing
         // the client a blank completion.
-        const isEmpty = verdict.kind === 'ok' &&
-          data?.choices &&
+        const hasChoices = Array.isArray(data?.choices) && data.choices.length > 0
+        // A 200 whose body is an error envelope (no `choices`) is not a successful
+        // empty answer: serving it gave the client content:"" with finish_reason
+        // "stop", HTTP 200, no retry and no error. Such a body is reported as
+        // provider_error so it is counted, retried once, and surfaced honestly.
+        const errorInOk = verdict.kind === 'ok' && data && !hasChoices && data.error
+        const isEmpty = verdict.kind === 'ok' && hasChoices &&
           !String(msg?.content ?? '').trim() &&
           !Array.isArray(msg?.tool_calls)
         fin({
           ...verdict,
+          ...(errorInOk ? { kind: 'provider_error' } : {}),
           ...(isEmpty ? { kind: 'empty' } : {}),
           status: res.statusCode,
           raw,
@@ -521,14 +676,34 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
     // Phase 1: waiting on the first byte. Prefill on a large prompt is slow but
     // healthy, so the budget is long. Phase 2: after tokens start, a silent
     // socket means something is wedged, so the budget tightens sharply.
-    req.setTimeout(FIRST_BYTE_TIMEOUT_MS, () => {
-      if (sawByte) {
-        req.destroy()
-        fin({ kind: 'timeout', status: 0, raw: '', data: null, ms: Date.now() - started })
-      } else {
-        req.setTimeout(STREAM_IDLE_TIMEOUT_MS)
-      }
-    })
+    //
+    // The timer is re-armed WITH a callback every time. `setTimeout(ms, cb)` on a
+    // request registers a one-shot 'timeout' listener, so re-arming without one
+    // (as this did) left the second window with no handler at all: a connection
+    // that never sent a byte hung the lane until the job's own timeout instead of
+    // being abandoned and retried on another runner.
+    const onIdle = () => {
+      idleTimer = null
+      // Both phases end the same way; only the budget differs. A stall with the
+      // wrong wall-clock label is still a stall, and the attempt is retried.
+      req.destroy()
+      fin({
+        kind: 'timeout',
+        status: 0,
+        raw: sawByte ? 'stream stalled after first byte' : 'no first byte within budget',
+        data: null,
+        ms: Date.now() - started,
+      })
+    }
+    const armIdle = (ms) => {
+      clearIdle()
+      // A local timer is used rather than req.setTimeout because it can be
+      // re-armed indefinitely and fires exactly once per window. The socket-level
+      // timeout is left to the agent, which must outlast the prefill budget.
+      idleTimer = setTimeout(onIdle, ms)
+      idleTimer.unref?.()
+    }
+    armIdle(FIRST_BYTE_TIMEOUT_MS)
     req.on('error', (e) => fin({ kind: 'error', status: 0, raw: String(e.message), data: null, ms: Date.now() - started }))
     if (signal) {
       signal.addEventListener('abort', () => {
@@ -563,7 +738,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
 // and forbidding them in a preamble) is wrong for a harness -- it turned every
 // "I'll read the configs" into narration followed by nothing, which is exactly the
 // "fake promise" symptom.
-const TOOL_MODE = (process.env.TOOL_MODE || 'passthrough').toLowerCase()
+const TOOL_MODE = String(config.TOOL_MODE || 'passthrough').toLowerCase()
 /**
  * Decide what to do with a tool call, given what the client has already seen.
  *
@@ -625,7 +800,7 @@ export async function callUpstream (job, opts = {}) {
   if (job?.system) history.push({ role: 'system', content: job.system })
   for (const m of job?.messages || []) history.push(m)
 
-  const TOOL_ROUNDS = Number(process.env.TOOL_ROUNDS || 2)
+  const TOOL_ROUNDS = config.TOOL_ROUNDS
   for (let round = 1; round <= TOOL_ROUNDS; round++) {
     history.push({ role: 'assistant', content: null, tool_calls: calls })
     for (const tc of calls) {

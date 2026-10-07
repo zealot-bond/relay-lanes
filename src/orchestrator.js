@@ -20,12 +20,10 @@ const WORKFLOW = config.GH_WORKFLOW
 const REF = config.GH_REF
 const TARGET = config.LANES_TARGET
 const TICK_MS = config.ORCH_TICK_MS
-// Lanes kept warm while the relay is idle: enough to absorb a burst instantly,
-// without paying for a full pool around an empty queue.
 // Lanes held warm while the relay is idle. Defaults to TARGET so the pool is
 // genuinely full and a request never waits on a cold start. Lower it to cut
 // runner minutes when the relay is idle for long stretches.
-const STANDBY = Number(process.env.LANES_STANDBY || TARGET)
+const STANDBY = config.LANES_STANDBY > 0 ? config.LANES_STANDBY : TARGET
 const API = 'https://api.github.com'
 const PORT = config.PORT
 // The lane needs to reach this relay. Passing it as a dispatch input means the
@@ -33,6 +31,11 @@ const PORT = config.PORT
 // impossible to know reliably from inside a container.
 const RELAY_TOKEN = config.RELAY_TOKEN
 const PUBLIC_URL = config.RELAY_PUBLIC_URL.replace(/\/$/, '')
+
+// Two polls every tick, for the life of the process. Without keep-alive each one
+// paid a fresh TLS handshake, and GitHub's secondary rate limiter counts
+// connection churn against the same budget as requests.
+const GH_AGENT = new https.Agent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: 4 })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const stamp = () => new Date().toISOString().slice(11, 19)
@@ -42,6 +45,7 @@ function api (path, { method = 'GET', body } = {}) {
     const data = body === undefined ? null : JSON.stringify(body)
     const req = https.request(API + path, {
       method,
+      agent: GH_AGENT,
       headers: {
         Accept: 'application/vnd.github+json',
         'User-Agent': 'relay-orchestrator',
@@ -53,6 +57,7 @@ function api (path, { method = 'GET', body } = {}) {
       let raw = ''
       res.on('data', (c) => { raw += c; })
       res.on('end', () => {
+        // Consume the body before the socket can be reused.
         if (res.statusCode >= 300) return reject(new Error(`HTTP ${res.statusCode} ${raw.slice(0, 160)}`))
         try { resolve(raw ? JSON.parse(raw) : null) } catch (e) { reject(e) }
       })
@@ -64,12 +69,28 @@ function api (path, { method = 'GET', body } = {}) {
   })
 }
 
+/**
+ * Count this workflow's runs.
+ *
+ * Each status is fetched independently and a failed half degrades to a known
+ * value rather than rejecting the pair: with Promise.all a transient 5xx on the
+ * queued query failed the whole tick, so nothing was dispatched even though the
+ * in-progress count was known. A failed count is reported as UNKNOWN, and the
+ * caller then trusts the relay's own lane registry instead of assuming zero --
+ * assuming zero is what produced a burst of 20 duplicate runs.
+ */
 const counts = async () => {
-  const [inProgress, queued] = await Promise.all([
-    api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?status=in_progress&per_page=100`),
-    api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?status=queued&per_page=100`),
-  ])
-  return { active: inProgress?.workflow_runs?.length ?? 0, queued: queued?.workflow_runs?.length ?? 0 }
+  const one = async (status) => {
+    try {
+      const r = await api(`/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?status=${status}&per_page=100`)
+      const runs = r?.workflow_runs
+      if (!Array.isArray(runs)) return null
+      return runs.length
+    } catch { return null }
+  }
+  const [inProgress, queued] = await Promise.all([one('in_progress'), one('queued')])
+  if (inProgress === null && queued === null) return { active: null, queued: null, known: false }
+  return { active: inProgress ?? 0, queued: queued ?? 0, known: true }
 }
 
 /**
@@ -97,7 +118,7 @@ async function resolveRelayUrl () {
 
 // How recently a lane must have been seen to count as live. Generous: a lane
 // long-polls for 20s at a time and only heartbeats on that cycle.
-const LANE_FRESH_MS = Number(process.env.LANE_FRESH_MS || 120000)
+const LANE_FRESH_MS = config.LANE_FRESH_MS
 
 async function main () {
   if (!TOKEN || !REPO) {
@@ -109,7 +130,12 @@ async function main () {
     `every ${TICK_MS / 1000}s`)
   console.log(`[orch] lanes will call back on ${relayUrl || '(unknown: dispatching without a url!)'}`)
   if (!relayUrl) {
-    console.error('[orch] no relay URL could be determined; set RELAY_PUBLIC_URL in baked-credentials.json')
+    // Do not dispatch at all. A run with no callback URL registers against
+    // 127.0.0.1, throws, and exits 1 -- so every dispatch burns runner minutes
+    // and a slice of the hourly budget on a run that provably cannot work.
+    console.error('[orch] no relay URL could be determined; NOT dispatching. ' +
+      'Set RELAY_PUBLIC_URL in baked-credentials.json')
+    return
   }
 
   // Fail loudly and early if the workflow does not exist in that repo. A 404 here
@@ -124,11 +150,11 @@ async function main () {
   // start take 30 minutes (one lane per 90s), which is the opposite of what a
   // pool is for. GitHub queues dispatches itself and starts them as concurrency
   // slots free, so a burst is safe and is the fastest path to N lanes.
-  const BUDGET_PER_HOUR = Number(process.env.DISPATCH_BUDGET || 400)
-  const MAX_BURST = Number(process.env.DISPATCH_BURST || 20)
-  const DISPATCH_SPACING_MS = Number(process.env.DISPATCH_SPACING_MS || 700)
+  const BUDGET_PER_HOUR = config.DISPATCH_BUDGET
+  const MAX_BURST = config.DISPATCH_BURST
+  const DISPATCH_SPACING_MS = config.DISPATCH_SPACING_MS
   // Only a failing dispatch backs off. A success means the config is right.
-  const COOLDOWN_MS = Number(process.env.DISPATCH_COOLDOWN_MS || 30000)
+  const COOLDOWN_MS = config.DISPATCH_COOLDOWN_MS
   let dispatches = []
   let cooldownUntil = 0
 
@@ -140,7 +166,7 @@ async function main () {
 
   for (;;) {
     try {
-      const { active, queued } = await counts()
+      const { active, queued, known } = await counts()
 
       // The orchestrator shares a process with the relay, so it reads the real
       // queue. Pending work scales the pool to TARGET; an idle pool settles at
@@ -162,7 +188,15 @@ async function main () {
       // A queued run is a lane that will exist, so max() is the safe reading: it
       // dispatches only when neither view shows a pool.
       const liveLanes = lanes.liveLanes(LANE_FRESH_MS).length
-      const capacity = Math.max(liveLanes, active + queued)
+
+      // When the GitHub API could not be reached at all, its counts are unknown,
+      // not zero. Treating unknown as zero is the restart flood: trust only the
+      // relay's own registry for this tick and record the API as unavailable.
+      if (!known) {
+        console.error(`${stamp()} [orch] github run counts unavailable; using lane registry only ` +
+          `(lanes=${liveLanes})`)
+      }
+      const capacity = known ? Math.max(liveLanes, active + queued) : liveLanes
       const deficit = target - capacity
       const left = budgetLeft()
 

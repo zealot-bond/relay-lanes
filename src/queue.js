@@ -18,7 +18,7 @@ let seq = 0
 const nextId = () => `job-${Date.now().toString(36)}-${(seq++).toString(36)}`
 
 export class WorkQueue extends EventEmitter {
-  constructor ({ maxPending = 5000, claimLeaseMs = 90000 } = {}) {
+  constructor ({ maxPending = 5000, claimLeaseMs = 90000, avoidTtlMs = 60000 } = {}) {
     super()
     // Each waiting lane registers one 'work' listener, so a full pool legitimately
     // exceeds Node's default cap of 10 and warns about a leak that does not
@@ -32,6 +32,10 @@ export class WorkQueue extends EventEmitter {
     // claim is reclaimed after this long so one dead lane cannot strand work or
     // make a healthy lane look busy.
     this.claimLeaseMs = claimLeaseMs
+    // How long a lane stays marked as a bad retry target for an entry it just
+    // failed. Long enough to try someone else, short enough that the mark cannot
+    // strand work behind it.
+    this.avoidTtlMs = avoidTtlMs
   }
 
   /**
@@ -42,17 +46,50 @@ export class WorkQueue extends EventEmitter {
  * lane would claim it, burn a full upstream call serving nobody, and the lease
  * would expire and hand it back again, forever, starving real requests.
  */
-reapStaleClaims () {
+  /**
+   * Refresh the lease on everything a lane is currently holding.
+   *
+   * Called from /lane/heartbeat and /lane/claim. A lane mid-way through a long
+   * tool turn (or a 600s prefill) is heartbeating the whole time, so its claim is
+   * provably still live and must not be handed to a second lane. Without this the
+   * reaper requeued work that was still being served, and two lanes streamed the
+   * same request into one client: interleaved text and scrambled tool arguments.
+   */
+  touchLane (laneId) {
+    const now = Date.now()
+    for (const entry of this.inflight.values()) {
+      if (entry.claimedBy === laneId) entry.claimedAt = now
+    }
+  }
+
+  /**
+ * Return claims whose lane never reported, so the work is not lost.
+ *
+   * An entry that has already finished, or whose client disconnected, is dropped
+   * rather than requeued. Requeuing a dead entry is what created a zombie loop: a
+   * lane would claim it, burn a full upstream call serving nobody, and the lease
+   * would expire and hand it back again, forever, starving real requests.
+   *
+   * `laneAlive` is supplied by the caller (which owns the lane registry): a claim
+   * held by a lane that is still heartbeating is live no matter how long the lease
+   * says, because claim age and lane liveness are different questions. Requeueing
+   * work a live lane is still serving is what let two lanes stream into one
+   * client at once -- interleaved text and doubled tool-call arguments.
+   */
+  reapStaleClaims (laneAlive = () => false) {
     const now = Date.now()
     const reaped = []
     for (const entry of this.inflight.values()) {
-      if (entry.claimedAt && now - entry.claimedAt > this.claimLeaseMs) {
-        this.inflight.delete(entry.id)
-        entry.pendingResolve = null
-        if (entry.done || entry.abandoned) continue
-        this.pending.push(entry)
-        reaped.push(entry)
-      }
+      if (!entry.claimedAt || now - entry.claimedAt <= this.claimLeaseMs) continue
+      if (laneAlive(entry.claimedBy)) continue
+      this.inflight.delete(entry.id)
+      // Wake any dispatcher blocked on this entry: it is going back in the queue,
+      // and leaving it waiting on a promise nobody will resolve is how a request
+      // ended up held for the full ATTEMPT_HARD_MS with no lane assigned.
+      this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null })
+      if (entry.done || entry.abandoned) continue
+      this.pending.push(entry)
+      reaped.push(entry)
     }
     if (reaped.length) this.emit('work')
     return reaped
@@ -78,15 +115,69 @@ reapStaleClaims () {
     return { ok: true, id: job.id }
   }
 
-  /** A lane claims the oldest job. Returns null when the queue is empty. */
+  /**
+   * A lane claims work. Returns null when nothing is claimable.
+   *
+   * The oldest entry is preferred, EXCEPT one this lane is marked as having
+   * already failed. Retrying a request on the egress IP that just rejected it
+   * wastes a full upstream call: a 4xx is identical from the same IP and an
+   * exhausted bucket is still exhausted. A lane the entry wants to avoid is
+   * therefore skipped while any other entry is available; when it is the only
+   * work left the entry is served anyway rather than stranded in the queue.
+   */
   claim (laneId) {
-    const entry = this.pending.shift()
-    if (!entry) return null
+    if (!this.pending.length) return null
+    // Prefer the oldest entry this lane has NOT recently failed. A lane the
+    // request already burned is the worst retry target: the same egress IP
+    // reproduces the same 4xx, and an exhausted bucket is still exhausted.
+    //
+    // The mark EXPIRES (see avoidTtlMs) rather than being a permanent block. As a
+    // hard filter it would strand work whenever every live lane had tried the
+    // entry; with an expiry the worst case is that a lane retries one entry after
+    // the window, exactly as it did before this existed.
+    const now = Date.now()
+    let idx = this.pending.findIndex((e) => !this._avoids(e, laneId, now))
+    if (idx === -1) idx = 0
+    const [entry] = this.pending.splice(idx, 1)
     entry.claimedBy = laneId
     entry.claimedAt = Date.now()
     entry.attempts++
     this.inflight.set(entry.id, entry)
     return entry
+  }
+
+  /** Has this lane failed this entry recently enough that it should not retry? */
+  _avoids (entry, laneId, now) {
+    const at = entry.avoid?.get?.(laneId)
+    if (!at) return false
+    if (now - at > this.avoidTtlMs) {
+      entry.avoid.delete(laneId)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Wake a dispatcher parked on this entry, if there is one.
+   *
+   * `deliverResult` in server.js owns the resolver; the queue only knows the entry
+   * object, so the wake is expressed as a queued result the dispatcher will pick
+   * up. That keeps one mechanism instead of two (and the old two could disagree,
+   * which hung a request with a result sitting in a field nobody read).
+   */
+  _wake (entry, result) {
+    if (typeof entry.resultWaiter === 'function') {
+      const wake = entry.resultWaiter
+      entry.resultWaiter = null
+      wake(result)
+    }
+  }
+
+  /** Mark a lane as a bad retry target for an entry, for a bounded window. */
+  avoidLane (entry, laneId) {
+    if (!entry || !laneId) return
+    if (!entry.avoid) entry.avoid = new Map()
+    entry.avoid.set(laneId, Date.now())
   }
 
   complete (jobId, result) {
@@ -111,11 +202,15 @@ reapStaleClaims () {
     this.inflight.delete(entry.id)
     const at = this.pending.indexOf(entry)
     if (at !== -1) this.pending.splice(at, 1)
-    if (entry.done) return
+    // The client promise must be settled even when the entry was already marked
+    // done by abandon(). Returning early here left handleChat parked forever, so
+    // `streamers.delete()` never ran and every aborted streaming request leaked
+    // its closure for the life of the process.
+    const firstSettlement = !entry.done
     entry.done = true
-    entry.pendingResolve = null
+    this._wake(entry, { kind: 'finished' })
     entry.resolve?.(result)
-    this.emit('done', { entry, result })
+    if (firstSettlement) this.emit('done', { entry, result })
   }
 
   /** Drop an entry whose client is gone, so no lane spends time on it. */
@@ -123,10 +218,14 @@ reapStaleClaims () {
     if (!entry) return
     entry.abandoned = true
     entry.done = true
-    entry.pendingResolve = null
     this.inflight.delete(entry.id)
     const at = this.pending.indexOf(entry)
     if (at !== -1) this.pending.splice(at, 1)
+    // Settle the dispatcher. Without this it stays parked on its attempt promise
+    // until ATTEMPT_HARD_MS expires, and handleChat never gets to delete its
+    // streamer entry, so every abandoned request leaks one closure for the life
+    // of the process.
+    this._wake(entry, { kind: 'abandoned', status: 0, ms: 0, data: null })
   }
 
   /**
@@ -142,7 +241,13 @@ reapStaleClaims () {
     // Never resurrect finished or abandoned work.
     if (entry.done || entry.abandoned) return false
     this.inflight.delete(entry.id)
-    entry.pendingResolve = null
+    // Never let the same entry sit in `pending` twice. Two callers can requeue
+    // (the reaper hands work back while the dispatcher is also retrying), and a
+    // duplicated entry is claimed by two lanes at once -- both stream into the
+    // same client, which is interleaved text and scrambled tool arguments.
+    if (this.pending.includes(entry)) return true
+    this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null })
+    entry.claimedBy = null
     if (front) this.pending.unshift(entry)
     else this.pending.push(entry)
     this.emit('work')
@@ -178,10 +283,17 @@ export class LaneRegistry extends EventEmitter {
     super()
     this.lanes = new Map()   // laneId -> lane record (live)
     this.retired = []        // history, so bucket exhaustion stays countable
+    // Ids whose egress bucket is spent. A retired lane must never serve again:
+    // the worker re-registers itself when the relay says "lane not registered"
+    // (which is how it recovers from a relay restart), and without this it would
+    // walk straight back in and spend its dead IP on more work.
+    this.tombstones = new Map()  // laneId -> retiredAt
     this.maxLanes = maxLanes
   }
 
   register (laneId, meta = {}) {
+    const dead = this.tombstones.get(laneId)
+    if (dead) return { retired: true, retiredAt: dead }
     const existing = this.lanes.get(laneId)
     if (existing) {
       existing.lastSeen = Date.now()
@@ -206,13 +318,26 @@ export class LaneRegistry extends EventEmitter {
       status: 'idle',        // idle | busy | exhausted | dead
       ...meta,
     }
+    // Never let spread-over-meta reinstate a tombstoned status.
+    lane.status = 'idle'
     this.lanes.set(laneId, lane)
     this.emit('lane:up', lane)
     return lane
   }
 
   /** Forget lanes that have stopped reporting. Returns the ids removed. */
-  prune (staleMs = 300000) {
+  /**
+ * Forget lanes that stopped reporting.
+ *
+ * `staleMs` must not exceed the window dispatch uses to consider a lane live.
+ * It used to default to 300s while selection used 45s, so after a mass lane death
+ * (lanes start in bursts and reach MAX_LIFETIME_S together) the pool reported zero
+ * live lanes while every registration slot was still held: /lane/register returned
+ * "lane capacity reached" for five minutes, the new runners exited immediately, and
+ * the orchestrator burned its dispatch budget on lanes that could never start.
+ * Generous enough to cover a heartbeat gap, short enough to free the slot.
+ */
+prune (staleMs = 60000) {
     const now = Date.now()
     const gone = []
     for (const [id, lane] of this.lanes) {
@@ -254,6 +379,17 @@ export class LaneRegistry extends EventEmitter {
    */
   retire (laneId, reason) {
     const lane = this.lanes.get(laneId)
+    // Tombstone even a lane that is already gone from the live map: a result can
+    // arrive after the record was pruned, and the retirement must still stick.
+    this.tombstones.set(laneId, Date.now())
+    if (this.tombstones.size > 2000) {
+      // Keep the map bounded without losing recent retirements.
+      const cutoff = Date.now() - 24 * 3600000
+      for (const [id, at] of this.tombstones) {
+        if (at > cutoff) break
+        this.tombstones.delete(id)
+      }
+    }
     if (!lane) return false
     lane.status = 'retired'
     lane.retiredReason = reason

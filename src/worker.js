@@ -2,9 +2,14 @@
 // to stop or its egress IP reports exhaustion.
 
 import { callUpstream, destroyKeepalive } from './lane.js'
+import { mergeToolDeltas } from './toolmerge.js'
+import { CODE_VERSION } from './codeversion.js'
+import { config } from './config.js'
 
 const RELAY = (process.env.RELAY_URL || 'http://127.0.0.1:8791').replace(/\/$/, '')
-const TOKEN = process.env.RELAY_TOKEN || 'relay'
+// The relay token is the one value the lane cannot get from baked config: the
+// orchestrator passes it as a dispatch input, so env wins here.
+const TOKEN = process.env.RELAY_TOKEN || config.RELAY_TOKEN
 const LANE_ID = process.env.LANE_ID ||
   `runner-${process.env.GITHUB_RUN_ID || 'local'}-${process.env.GITHUB_RUN_ATTEMPT || '0'}`
 // A lane should live until its egress bucket is spent (exit 75) or it genuinely
@@ -21,40 +26,8 @@ const IDLE_EXIT_S = Number(process.env.LANE_IDLE_EXIT_S || 2400)
 // token would cost more than the tokens themselves; a short window keeps
 // time-to-first-token near upstream latency while collapsing a burst of tokens
 // into one request.
-const DELTA_BATCH_MS = Number(process.env.DELTA_BATCH_MS || 40)
+const DELTA_BATCH_MS = config.DELTA_BATCH_MS
 
-/**
- * Collapse streamed tool-call fragments into one entry per index.
- *
- * Batching is what makes streaming affordable, but naively concatenating the
- * fragments produced this on the wire:
- *
- *   delta.tool_calls = [ {index:0, function:{name:null, arguments:"{\"file_path\": "}},
- *                         {index:0, function:{name:null, arguments:"\""}}, ... ]
- *
- * Every fragment was its own array element, all sharing index 0, with no `id` and
- * a null `name`. A strict tool-use validator reads that as one call missing its
- * required properties -- which is exactly the reported failure:
- *   invalid arguments: missing required property "file_path" / "old_string" / "new_string"
- *
- * One entry per index, arguments concatenated, identity fields taken from the first
- * fragment that carries them, is what a client expects to reassemble.
- */
-function mergeToolDeltas (frags) {
-  const byIndex = new Map()
-  for (const d of frags) {
-    const i = typeof d.index === 'number' ? d.index : 0
-    const cur = byIndex.get(i) || { index: i, type: 'function', function: { name: '', arguments: '' } }
-    if (d.id && !cur.id) cur.id = d.id
-    if (d.type && !cur.type) cur.type = d.type
-    if (d.function) {
-      if (d.function.name) cur.function.name += d.function.name
-      if (d.function.arguments) cur.function.arguments += d.function.arguments
-    }
-    byIndex.set(i, cur)
-  }
-  return [...byIndex.values()]
-}
 
 const H = { 'Content-Type': 'application/json', 'x-relay-token': TOKEN }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -78,12 +51,23 @@ async function main () {
     runnerId: process.env.GITHUB_RUN_ID,
     attempt: process.env.GITHUB_RUN_ATTEMPT,
     repo: process.env.GITHUB_REPOSITORY,
+    // Lets the relay tell which code this runner is executing. Runners check out a
+    // git repo while the relay ships in a jar, so the two drift apart silently.
+    codeVersion: CODE_VERSION,
   })
   if (!reg?.ok) {
     if (reg?.error === 'lane capacity reached') {
       // Not a failure. The pool is full, so this runner has no work to do and
       // exiting immediately avoids burning runner minutes for nothing.
       console.log('[lane] relay is at lane capacity; nothing to do')
+      destroyKeepalive()
+      process.exit(0)
+    }
+    if (reg?.error === 'lane retired') {
+      // The relay remembers this lane id as spent. Never re-enter: a retired
+      // egress IP can only answer 429, and rejoining would burn runner minutes
+      // rediscovering that.
+      console.log('[lane] this lane id was retired (bucket spent); exiting')
       destroyKeepalive()
       process.exit(0)
     }
@@ -119,7 +103,15 @@ async function main () {
     // this a relay restart silently idles every lane until the job times out.
     if (claim?.error === 'lane not registered') {
       console.log('[lane] relay forgot this lane, re-registering')
-      const r = await post('/lane/register', { laneId: LANE_ID, rejoin: true }).catch(() => null)
+      const r = await post('/lane/register', { laneId: LANE_ID, rejoin: true, codeVersion: CODE_VERSION }).catch(() => null)
+      if (r?.error === 'lane retired') {
+        // Retired while we were away: this runner's egress bucket is spent, so
+        // there is nothing left to do with it. Exiting lets the orchestrator
+        // start a fresh runner with a fresh IP.
+        console.log('[lane] relay retired this lane while disconnected; exiting')
+        destroyKeepalive()
+        process.exit(0)
+      }
       if (!r?.ok) await sleep(3000)
       continue
     }
@@ -142,22 +134,39 @@ async function main () {
     let pending = []
     let pendingTools = []
     let deltaTimer = null
-    let streamedAny = false
-    const flushDelta = async () => {
-      if (deltaTimer) { clearTimeout(deltaTimer); deltaTimer = null }
+    let streamedText = false
+    let streamedTools = false
+    // Survives every flush of this claim: identity arrives in one 40ms window and
+    // arguments in the next, so a per-batch fold would drop the id/name.
+    const toolAcc = new Map()
+    // Flushes are chained, never concurrent. Two overlapping POSTs can be
+    // reordered in flight, and a batch that lands after a later one interleaves
+    // the client's text -- the exact "duplicated / scrambled output" symptom.
+    let flushChain = Promise.resolve()
+    const doFlush = async () => {
       const hasText = pending.length > 0
       const hasTools = pendingTools.length > 0
       if (!hasText && !hasTools) return
       const body = { laneId: LANE_ID, entryId: claim.entryId }
       if (hasText) body.text = pending.join('')
-      if (hasTools) body.toolCalls = mergeToolDeltas(pendingTools)
+      if (hasTools) body.toolCalls = mergeToolDeltas(pendingTools, toolAcc)
       pending = []
       pendingTools = []
       const r = await post('/lane/delta', body).catch(() => null)
-      if (r?.ok) streamedAny = true
+      if (r?.ok) {
+        // Tracked separately: a turn can stream tool calls and no text, and the
+        // relay must not treat that as "the client already saw everything".
+        if (hasText) streamedText = true
+        if (hasTools) streamedTools = true
+      }
+    }
+    const flushDelta = () => {
+      if (deltaTimer) { clearTimeout(deltaTimer); deltaTimer = null }
+      flushChain = flushChain.then(doFlush).catch(() => {})
+      return flushChain
     }
     const schedule = () => {
-      if (!deltaTimer) deltaTimer = setTimeout(flushDelta, DELTA_BATCH_MS)
+      if (!deltaTimer) deltaTimer = setTimeout(() => { flushDelta() }, DELTA_BATCH_MS)
     }
 
     // A lane can legitimately be busy for minutes on a large prompt. Without this it
@@ -169,24 +178,34 @@ const busyHeartbeat = setInterval(() => {
 }, 20000)
 busyHeartbeat.unref?.()
 
-    const result = await callUpstream(claim.job, {
-      // Only stream when the client asked for a stream. Sending deltas for a
-      // non-streaming request would just be a rejected POST per batch.
-      onDelta: claim.job.stream
-        ? (text) => {
-            pending.push(text)
-            schedule()
-          }
-        : undefined,
-      // Tool-call deltas must reach an agent harness exactly like text does:
-      // it reassembles the call from these to know which tool to run.
-      onToolDelta: claim.job.stream
-        ? (deltas) => {
-            pendingTools.push(...deltas)
-            schedule()
-          }
-        : undefined,
-    })
+    // The result POST is the last thing this claim does, and it must still happen
+    // if callUpstream throws: an unhandled throw here would skip the report
+    // entirely, leaving the relay to serve out the full ATTEMPT_HARD_MS before it
+    // gives up on work that had already finished.
+    let result
+    try {
+      result = await callUpstream(claim.job, {
+        // Only stream when the client asked for a stream. Sending deltas for a
+        // non-streaming request would just be a rejected POST per batch.
+        onDelta: claim.job.stream
+          ? (text) => {
+              pending.push(text)
+              schedule()
+            }
+          : undefined,
+        // Tool-call deltas must reach an agent harness exactly like text does:
+        // it reassembles the call from these to know which tool to run.
+        onToolDelta: claim.job.stream
+          ? (deltas) => {
+              pendingTools.push(...deltas)
+              schedule()
+            }
+          : undefined,
+      })
+    } catch (e) {
+      result = { kind: 'error', status: 0, ms: 0, data: null, raw: String(e?.message || e) }
+      console.error('[lane] callUpstream threw:', e?.stack || e)
+    }
     await flushDelta()
     clearInterval(busyHeartbeat)
 
@@ -205,9 +224,12 @@ busyHeartbeat.unref?.()
         kind: result.kind,
         status: result.status,
         ms: result.ms,
-        // Tells the relay the client already received the text through
-        // /lane/delta, so it must not replay the buffered completion.
-        streamed: streamedAny,
+        // Tells the relay which parts of the answer the client already received
+        // through /lane/delta, so it never replays them. Kept as two flags because
+        // a tool-only turn streams no text and must still send its folded calls.
+        streamed: streamedText || streamedTools,
+        streamedText,
+        streamedTools,
         raw: result.kind === 'ok' ? '' : String(result.raw || '').slice(0, 400),
         data: result.data,
       },
