@@ -36,6 +36,8 @@ const RESPONSES_MODELS = new Set([
 //   PASS responses muse-spark-1.2-contributor-free 4.5s
 //   PASS responses muse-spark-1.3-contributor-free 1.8s
 //
+//   FAIL chat 429 "Endpoint is unavailable"    ling-3.1-flash-free (worked at 1.4s earlier; down now --
+//        the gateway reports an OUTAGE with status 429, so it was mistaken for a rate limit)
 //   FAIL chat 400 "Endpoint is unavailable"    ling-3.0-flash-fin-free
 //   FAIL chat 400 "Model is unavailable"       deepseek-v4-flash-free
 //   FAIL chat 500 / responses 500              jev-1.13-free
@@ -59,7 +61,6 @@ export const MODELS = [
   // Verified present and answering on the chat dialect only.
   { id: 'exo-free', contextWindow: 200000 },
   { id: 'fledge-alpha-free', contextWindow: 200000 },
-  { id: 'ling-3.1-flash-free', contextWindow: 200000 },
   { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
   { id: 'space-bunny-free', contextWindow: 200000 },
 ]

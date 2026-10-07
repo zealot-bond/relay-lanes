@@ -179,6 +179,18 @@ export function classifyUpstream (status, raw) {
   // prompt: how do I raise my rate limit?"), and matching it retired a healthy lane.
   // Prose is trusted only on server-error statuses, where the gateway is the one
   // speaking.
+  // A 429 is not always a rate limit. ling-3.1-flash-free answered
+  //   HTTP 429 {"error":{"type":"server_error","message":"Upstream request failed:
+  //             Endpoint is unavailable."}}
+  // -- the model's endpoint was down, and the status code was simply wrong. Trusting
+  // it retired a lane per request (20 retirements from 10 requests) and made every
+  // runner exit, churning the pool for a fault no egress IP can fix. An outage
+  // message is a model fault, so it is reported as provider_error, which is retried
+  // once and counted toward quarantining the MODEL rather than burning lanes.
+  const modelOutage = /endpoint is unavailable|upstream request failed|model is unavailable|temporarily unavailable/i.test(text) &&
+    !text.includes('FreeUsageLimitError') && !text.includes('rate_limit_error')
+  if (modelOutage) return { kind: 'provider_error' }
+
   const structuredLimit = status === 429 || text.includes('FreeUsageLimitError') ||
     text.includes('rate_limit_error')
 

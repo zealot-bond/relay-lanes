@@ -320,6 +320,8 @@ const scenarios = {
       ['400 echoing the prompt', 400, '{"error":{"message":"invalid prompt: how do I raise my rate limit?"}}', 'provider_error'],
       ['403 gate that mentions rate limits', 403, '{"error":{"type":"FreeTierError","message":"rate limits apply"}}', 'gate'],
       ['real 429', 429, '', 'limited'],
+      ['429 whose body says the endpoint is down', 429, '{"error":{"type":"server_error","message":"Error from provider (Console): Upstream request failed: Endpoint is unavailable."}}', 'provider_error'],
+      ['429 with a structured quota marker is still a limit', 429, '{"error":{"type":"FreeUsageLimitError","message":"Upstream request failed"}}', 'limited'],
       ['structured limit marker', 400, '{"error":{"type":"FreeUsageLimitError"}}', 'limited'],
       ['500 that says rate limit in prose', 500, 'upstream rate limit reached', 'limited'],
       ['plain 500', 500, 'boom', 'transport'],
