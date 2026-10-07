@@ -86,8 +86,15 @@ export class WorkQueue extends EventEmitter {
       // Wake any dispatcher blocked on this entry: it is going back in the queue,
       // and leaving it waiting on a promise nobody will resolve is how a request
       // ended up held for the full ATTEMPT_HARD_MS with no lane assigned.
-      this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null })
+      // Say WHICH lane's claim was reaped. Without it the dispatcher guessed the
+      // lane from its own hint, so the innocent lane was marked as failed while the
+      // dead one stayed eligible.
+      this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null, laneId: entry.claimedBy || undefined })
       if (entry.done || entry.abandoned) continue
+      // Text has already reached the client: serving the entry again from the start
+      // would replay it into a stream that is already committed (observed: the client
+      // received "hello " then "hello world"). The dispatcher finishes it as partial.
+      if (entry.committed) continue
       this.pending.push(entry)
       reaped.push(entry)
     }
@@ -246,7 +253,7 @@ export class WorkQueue extends EventEmitter {
     // duplicated entry is claimed by two lanes at once -- both stream into the
     // same client, which is interleaved text and scrambled tool arguments.
     if (this.pending.includes(entry)) return true
-    this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null })
+    this._wake(entry, { kind: 'requeued', status: 0, ms: 0, data: null, laneId: entry.claimedBy || undefined })
     entry.claimedBy = null
     if (front) this.pending.unshift(entry)
     else this.pending.push(entry)

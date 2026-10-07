@@ -174,17 +174,24 @@ export function classifyUpstream (status, raw) {
   // can never be mistaken for an error.
   if (status < 400) return { kind: 'ok' }
 
-  const limited = status === 429 || text.includes('FreeUsageLimitError') ||
-    text.includes('rate_limit_error') || /rate[_ -]?limit/i.test(text)
+  // Exhaustion is declared by the STATUS or a structured marker, never by prose that
+  // may be quoting the user. A 4xx body routinely echoes the request ("invalid
+  // prompt: how do I raise my rate limit?"), and matching it retired a healthy lane.
+  // Prose is trusted only on server-error statuses, where the gateway is the one
+  // speaking.
+  const structuredLimit = status === 429 || text.includes('FreeUsageLimitError') ||
+    text.includes('rate_limit_error')
+
   // The gateway reports its own access gate two ways: a FreeTierError envelope,
-  // and a prose message from the upstream provider. Only the first was recognised,
-  // so the second fell through to provider_error -- which is retried on another IP
-  // (pointless, the fingerprint does not change) and counted against model health
-  // (wrong, a gate is a config problem, not a sick model).
-  const gate = !limited && (text.includes('FreeTierError') ||
-    /free tier can only be used from within/i.test(text))
-  if (limited) return { kind: 'limited', retryAfter: null }
-  if (gate) return { kind: 'gate' }
+  // and a prose message from the upstream provider. Checked BEFORE prose rate-limit
+  // matching: a 403 gate message that merely mentions "rate limits" is still a gate,
+  // not an exhausted bucket -- retiring the lane would not change the fingerprint.
+  const gate = text.includes('FreeTierError') ||
+    /free tier can only be used from within/i.test(text)
+  if (gate && !structuredLimit) return { kind: 'gate' }
+
+  const proseLimit = status >= 500 && /rate[_ -]?limit/i.test(text)
+  if (structuredLimit || proseLimit) return { kind: 'limited', retryAfter: null }
   if (status >= 500) return { kind: 'transport' }
   return { kind: 'provider_error' }
 }

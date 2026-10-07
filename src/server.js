@@ -32,6 +32,8 @@ const MAX_HOLD_MS = config.MAX_HOLD_MS
 const RETRY_LIMIT = config.RETRY_LIMIT
 const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
 const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
+// How long a finished stream may wait for a slow client to read its tail.
+const END_DRAIN_TIMEOUT_MS = Number(process.env.END_DRAIN_TIMEOUT_MS || 60000)
 
 export const queue = new WorkQueue({ claimLeaseMs: 120000, avoidTtlMs: 60000 })
 export const lanes = new LaneRegistry({ maxLanes: MAX_LANES })
@@ -111,7 +113,14 @@ function noteFailure (model, result) {
   console.error(`[relay] upstream rejected ${model}: ${detail.slice(0, 200)}`)
 }
 
-export function noteModelResult (model, result) {
+const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'empty', 'transport', 'timeout', 'error'])
+
+/** Record an attempt's rejection in recentFailures without touching the health counter. */
+function logAttemptFailure (model, result) {
+  if (!UNCOUNTED_KINDS.has(result.kind)) noteFailure(model, result)
+}
+
+export function noteModelResult (model, result, { log = true } = {}) {
   const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '', until: 0 }
   if (result.kind === 'ok') {
     h.fails = 0
@@ -139,7 +148,7 @@ export function noteModelResult (model, result) {
     ? `upstream returned HTTP ${result.status} (${String(result.raw || '').slice(0, 140).replace(/\s+/g, ' ').trim() || 'no body'})`
     : `upstream ${result.kind}`
   modelHealth.set(model, h)
-  noteFailure(model, result)
+  if (log) noteFailure(model, result)
 }
 
 export function modelHealthOf (model) {
@@ -406,9 +415,20 @@ async function dispatch (entry) {
     // is marked so the retry lands somewhere else, and no attempt is consumed:
     // the request was never actually served.
     if (result.kind === 'requeued') {
-      queue.avoidLane(entry, servedLaneId(result, lane))
-      tried.add(servedLaneId(result, lane))
-      queue.requeue(entry, { front: true })
+      const gone = servedLaneId(result, lane)
+      queue.avoidLane(entry, gone)
+      tried.add(gone)
+      // The reaper has already put the entry back, and a lane waiting in take() can
+      // claim it inside that same emit -- before this microtask runs. Calling
+      // requeue() then deleted the NEW lane's live claim from `inflight` and queued
+      // the entry again while it was being served: the upstream call was wasted,
+      // the lane's result was rejected, and the client waited about twice as long.
+      // A claim held by a lane other than the one that vanished is live; leave it.
+      const liveClaim = queue.inflight.get(entry.id) === entry &&
+        entry.claimedBy && entry.claimedBy !== gone
+      // Text already on the wire cannot be replayed: finish with what arrived.
+      if (entry.committed) return { ...last, kind: 'partial' }
+      if (!liveClaim) queue.requeue(entry, { front: true })
       await sleep(200)
       continue
     }
@@ -424,9 +444,9 @@ async function dispatch (entry) {
     // same lane would reproduce the same rejection or exhausted bucket.
     queue.avoidLane(entry, served)
     last = result
+    entry.outcome = result
     if (result.kind === 'ok') {
       lanes.record(served, 'ok', result.ms || 0)
-      noteModelResult(entry.job.model, result)
       return result
     }
 
@@ -438,7 +458,11 @@ async function dispatch (entry) {
       // that is merely flaky is not punished by the hard-failure retry budget.
       empties++
       lanes.record(served, 'empty', result.ms || 0)
-      noteModelResult(entry.job.model, result)
+      entry.outcome = result
+      // Check the cap BEFORE requeueing. Requeueing first let a lane claim and
+      // serve the entry during the backoff sleep, after the loop had already
+      // decided to stop: five upstream calls for a request allowed four.
+      if (empties > RETRY_LIMIT) return result
       if (!entry.committed) {
         queue.requeue(entry, { front: true })
         await sleep(Math.min(2000, 150 * empties))
@@ -464,7 +488,6 @@ async function dispatch (entry) {
       // could not find it; keeping it costs nothing and closes the case where the
       // record was pruned first.
       queue.avoidLane(entry, served)
-      noteModelResult(entry.job.model, result)
       // `limited` retires a lane on every pass, so it must respect the attempt
       // cap like every other outcome. It previously requeued unconditionally,
       // burning RETRY_LIMIT+2 attempts and retiring that many lanes from a single
@@ -474,11 +497,18 @@ async function dispatch (entry) {
         await sleep(Math.min(2000, 150 * attempt))
         continue
       }
-      return { ...result, kind: 'partial' }
+      // Only a stream that already has text on the wire is "partial". Reporting
+      // every exhaustion as partial told clients "(partial)" about requests that
+      // had produced nothing.
+      return entry.committed ? { ...result, kind: 'partial' } : result
     }
 
     lanes.record(served, result.kind === 'timeout' ? 'timeout' : 'failed', result.ms || 0)
-    noteModelResult(entry.job.model, result)
+    // Log each attempt's rejection for diagnosis, but do not COUNT it toward model
+    // health here: a single bad request makes two attempts, and counting per attempt
+    // meant two malformed requests from one client quarantined the model for everyone.
+    // Health is updated once per request, in ensureDispatched.
+    logAttemptFailure(entry.job.model, result)
 
     // A rejected fingerprint is not going to change on another IP. Everything
     // else gets at most one more attempt: the two models whose endpoint was
@@ -517,6 +547,14 @@ export function ensureDispatched (entry) {
       // reaper hands it back in a loop.
       console.error('[relay] dispatch threw:', e?.stack || e)
       result = { kind: 'error', status: 0, ms: 0, data: null, raw: String(e?.message || e) }
+    }
+    // Model health is counted ONCE per request, from the last real upstream outcome.
+    // It used to be counted per attempt, and one request makes up to two attempts, so
+    // two malformed requests from a single client reached the quarantine threshold
+    // and blacked the model out for every other client. An abandoned request or one
+    // that never reached a lane says nothing about the model, so it is not counted.
+    if (result.kind !== 'abandoned' && entry.outcome) {
+      noteModelResult(entry.job.model, entry.outcome, { log: false })
     }
     // Single exit point: removes the entry from pending and inflight and settles
     // the client. Anything left behind here becomes zombie work that a lane serves
@@ -639,8 +677,16 @@ async function handleChat (req, res) {
   // request turned out not to be a stream.
   let backlog = []
   let backlogBytes = 0
+  let paused = false          // the socket buffer is full: hold further chunks here
+  let pendingEnd = false      // end() was requested while data was still queued
+  let endTimer = null
   let writeSse = () => {}
   let drainBacklog = () => {}
+  // Non-streaming responses are ended directly; the streaming block replaces this
+  // with a version that waits for queued data to reach the client first.
+  let endWhenDrained = () => {
+    try { if (!res.writableEnded && !res.destroyed) res.end() } catch { /* client gone */ }
+  }
 
   if (stream) {
     res.writeHead(200, {
@@ -653,15 +699,21 @@ async function handleChat (req, res) {
 
     // Every write to this response goes through writeSse, so the keepalive can
     // never jump ahead of real data that is still queued behind a full socket
-    // buffer. That ordering matters: a client reading a comment before the text
-    // it belongs to is harmless, but interleaving out of order is not.
+    // buffer.
+    //
+    // Node's res.write() returning false means the chunk WAS accepted and the
+    // buffer is now above its high-water mark -- it is a request to stop, not a
+    // refusal. The first version queued the chunk again as well, so it was sent
+    // twice: measured, 100 deltas of 60KB to a slow reader arrived as 152 frames
+    // with 52 duplicates, and duplicated tool-argument fragments are corrupt JSON.
+    // A chunk is therefore written exactly once; `paused` only decides whether the
+    // NEXT chunk may be written now or must wait in the backlog.
     backlog = []
     backlogBytes = 0
 
     writeSse = (chunk) => {
       if (res.writableEnded || res.destroyed) return
-      if (backlog.length) {
-        // Something is already waiting: queue behind it to preserve order.
+      if (paused) {
         backlog.push(chunk)
         backlogBytes += chunk.length
         if (backlogBytes > MAX_BACKLOG_BYTES) {
@@ -673,21 +725,42 @@ async function handleChat (req, res) {
         }
         return
       }
-      if (!res.write(chunk)) {
-        backlog.push(chunk)
-        backlogBytes += chunk.length
-      }
+      if (!res.write(chunk)) paused = true
+    }
+
+    const finishEnd = () => {
+      clearTimeout(endTimer)
+      try { if (!res.writableEnded && !res.destroyed) res.end() } catch { /* client gone */ }
     }
 
     drainBacklog = () => {
+      paused = false
       while (backlog.length && !res.writableEnded && !res.destroyed) {
-        const chunk = backlog[0]
-        if (!res.write(chunk)) return
-        backlog.shift()
+        // Take the chunk BEFORE writing it: it is accepted whether or not write()
+        // reports pressure, so leaving it at the head re-sent it on every drain.
+        const chunk = backlog.shift()
         backlogBytes -= chunk.length
+        if (!res.write(chunk)) { paused = true; return }
       }
+      if (pendingEnd && !paused && !backlog.length) finishEnd()
     }
     res.on('drain', drainBacklog)
+
+    // Ending a response while data is still queued drops that data: the final
+    // content, finish_reason and [DONE] were all lost to a slow reader (48 of 60
+    // frames, no [DONE], clean EOF). So end only once the backlog has been written,
+    // with a bound so a client that never reads cannot hold the socket forever.
+    endWhenDrained = () => {
+      if (res.writableEnded || res.destroyed) return
+      if (!paused && !backlog.length) { finishEnd(); return }
+      pendingEnd = true
+      endTimer = setTimeout(() => {
+        console.error('[relay] client did not drain the tail of the stream in time; closing')
+        res.destroy()
+      }, END_DRAIN_TIMEOUT_MS)
+      endTimer.unref?.()
+    }
+    res.on('close', () => clearTimeout(endTimer))
 
     // A comment line: every conformant SSE client ignores it, but it resets the
     // idle timers of any proxy in between. Without it a large prefill (measured
@@ -794,10 +867,9 @@ async function handleChat (req, res) {
           // queued behind a full socket buffer.
           writeSse(`data: ${JSON.stringify(err)}\n\n`)
           writeSse('data: [DONE]\n\n')
-          // Flush whatever is still backlogged before closing, otherwise a slow but
-          // live client loses the tail of the answer.
-          drainBacklog()
-          res.end()
+          // End only after the backlog has been written, or a slow but live client
+          // loses the tail of the answer.
+          endWhenDrained()
         } catch { /* client already gone */ }
       }
       return
@@ -903,7 +975,7 @@ async function handleChat (req, res) {
   // already walked away from: a harness that half-read the stream depends on it to
   // close its own parser rather than treating the connection drop as a crash.
   safeWrite('data: [DONE]\n\n')
-  if (!res.writableEnded && !res.destroyed) res.end()
+  endWhenDrained()
 }
 
 function dashboard () {
@@ -1025,6 +1097,13 @@ async function laneDelta (req, res) {
   // The entry is resolved through the queue, the same way a result is: `inflight`
   // is the one place an entry is guaranteed to be while a lane is serving it.
   const entry = queue.inflight.get(entryId)
+  // No in-flight entry means NO lane holds a claim right now (it was requeued after a
+  // reap, or finished). The claim check below sat inside `if (entry)`, so it was
+  // skipped in exactly that case and a lane that had lost its claim could still write
+  // into the client's stream: observed, "GHOST FROM LANE THAT LOST CLAIM" delivered.
+  if (!entry) {
+    return json(res, 409, { ok: false, error: 'entry is not claimed by any lane' })
+  }
   if (entry) {
     // Same claim guard as /lane/result. Without it, a lane that lost its claim
     // (lease reaped after a heartbeat gap, relay stall, GC pause) keeps streaming

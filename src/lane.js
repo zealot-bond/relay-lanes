@@ -16,6 +16,7 @@
 // steady 20 without central scheduling.
 
 import https from 'node:https'
+import { StringDecoder } from 'node:string_decoder'
 import {
   zenBase, CHAT_PATH, RESPONSES_PATH,
   fingerprintToolSpecs, fingerprintToolSpecsResponses,
@@ -98,6 +99,11 @@ function parseUpstream (raw, model, onText) {
   let dataParts = []
 
   for (const line of raw.split(/\n/)) {
+    // A blank line is the SSE event boundary. Whatever was accumulated and still does
+    // not parse is a dead frame (a keepalive, a `data: ping`): drop it HERE. Left in
+    // place it was joined onto every later frame, none of which then parsed, so one
+    // stray non-JSON line silently discarded the rest of the stream.
+    if (line.trim() === '') { dataParts = []; continue }
     if (!line.startsWith('data:')) continue
     // SSE allows a field to be split across several `data:` lines, which must be
     // joined with a newline before parsing. Reading each line independently made a
@@ -303,7 +309,13 @@ function toResponsesInput (messages) {
   // both used "call_0", so their function_call items and their results collapsed
   // into one call: the model then saw a single tool invocation with the wrong
   // output, which is a silent wrong answer rather than a visible error.
+  //
+  // They must also PAIR: a function_call and the output that answers it need the
+  // same id. One shared counter gave the calls call_0/call_1 and the outputs
+  // call_2/call_3, so no output matched any call. Anonymous ids are therefore handed
+  // to the calls first and consumed in order by the outputs that follow them.
   let anonymous = 0
+  const unmatched = []
   const nextAnonId = () => `call_${anonymous++}`
   for (const m of messages || []) {
     const role = m?.role
@@ -313,7 +325,7 @@ function toResponsesInput (messages) {
       const out = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
       input.push({
         type: 'function_call_output',
-        call_id: m.tool_call_id || m.call_id || m.id || nextAnonId(),
+        call_id: m.tool_call_id || m.call_id || m.id || unmatched.shift() || nextAnonId(),
         output: out,
       })
       continue
@@ -322,9 +334,11 @@ function toResponsesInput (messages) {
     // An assistant turn that invoked tools is a function_call item, not a message.
     if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
       for (const tc of m.tool_calls) {
+        const anon = tc.id || tc.tool_call_id ? null : nextAnonId()
+        if (anon) unmatched.push(anon)
         input.push({
           type: 'function_call',
-          call_id: tc.id || tc.tool_call_id || nextAnonId(),
+          call_id: tc.id || tc.tool_call_id || anon,
           name: tc.function?.name || tc.name || '',
           arguments: typeof tc.function?.arguments === 'string'
             ? tc.function.arguments
@@ -551,6 +565,11 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       // Incremental SSE decode. Only complete `data:` lines are parsed, so a
       // frame split across two TCP reads is never mangled into invalid JSON.
       let carry = ''
+      // Decode through a StringDecoder, not chunk.toString(): a multi-byte character
+      // (any CJK text, any emoji) can straddle two TCP reads, and decoding each read
+      // on its own turned the split character into U+FFFD. Measured: the client-bound
+      // stream carried "日���語" while the folded result was the correct "日本語".
+      const decoder = new StringDecoder('utf8')
       // Tracks which output_index is currently receiving arguments, and the last
       // index seen, so the responses dialect can assign real positions.
       let activeCall = -1
@@ -564,7 +583,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
         armIdle(STREAM_IDLE_TIMEOUT_MS)
         chunks.push(c)
         if (!onDelta && !onToolCall && !onToolDelta) return
-        carry += c.toString('utf8')
+        carry += decoder.write(c)
         let nl
         while ((nl = carry.indexOf('\n')) !== -1) {
           const line = carry.slice(0, nl)
@@ -643,6 +662,18 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
           if (typeof text === 'string' && text) onDelta?.(text)
         }
       })
+      // A response that is already flowing does not raise an error on the REQUEST when
+      // the socket dies, so without these the call sat on a dead connection until the
+      // idle timer fired -- two minutes at the production setting -- before it could be
+      // retried. Observed: upstream sent one frame and reset; the call resolved only
+      // after the whole idle budget, as a timeout.
+      const abortedMidStream = (why) => fin({
+        kind: 'error', status: res.statusCode || 0,
+        raw: `upstream connection ${why} mid-stream`, data: null, ms: Date.now() - started,
+      })
+      res.on('aborted', () => abortedMidStream('aborted'))
+      res.on('error', (e) => abortedMidStream(`failed (${e.code || e.message})`))
+      res.on('close', () => { if (!res.complete) abortedMidStream('closed') })
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString()
         const verdict = classifyUpstream(res.statusCode, raw)
