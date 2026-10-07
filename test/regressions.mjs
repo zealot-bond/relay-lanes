@@ -212,6 +212,56 @@ const scenarios = {
     return [{ name: `exactly ${limit} upstream calls for an always-empty request`, ok: calls === limit, detail: `calls=${calls}` }]
   },
 
+  // A lane on stale code corrupted tool calls ("bashbash") and still got work,
+  // because lanes pull from /lane/claim regardless of which one the dispatcher
+  // preferred.
+  async 'stale lanes: starved while a current lane exists, used as a last resort' () {
+    const { CODE_VERSION } = await imp('codeversion.js')
+    const { B, post } = await bootRelay(18908, { LANE_STALE_MS: '60000' })
+    await post('/lane/register', { laneId: 'CUR', codeVersion: CODE_VERSION })
+    await post('/lane/register', { laneId: 'OLD' })                 // unversioned, like pre-fix runners
+    const served = { CUR: 0, OLD: 0 }
+    const work = (l) => (async () => {
+      for (;;) {
+        const r = await fetch(B + `/lane/claim?laneId=${l}&wait=1000`, { headers: H }).catch(() => null)
+        if (!r) return
+        if (r.status === 204) continue
+        if (r.status !== 200) return
+        const c = await r.json(); served[l]++
+        await post('/lane/result', { laneId: l, entryId: c.entryId, result: { kind: 'ok', status: 200, ms: 1, data: { choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] } } })
+      }
+    })()
+    work('CUR'); work('OLD')
+    const ask = () => fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.status)
+    const statuses = await Promise.all(Array.from({ length: 8 }, ask))
+    const whileCurrent = { ...served }
+
+    return [
+      { name: 'all requests succeed', ok: statuses.every((s) => s === 200), detail: statuses.join(',') },
+      { name: 'the current lane served every request', ok: whileCurrent.CUR === 8, detail: JSON.stringify(whileCurrent) },
+      { name: 'the stale lane served none while a current one was live', ok: whileCurrent.OLD === 0, detail: JSON.stringify(whileCurrent) },
+    ]
+  },
+
+  async 'stale lanes: take over when no current lane exists' () {
+    const { B, post } = await bootRelay(18909, { LANE_STALE_MS: '60000' })
+    await post('/lane/register', { laneId: 'OLD' })
+    let served = 0
+    ;(async () => {
+      for (;;) {
+        const r = await fetch(B + '/lane/claim?laneId=OLD&wait=1000', { headers: H }).catch(() => null)
+        if (!r) return
+        if (r.status === 204) continue
+        if (r.status !== 200) return
+        const c = await r.json(); served++
+        await post('/lane/result', { laneId: 'OLD', entryId: c.entryId, result: { kind: 'ok', status: 200, ms: 1, data: { choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] } } })
+      }
+    })()
+    const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) })
+    await r.text()
+    return [{ name: 'with only stale lanes the request is still served', ok: r.status === 200 && served === 1, detail: `status=${r.status} served=${served}` }]
+  },
+
   // #6 a multi-byte character split across TCP reads was decoded per chunk.
   async 'lane: utf-8 split across reads' () {
     const { stop, port } = await mockUpstream((res) => {

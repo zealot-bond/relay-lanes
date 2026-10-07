@@ -1068,7 +1068,28 @@ async function laneClaim (req, res) {
   // without this an idle-but-healthy lane silently vanishes from the pool.
   lanes.heartbeat(laneId)
 
-  const entry = await queue.take(laneId, Number(url.searchParams.get('wait') || 20000))
+  const waitMs = Number(url.searchParams.get('wait') || 20000)
+  const safeWait = Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 20000
+
+  // A lane on stale code is not given work while a current one is available.
+  //
+  // Lanes PULL work, so preferring current lanes in pickLane only chose a hint: any
+  // lane polling /lane/claim took the entry regardless. Measured: with three current
+  // lanes and one old one, the old one served 2 of 12 requests and exactly those 2
+  // came back with a doubled tool name ("bashbash") and unparseable arguments. A
+  // corrupted tool call is worse than a short wait for a current lane, so the stale
+  // lane just idles its poll. If NO current lane is live the stale ones are used
+  // anyway -- a degraded service beats none -- and the STALE LANE CODE warning has
+  // already said why. ALLOW_STALE_LANES=1 turns this off.
+  const me = lanes.lanes.get(laneId)
+  if (me && me.codeVersion !== CODE_VERSION && process.env.ALLOW_STALE_LANES !== '1' &&
+      lanes.liveLanes(LANE_STALE_MS).some((l) => l.codeVersion === CODE_VERSION && l.status !== 'exhausted')) {
+    await sleep(Math.min(safeWait, 5000))
+    lanes.heartbeat(laneId)
+    return json(res, 204, {})
+  }
+
+  const entry = await queue.take(laneId, safeWait)
   if (!entry) return json(res, 204, {})
   return json(res, 200, { entryId: entry.id, job: entry.job })
 }

@@ -30,6 +30,42 @@ client ──HTTP──▶ relay (server.jar) ──queue──▶ lane (GitHub 
 Only the **upstream call** goes through a runner. The client-facing path is the jar,
 which is why relay overhead is ~76ms.
 
+## TWO deployment surfaces — read this before debugging anything
+
+The code is split across two places that are deployed by **different mechanisms**:
+
+| runs in | files | deployed by |
+|---|---|---|
+| the **jar** (the panel) | `server.js` `queue.js` `orchestrator.js` `main.js` | uploading `server.jar` |
+| the **runners** (GitHub) | `lane.js` `fingerprint.js` `worker.js` `toolmerge.js` `config.js` `models.js` `codeversion.js` | **`git push` to the runner repo** (`GH_REPO`) |
+
+The jar contains copies of the lane files, but it never executes them for upstream
+calls. **Rebuilding and uploading the jar does not change what the runners do.**
+
+This was the cause of a long run of "fixed but still broken" reports: lane-side fixes
+were built into the jar for many rounds while the runners kept executing code from
+before them, so streamed tool calls kept arriving corrupted (`"bashbash"`, arguments
+emitted twice). Measured on the live panel: 4 of 32 streamed Bash calls valid before
+the runner repo was updated, 32 of 32 after.
+
+Two more things about runners:
+
+- A dispatched run is **pinned to the commit that was `main` when it was dispatched**,
+  even if it starts later, and a running one keeps its code for up to
+  `LANE_LIFETIME_S` (55 min). After pushing lane code, **cancel all in-progress and
+  queued runs**; the orchestrator refills the pool from the new commit.
+- Do not trust the build id for lane code. Each lane reports `codeVersion`, a hash of
+  the lane-side files (`src/codeversion.js`); the relay compares it with the hash of
+  its own bundled copies. `/health` → `laneCode` shows `current / stale / unreported`,
+  and the periodic log line prints `code=all-current(...)` or `code=…STALE…`. A lane
+  on different code logs `STALE LANE CODE` when it registers, and is **given no work
+  while a current lane is live** (otherwise it still claims work and corrupts tool
+  calls). If no current lane exists, stale ones are used rather than stalling.
+  `ALLOW_STALE_LANES=1` disables the guard.
+
+To deploy lane changes: `git push` `src/` to the runner repo, cancel runs, then watch
+`/health` until `laneCode.current` equals the lane count.
+
 ## Files
 
 | File | Role |
@@ -190,7 +226,33 @@ NODE_RUNTIME=/path/to/node bash scripts/pack-jar.sh
 ```
 
 Needs `javac` (Java 8 target) and a Node runtime to bundle. Output: `server.jar`,
-self-contained, ~46MB.
+self-contained, ~46MB. `pack-jar.sh` searches for a JDK and the bundled Node runtime
+and **fails loudly** if it cannot find them (a missing toolchain once produced an
+empty build with no message). Each build stamps `build-info.json`; the id appears in
+the startup banner, `/health` and `/v1/models`.
+
+`baked-credentials.json` is bundled into the jar and contains live credentials.
+An operator's override file is `start.properties` in **`.relay/app-payload/`** (the
+launcher preserves it across re-extraction), not next to `server.jar`. Empty values
+are ignored at every layer, so a property cannot be used to *blank* a baked secret.
+
+## Tests
+
+```bash
+node test/units.mjs          # converters, SSE fold, dialect shapes
+node test/wire-toolcalls.mjs # serialised bytes a client reassembles
+node test/stream-safety.mjs  # keepalive, ordering, backpressure model
+node test/tool-shapes.mjs    # tool spec normalisation + gate-safe dedupe
+node test/codeversion.mjs    # the lane-code fingerprint
+node test/regressions.mjs    # 33 checks over 14 loopback scenarios
+SRC_DIR=/older/src node test/regressions.mjs   # negative control
+```
+
+`regressions.mjs` runs the real modules over loopback (real HTTP server, raw sockets,
+a TLS mock for the upstream), one process per scenario. **Point it at the pre-fix tree
+too and confirm those scenarios fail** — one backpressure test passed on the broken
+code because its volume never reached the buffer limit, and only the negative control
+showed it. Never copy production logic into a test; import it.
 
 ## Known issues
 
@@ -203,6 +265,19 @@ self-contained, ~46MB.
    pending a decision, since clients may budget against it.
 4. GitHub Actions ToS: using CI runners as a request-serving relay violates the
    acceptable use. This can affect the token, not just quota.
+5. **Tool names are matched exactly when merging with the gateway's tools.** The
+   gateway's access check needs `bash`, `glob`, `grep`, `read` present as spelled; a
+   client's `Bash` therefore sits alongside the gateway's `bash` instead of replacing
+   it (a case-insensitive merge removed `bash` and every request answered 403).
+   A harness using capitalised names may see the model call the lowercase one.
+6. `max_tokens` is floored at 4096. Reasoning tokens come out of the same budget, and
+   anything lower produced an empty completion (measured), so a harness that sets
+   `max_tokens=32` gets a larger budget than it asked for.
+7. Unproven, found in review but not triggered: chat tool calls that arrive without an
+   `index` are all streamed as index 0 while the fold keys by position; and a lost
+   first delta batch would leave a streamed call without its id/name.
+8. Model availability is not discoverable from the gateway's own model list: it still
+   lists `mimo-v2.5-free` (HTTP 410 on every call). Probe before adding a model.
 
 ## A note on `src/fingerprint.js`
 
