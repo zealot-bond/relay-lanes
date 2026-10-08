@@ -41,18 +41,12 @@ export const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read']
  * The tools the gateway requires, described as genuinely usable.
  *
  * These four declarations exist because the gateway rejects a request carrying no
- * tool list at all. Forwarding the client's own tool specs alongside them was
- * tried and measured: upstream answered HTTP 400 "Missing required parameter:
- * `tools[4].type`" for every arrangement tried (any shape, any name casing, any
- * count, with or without a `required` array). Only the unmodified set of four is
- * accepted, so the client's specs cannot be passed through and the four below are
- * the whole tool surface.
+ * tool list at all. Client tool specs are normalized and unioned with these four
+ * (keeping bash, glob, grep, read present so the gateway access gate is satisfied).
  *
- * They were previously described as placeholders that "must never be called",
- * which made the model refuse: it answered "I don't have access to a bash tool"
- * instead of calling one. They are now described as ordinary working tools, with
- * the conventional argument shapes, so a call comes back populated. The tool
- * EXECUTION remains the client's job -- the relay only carries the call.
+ * They are described as ordinary working tools with conventional argument shapes,
+ * so calls come back populated when tools are used. The tool EXECUTION remains
+ * the client's job -- the relay only carries the call.
  */
 const FINGERPRINT_TOOL_INFO = {
   bash: {
@@ -189,7 +183,7 @@ export function classifyUpstream (status, raw) {
   // once and counted toward quarantining the MODEL rather than burning lanes.
   const modelOutage = /endpoint is unavailable|upstream request failed|model is unavailable|temporarily unavailable/i.test(text) &&
     !text.includes('FreeUsageLimitError') && !text.includes('rate_limit_error')
-  if (modelOutage) return { kind: 'provider_error' }
+  if (modelOutage) return { kind: 'provider_error', outage: true }
 
   const structuredLimit = status === 429 || text.includes('FreeUsageLimitError') ||
     text.includes('rate_limit_error')
@@ -205,5 +199,5 @@ export function classifyUpstream (status, raw) {
   const proseLimit = status >= 500 && /rate[_ -]?limit/i.test(text)
   if (structuredLimit || proseLimit) return { kind: 'limited', retryAfter: null }
   if (status >= 500) return { kind: 'transport' }
-  return { kind: 'provider_error' }
+  return { kind: 'provider_error', outage: false }
 }

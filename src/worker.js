@@ -136,6 +136,7 @@ async function main () {
     let deltaTimer = null
     let streamedText = false
     let streamedTools = false
+    let streamedTextChars = 0
     // Survives every flush of this claim: identity arrives in one 40ms window and
     // arguments in the next, so a per-batch fold would drop the id/name.
     const toolAcc = new Map()
@@ -156,7 +157,10 @@ async function main () {
       if (r?.ok) {
         // Tracked separately: a turn can stream tool calls and no text, and the
         // relay must not treat that as "the client already saw everything".
-        if (hasText) streamedText = true
+        if (hasText) {
+          streamedText = true
+          streamedTextChars += body.text.length
+        }
         if (hasTools) streamedTools = true
       }
     }
@@ -193,6 +197,18 @@ busyHeartbeat.unref?.()
               schedule()
             }
           : undefined,
+        onToolCall: () => {
+          // If a tool call arrives:
+          // In self mode or when client provided no tools, withhold pre-tool text
+          // that hasn't been flushed yet so the client doesn't see "I'll read that file"
+          if (config.TOOL_MODE === 'self' || !claim.job?.tools?.length) {
+            pending = []
+            if (deltaTimer && !pendingTools.length) {
+              clearTimeout(deltaTimer)
+              deltaTimer = null
+            }
+          }
+        },
         // Tool-call deltas must reach an agent harness exactly like text does:
         // it reassembles the call from these to know which tool to run.
         onToolDelta: claim.job.stream
@@ -230,6 +246,7 @@ busyHeartbeat.unref?.()
         streamed: streamedText || streamedTools,
         streamedText,
         streamedTools,
+        streamedTextLen: streamedTextChars,
         raw: result.kind === 'ok' ? '' : String(result.raw || '').slice(0, 400),
         data: result.data,
       },

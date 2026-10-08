@@ -48,7 +48,7 @@ setInterval(() => {
   // Forget lanes that stopped reporting, not only on registration. Otherwise the
   // dashboard and /health keep counting runners that are long gone, and a dead
   // lane holds its slot until the next register call happens to prune it.
-  lanes.prune()
+  lanes.prune(config.LANE_STALE_MS)
   const l = lanes.stats()
   const q = queue.stats()
   const c = laneCodeStats()

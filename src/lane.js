@@ -98,6 +98,21 @@ function parseUpstream (raw, model, onText) {
   // Accumulates the pieces of a multi-line `data:` field until it parses.
   let dataParts = []
 
+  // Real indices for chat-dialect calls that arrive without an explicit index.
+  const chatCallIndexById = new Map()
+  let lastChatCallIndex = 0
+  const resolveChatIndex = (tc, curLen) => {
+    if (typeof tc.index === 'number') return tc.index
+    if (tc.id) {
+      if (chatCallIndexById.has(tc.id)) return chatCallIndexById.get(tc.id)
+      const at = curLen
+      chatCallIndexById.set(tc.id, at)
+      lastChatCallIndex = at
+      return at
+    }
+    return lastChatCallIndex
+  }
+
   for (const line of raw.split(/\n/)) {
     // A blank line is the SSE event boundary. Whatever was accumulated and still does
     // not parse is a dead frame (a keepalive, a `data: ping`): drop it HERE. Left in
@@ -130,7 +145,7 @@ function parseUpstream (raw, model, onText) {
     // completion look empty even though upstream had produced a valid response.
     if (Array.isArray(delta?.tool_calls)) {
       for (const tc of delta.tool_calls) {
-        const at = typeof tc.index === 'number' ? tc.index : toolCalls.length
+        const at = resolveChatIndex(tc, toolCalls.length)
         const cur = toolCalls[at] ||= {
           id: '', type: 'function',
           function: { name: '', arguments: '' },
@@ -445,7 +460,7 @@ function toResponsesTools (tools) {
   return tools.filter(usableTool).map(toResponsesTool)
 }
 
-function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools }) {
+function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls }) {
   const protocol = protocolFor(model)
 
   // Client tool specs are normalised into the target dialect's shape and unioned
@@ -459,6 +474,8 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
   // exo-free and muse-spark with an Anthropic-style Bash/Edit tool set, while the
   // same tools spelled lowercase passed.
   const clientTools = (Array.isArray(tools) ? tools : []).filter(usableTool)
+  const hasClientTools = clientTools.length > 0
+  const disableTools = toolChoice === 'none' || !hasClientTools
   const clientNames = new Set(clientTools.map(nameOfTool).filter(Boolean))
 
   const chatTools = [
@@ -471,11 +488,19 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
   ]
 
   if (protocol === 'responses') {
+    // When tools are not desired, responses endpoint refuses tool_choice: "none"
+    // (only "auto" is supported). We instruct the reasoning model directly in system
+    // so it does not invoke tools.
+    const noToolsInstruction = disableTools
+      ? 'Do not call any tools or functions. Answer directly in text.'
+      : null
+    const effectiveSystem = [system, noToolsInstruction].filter(Boolean).join('\n\n')
+
     // `system` is folded in as a leading message so ordering is preserved.
-    const merged = system
-      ? [{ role: 'system', content: system }, ...(messages || [])]
+    const merged = effectiveSystem
+      ? [{ role: 'system', content: effectiveSystem }, ...(messages || [])]
       : (messages || [])
-    return {
+    const body = {
       model,
       input: toResponsesInput(merged),
       stream: true,                          // the responses endpoint requires it
@@ -484,6 +509,9 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       ...(temperature !== undefined ? { temperature } : {}),
       ...(topP !== undefined ? { top_p: topP } : {}),
     }
+    if (toolChoice && toolChoice !== 'none') body.tool_choice = toolChoice
+    if (parallelToolCalls !== undefined) body.parallel_tool_calls = parallelToolCalls
+    return body
   }
 
   // Chat dialect: keep the original messages, only normalise tool entries.
@@ -515,6 +543,12 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
     tools: chatTools,
     max_tokens: outputBudget(maxTokens),
   }
+  if (disableTools) {
+    body.tool_choice = 'none'
+  } else if (toolChoice) {
+    body.tool_choice = toolChoice
+  }
+  if (parallelToolCalls !== undefined) body.parallel_tool_calls = parallelToolCalls
   if (temperature !== undefined) body.temperature = temperature
   if (topP !== undefined) body.top_p = topP
   return body
@@ -532,9 +566,9 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
  * This is the single-shot form. callUpstream() wraps it to handle tool calls.
  */
 async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta } = {}) {
-  const { model, messages, system, maxTokens, temperature, topP, tools } = job || {}
+  const { model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls } = job || {}
   const protocol = protocolFor(model)
-  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools }))
+  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls }))
   const url = new URL(zenBase() + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
 
   const started = Date.now()
@@ -576,6 +610,20 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       let nextFoldedPos = 0
       const callsByIndex = new Map()
       const outIdxToCall = new Map()
+      const chatCallIndexById = new Map()
+      let lastChatCallIndex = 0
+      let chatCallCount = 0
+      const resolveChatIndex = (d) => {
+        if (typeof d.index === 'number') return d.index
+        if (d.id) {
+          if (chatCallIndexById.has(d.id)) return chatCallIndexById.get(d.id)
+          const at = chatCallCount++
+          chatCallIndexById.set(d.id, at)
+          lastChatCallIndex = at
+          return at
+        }
+        return lastChatCallIndex
+      }
       res.on('data', (c) => {
         // Every byte is progress. The first one spends the long prefill budget;
         // from then on a silent socket is a stall rather than legitimate prefill.
@@ -604,7 +652,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
             // deltas, and dropping them is why a harness saw the model's intent
             // text and then nothing at all.
             onToolDelta?.(tc.map((d) => ({
-              index: typeof d.index === 'number' ? d.index : 0,
+              index: resolveChatIndex(d),
               ...(d.id ? { id: d.id } : {}),
               ...(d.type ? { type: d.type } : {}),
               ...(d.function ? { function: d.function } : {}),
@@ -689,9 +737,10 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
         // "stop", HTTP 200, no retry and no error. Such a body is reported as
         // provider_error so it is counted, retried once, and surfaced honestly.
         const errorInOk = verdict.kind === 'ok' && data && !hasChoices && data.error
+        const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
         const isEmpty = verdict.kind === 'ok' && hasChoices &&
           !String(msg?.content ?? '').trim() &&
-          !Array.isArray(msg?.tool_calls)
+          !hasToolCalls
         fin({
           ...verdict,
           ...(errorInOk ? { kind: 'provider_error' } : {}),
@@ -798,7 +847,10 @@ const TOOL_UNAVAILABLE =
   'conversation, and say plainly what you cannot do.'
 
 export async function callUpstream (job, opts = {}) {
-  if (TOOL_MODE === 'passthrough') return callUpstreamOnce(job, opts)
+  const clientTools = (Array.isArray(job?.tools) ? job.tools : []).filter(usableTool)
+  const isPlainChat = clientTools.length === 0 || job?.toolChoice === 'none'
+  const effectiveMode = isPlainChat ? 'self' : TOOL_MODE
+  if (effectiveMode === 'passthrough') return callUpstreamOnce(job, opts)
 
   // The self-answer loop must run for non-streaming clients too. Returning early
   // when there is no onDelta left those clients with the raw promise plus a
@@ -806,6 +858,7 @@ export async function callUpstream (job, opts = {}) {
   // Retraction is only needed when there is a client to retract from, so a
   // no-op forward is correct and harmless.
   const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : () => {}
+  const onToolCall = typeof opts.onToolCall === 'function' ? opts.onToolCall : () => {}
 
   // One round: forward text as it arrives and remember whether any was sent.
   const runRound = (roundJob) => {
@@ -813,11 +866,15 @@ export async function callUpstream (job, opts = {}) {
     return callUpstreamOnce(roundJob, {
       ...opts,
       onDelta: (t) => { sentText = true; onDelta(t) },
+      onToolCall: () => {
+        onToolCall()
+        opts.onToolCall?.()
+      },
     }).then((r) => ({ r, sentText }))
   }
 
   let { r: result, sentText } = await runRound(job)
-  if (TOOL_MODE !== 'self' || result.kind !== 'ok') return result
+  if (effectiveMode !== 'self' || result.kind !== 'ok') return result
 
   const toolCallsOf = (r) => r.data?.choices?.[0]?.message?.tool_calls
 

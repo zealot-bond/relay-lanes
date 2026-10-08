@@ -33,7 +33,7 @@ const RETRY_LIMIT = config.RETRY_LIMIT
 const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
 const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
 // How long a finished stream may wait for a slow client to read its tail.
-const END_DRAIN_TIMEOUT_MS = Number(process.env.END_DRAIN_TIMEOUT_MS || 60000)
+const END_DRAIN_TIMEOUT_MS = config.END_DRAIN_TIMEOUT_MS
 
 export const queue = new WorkQueue({ claimLeaseMs: 120000, avoidTtlMs: 60000 })
 export const lanes = new LaneRegistry({ maxLanes: MAX_LANES })
@@ -141,6 +141,12 @@ export function noteModelResult (model, result, { log = true } = {}) {
     modelHealth.set(model, h)
     return
   }
+  // Client prompt errors (4xx other than genuine outages) do not indicate a broken model;
+  // counting them would let a single user sending bad prompts quarantine the model for everyone.
+  const isPromptError = result.status >= 400 && result.status < 500 && !result.outage &&
+    /invalid_request|invalid prompt|bad_request|context_length/i.test(String(result.raw || ''))
+  if (isPromptError) return
+
   h.fails++
   h.lastKind = result.kind
   h.until = Date.now() + QUARANTINE_MS
@@ -187,7 +193,7 @@ export function modelHealthStats () {
  */
 // Retried at most once (see dispatch). `gate` is excluded: a rejected
 // fingerprint is identical from every egress IP, so retrying cannot help.
-const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error', 'provider_error'])
+const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error'])
 // Attempts per request, including the first. Two is deliberate: a 4xx is identical
 // from every egress IP, so a second try covers genuine transients and a third only
 // holds the client longer before the same answer.
@@ -515,7 +521,8 @@ async function dispatch (entry) {
     // permanently gone are no longer advertised, so a 4xx on a listed model is
     // most likely transient and deserves a second try -- but not three, which is
     // what turned one rejection into three full round trips for the client.
-    if (result.kind === 'gate' || attempt >= MAX_ATTEMPTS || !RETRYABLE.has(result.kind)) {
+    const isRetryable = RETRYABLE.has(result.kind) || (result.kind === 'provider_error' && result.outage)
+    if (result.kind === 'gate' || attempt >= MAX_ATTEMPTS || !isRetryable) {
       return last
     }
 
@@ -584,7 +591,9 @@ export function acceptLaneResult (laneId, entryId, result) {
   entry.streamedText = Boolean(result.streamedText ?? result.streamed)
   entry.streamedTools = Boolean(result.streamedTools)
   entry.streamed = Boolean(result.streamed)
-  if (typeof result.streamedTextLen === 'number') entry.streamedTextLen = result.streamedTextLen
+  if (typeof result.streamedTextLen === 'number') {
+    entry.streamedTextLen = Math.max(entry.streamedTextLen || 0, result.streamedTextLen)
+  }
 
   // Which lane really served this, for retry attribution and retirement.
   deliverResult(entry, { ...result, laneId })
@@ -623,7 +632,7 @@ async function handleChat (req, res) {
 
   const {
     model: rawModel, messages, system, max_tokens: maxTokens, max_completion_tokens: maxCompletion,
-    temperature, top_p: topP, stream, tools,
+    temperature, top_p: topP, stream, tools, tool_choice: toolChoice, parallel_tool_calls: parallelToolCalls,
   } = payload || {}
 
   const { model } = splitModelId(rawModel || '')
@@ -660,6 +669,8 @@ async function handleChat (req, res) {
       messages,
       system,
       tools,
+      toolChoice,
+      parallelToolCalls,
       maxTokens: maxCompletion || maxTokens,
       temperature,
       topP,
@@ -935,14 +946,23 @@ async function handleChat (req, res) {
   // missing required properties ("file_path" / "old_string" / "new_string").
   if (bufferedCalls.length) {
     const sent = entry.streamedToolArgs || new Map()
+    const sentNames = entry.streamedToolNames || new Map()
     const repair = []
     for (let i = 0; i < bufferedCalls.length; i++) {
       const c = bufferedCalls[i]
+      const fullName = c.function?.name || ''
+      const gotName = sentNames.get(i) || ''
       const fullArgs = typeof c.function?.arguments === 'string' ? c.function.arguments : ''
       const got = sent.get(i) || ''
       if (!entry.streamedTools) {
         // Nothing was streamed: send the whole call, name and id included.
         repair.push({ ...c, index: i })
+        continue
+      }
+      // If the client's received name does not match the full folded name, the name
+      // was split across batches or truncated in flight. Restate the call in full.
+      if (fullName !== gotName) {
+        repair.push({ index: i, ...c })
         continue
       }
       // Identity is never repeated: a client appending name fragments would turn
@@ -1082,7 +1102,7 @@ async function laneClaim (req, res) {
   // anyway -- a degraded service beats none -- and the STALE LANE CODE warning has
   // already said why. ALLOW_STALE_LANES=1 turns this off.
   const me = lanes.lanes.get(laneId)
-  if (me && me.codeVersion !== CODE_VERSION && process.env.ALLOW_STALE_LANES !== '1' &&
+  if (me && me.codeVersion !== CODE_VERSION && config.ALLOW_STALE_LANES !== '1' &&
       lanes.liveLanes(LANE_STALE_MS).some((l) => l.codeVersion === CODE_VERSION && l.status !== 'exhausted')) {
     await sleep(Math.min(safeWait, 5000))
     lanes.heartbeat(laneId)
@@ -1147,10 +1167,17 @@ async function laneDelta (req, res) {
     if (Array.isArray(body.toolCalls) && body.toolCalls.length) {
       entry.streamedTools = true
       const args = entry.streamedToolArgs || (entry.streamedToolArgs = new Map())
+      const names = entry.streamedToolNames || (entry.streamedToolNames = new Map())
       for (const c of body.toolCalls) {
         const i = typeof c.index === 'number' ? c.index : 0
-        const prev = args.get(i) || ''
-        args.set(i, prev + (c.function?.arguments || ''))
+        if (typeof c.function?.arguments === 'string') {
+          const prev = args.get(i) || ''
+          args.set(i, prev + c.function.arguments)
+        }
+        if (typeof c.function?.name === 'string' && c.function.name) {
+          const prevN = names.get(i) || ''
+          names.set(i, prevN ? prevN + c.function.name : c.function.name)
+        }
       }
     }
   }

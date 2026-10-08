@@ -95,8 +95,11 @@ export class WorkQueue extends EventEmitter {
       // would replay it into a stream that is already committed (observed: the client
       // received "hello " then "hello world"). The dispatcher finishes it as partial.
       if (entry.committed) continue
-      this.pending.push(entry)
-      reaped.push(entry)
+      if (!this.pending.includes(entry)) {
+        entry.claimedBy = null
+        this.pending.push(entry)
+        reaped.push(entry)
+      }
     }
     if (reaped.length) this.emit('work')
     return reaped
@@ -344,7 +347,7 @@ export class LaneRegistry extends EventEmitter {
  * the orchestrator burned its dispatch budget on lanes that could never start.
  * Generous enough to cover a heartbeat gap, short enough to free the slot.
  */
-prune (staleMs = 60000) {
+  prune (staleMs = 45000) {
     const now = Date.now()
     const gone = []
     for (const [id, lane] of this.lanes) {

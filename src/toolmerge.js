@@ -73,6 +73,9 @@ function mergeToolDeltas (frags, acc = new Map()) {
       // Later pieces still accumulate, so the final folded name is complete even
       // though the client only ever received the first fragment.
       cur.function.name = appendName(cur.function.name, d.function.name)
+      if (out.function && typeof out.function.name === 'string') {
+        out.function.name = cur.function.name
+      }
     }
     // Arguments are the one field that genuinely streams in pieces: this batch's
     // own text is forwarded, while the accumulator keeps the full string.

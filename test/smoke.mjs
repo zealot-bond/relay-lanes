@@ -309,7 +309,7 @@ const main = async () => {
     const b = mk('lane-good', false)
     await a.register(); await b.register()
     a.start(); b.start()
-    const r = await post('/v1/chat/completions', { model: 'github/mimo-v2.5-free', messages: [{ role: 'user', content: 'hi' }] })
+    const r = await post('/v1/chat/completions', { model: 'github/mimo-v2.6-flash-free', messages: [{ role: 'user', content: 'hi' }] })
     check('client got the healthy answer', r.body?.choices?.[0]?.message?.content === 'recovered',
       JSON.stringify(r.body?.choices?.[0]?.message?.content))
     check('a second lane was used', seen.size === 2, [...seen].join(','))

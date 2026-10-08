@@ -101,7 +101,7 @@ export const config = {
   DISPATCH_BURST: num('DISPATCH_BURST', 20),
   DISPATCH_SPACING_MS: num('DISPATCH_SPACING_MS', 700),
   DISPATCH_COOLDOWN_MS: num('DISPATCH_COOLDOWN_MS', 30000),
-  LANE_FRESH_MS: num('LANE_FRESH_MS', 120000),
+  LANE_FRESH_MS: num('LANE_FRESH_MS', 45000),
   MODEL_HEALTH_THRESHOLD: num('MODEL_HEALTH_THRESHOLD', 3),
   MODEL_QUARANTINE_MS: num('MODEL_QUARANTINE_MS', 120000),
   TOOL_MODE: str('TOOL_MODE', 'passthrough'),
@@ -128,6 +128,8 @@ export const config = {
   // How long a claim may sit before its holder is judged on liveness, so a lane
   // that claimed a moment ago is not requeued out from under itself.
   CLAIM_GRACE_MS: num('CLAIM_GRACE_MS', 15000),
+  END_DRAIN_TIMEOUT_MS: num('END_DRAIN_TIMEOUT_MS', 60000),
+  ALLOW_STALE_LANES: str('ALLOW_STALE_LANES', '0'),
 }
 
 /**
