@@ -11,6 +11,20 @@
 
 export const PROVIDER = 'github'
 
+// KNOWN MODEL BEHAVIOUR, measured 2026-10-15 by calling upstream directly and comparing
+// with what the relay delivers (streaming and non-streaming agree exactly):
+//
+//   muse-spark-1.3-contributor-free  OMITS `description` from its bash arguments -- 2/2
+//   muse-spark-1.2-contributor-free  includes it -- 2/2
+//   big-pickle                       includes it -- 2/2
+//
+// The relay is faithful -- it forwards exactly what upstream sends. But a harness whose Bash
+// schema marks `description` required will reject every muse-spark-1.3 tool call, and the
+// symptom is a client-side "missing required property" that looks exactly like relay
+// corruption. If you hit that, use muse-spark-1.2, or drop `description` from `required`.
+//
+// Both muse models are the RESPONSES dialect, so their arguments are assembled from
+// response.function_call_arguments.delta rather than delta.tool_calls[].function.arguments.
 const RESPONSES_MODELS = new Set([
   'muse-spark-1.2-contributor-free',
   'muse-spark-1.3-contributor-free',

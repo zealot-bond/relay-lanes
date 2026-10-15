@@ -268,6 +268,23 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
+## Verified working on BOTH paths (2026-10-15)
+
+The `/inference` endpoint change touched lane-side code, so the lane path was re-verified
+end to end with workers built from the PUSHED runner repo -- the code GitHub Actions
+actually executes. It needed no rework:
+
+- **All 11 models, 66/66 requests served, 0 failed, 0 retired** (`scripts/probe-catalogue.mjs`).
+- `scripts/bench-lanes.mjs`: 20 and 30 concurrent through lanes -> 0 client 429s, 0 5xx,
+  queue drains to 0, nothing stranded.
+
+One model quirk, not a defect: **`muse-spark-1.3-contributor-free` omits `description`**
+from its bash arguments. Confirmed by calling upstream directly with the relay bypassed --
+the raw tool call has no `description`, while muse-spark-1.2 and big-pickle both include it.
+The relay forwards exactly what upstream sends. A harness that marks `description` required
+will reject every muse-spark-1.3 call, and the symptom looks exactly like relay corruption.
+Use muse-spark-1.2, or drop `description` from `required`.
+
 ## DIRECT MODE -- the default since 2026-10-15
 
 `DIRECT_MODE=1` (the default) bypasses the lane pool completely: **no GitHub Actions
