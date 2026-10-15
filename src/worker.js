@@ -179,7 +179,7 @@ async function main () {
     // load is high.
 const busyHeartbeat = setInterval(() => {
   post('/lane/heartbeat', { laneId: LANE_ID }).catch(() => {})
-}, 20000)
+}, 10000)
 busyHeartbeat.unref?.()
 
     // The result POST is the last thing this claim does, and it must still happen

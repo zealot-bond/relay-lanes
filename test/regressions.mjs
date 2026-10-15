@@ -51,7 +51,7 @@ const scenarios = {
     const N = 100, SZ = 60000
     const { B, post } = await bootRelay(18901, { MAX_BACKLOG_BYTES: '1000000000' })
     await post('/lane/register', { laneId: 'L1' })
-    const body = JSON.stringify({ model: 'github/exo-free', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+    const body = JSON.stringify({ model: 'github/big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] })
     const sock = net.connect(18901, '127.0.0.1')
     const buf = []
     sock.on('data', (d) => buf.push(d))
@@ -77,7 +77,7 @@ const scenarios = {
     const N = 80, SZ = 60000
     const { B, post } = await bootRelay(18902, { MAX_BACKLOG_BYTES: '1000000000' })
     await post('/lane/register', { laneId: 'L1' })
-    const body = JSON.stringify({ model: 'github/exo-free', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+    const body = JSON.stringify({ model: 'github/big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] })
     const sock = net.connect(18902, '127.0.0.1')
     const buf = []
     sock.on('data', (d) => buf.push(d))
@@ -104,7 +104,7 @@ const scenarios = {
     const { S, B, post } = await bootRelay(18903, { LANE_STALE_MS: '600', CLAIM_GRACE_MS: '100', ATTEMPT_HARD_MS: '60000' })
     S.queue.claimLeaseMs = 300
     await post('/lane/register', { laneId: 'L1' })
-    fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) }).catch(() => {})
+    fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) }).catch(() => {})
     const c1 = await fetch(B + '/lane/claim?laneId=L1&wait=3000', { headers: H }).then((r) => r.json())
     await post('/lane/register', { laneId: 'L2' })
     const hb = setInterval(() => post('/lane/heartbeat', { laneId: 'L2' }), 150)
@@ -124,7 +124,7 @@ const scenarios = {
     const { S, B, post } = await bootRelay(18904, { LANE_STALE_MS: '600', CLAIM_GRACE_MS: '100', ATTEMPT_HARD_MS: '60000' })
     S.queue.claimLeaseMs = 300
     await post('/lane/register', { laneId: 'L1' })
-    const client = fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.text())
+    const client = fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.text())
     const c1 = await fetch(B + '/lane/claim?laneId=L1&wait=3000', { headers: H }).then((r) => r.json())
     await post('/lane/delta', { laneId: 'L1', entryId: c1.entryId, text: 'hello ' })
     await post('/lane/register', { laneId: 'L2' })
@@ -145,7 +145,7 @@ const scenarios = {
   async 'delta: a lane without a claim cannot write' () {
     const { S, B, post } = await bootRelay(18905, { LANE_STALE_MS: '60000', CLAIM_GRACE_MS: '100' })
     await post('/lane/register', { laneId: 'L1' })
-    const client = fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.text())
+    const client = fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.text())
     const c1 = await fetch(B + '/lane/claim?laneId=L1&wait=3000', { headers: H }).then((r) => r.json())
     S.queue.requeue(S.queue.inflight.get(c1.entryId))
     const r = await post('/lane/delta', { laneId: 'L1', entryId: c1.entryId, text: 'GHOST FROM LANE THAT LOST CLAIM' })
@@ -176,15 +176,15 @@ const scenarios = {
     }
     const statuses = []
     for (let i = 0; i < 2; i++) {
-      const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) })
+      const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
       statuses.push(r.status); await r.text()
     }
-    const third = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) })
+    const third = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
     const t = third.status; await third.text()
     const h = await fetch(B + '/health').then((r) => r.json())
     return [
       { name: 'two failing requests do not quarantine the model', ok: statuses.every((s) => s === 502), detail: `statuses ${statuses.join(',')}` },
-      { name: 'a third request is still attempted (counter is 2, threshold 3)', ok: t === 502, detail: `third=${t} fails=${h.modelHealth?.['exo-free']?.fails}` },
+      { name: 'a third request is still attempted (counter is 2, threshold 3)', ok: t === 502, detail: `third=${t} fails=${h.modelHealth?.['big-pickle']?.fails}` },
     ]
   },
 
@@ -205,7 +205,7 @@ const scenarios = {
         }
       })()
     }
-    const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) })
+    const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
     await r.text()
     await sleep(1500)   // anything served AFTER the verdict would show up here
     const limit = Number(process.env.RETRY_LIMIT || 3) + 1
@@ -232,7 +232,7 @@ const scenarios = {
       }
     })()
     work('CUR'); work('OLD')
-    const ask = () => fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.status)
+    const ask = () => fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) }).then((r) => r.status)
     const statuses = await Promise.all(Array.from({ length: 8 }, ask))
     const whileCurrent = { ...served }
 
@@ -257,7 +257,7 @@ const scenarios = {
         await post('/lane/result', { laneId: 'OLD', entryId: c.entryId, result: { kind: 'ok', status: 200, ms: 1, data: { choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] } } })
       }
     })()
-    const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] }) })
+    const r = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
     await r.text()
     return [{ name: 'with only stale lanes the request is still served', ok: r.status === 200 && served === 1, detail: `status=${r.status} served=${served}` }]
   },
@@ -272,7 +272,7 @@ const scenarios = {
     process.env.ZEN_BASE = `https://127.0.0.1:${port}`
     const { callUpstream } = await imp('lane.js')
     const got = []
-    const r = await callUpstream({ model: 'exo-free', messages: [{ role: 'user', content: 'x' }], stream: true }, { onDelta: (x) => got.push(x) })
+    const r = await callUpstream({ model: 'big-pickle', messages: [{ role: 'user', content: 'x' }], stream: true }, { onDelta: (x) => got.push(x) })
     stop()
     const streamed = got.join('')
     return [
@@ -291,7 +291,7 @@ const scenarios = {
     process.env.STREAM_IDLE_TIMEOUT_MS = '4000'
     const { callUpstream } = await imp('lane.js')
     const t = Date.now()
-    const r = await callUpstream({ model: 'exo-free', messages: [{ role: 'user', content: 'x' }], stream: true }, { onDelta: () => {} })
+    const r = await callUpstream({ model: 'big-pickle', messages: [{ role: 'user', content: 'x' }], stream: true }, { onDelta: () => {} })
     const ms = Date.now() - t
     stop()
     return [
@@ -304,8 +304,8 @@ const scenarios = {
   async 'lane: a stray non-JSON line does not eat the stream' () {
     const lane = await imp('lane.js')
     const raw = chatChunk('A') + 'data: ping\n\n' + chatChunk('B') + chatChunk('C') + 'data: [DONE]\n\n'
-    const folded = lane.parseForTest(raw, 'exo-free')
-    const wrapped = lane.parseForTest('data: {"choices":[{"index":0,\ndata: "delta":{"content":"XY"}}]}\n\ndata: [DONE]\n\n', 'exo-free')
+    const folded = lane.parseForTest(raw, 'big-pickle')
+    const wrapped = lane.parseForTest('data: {"choices":[{"index":0,\ndata: "delta":{"content":"XY"}}]}\n\ndata: [DONE]\n\n', 'big-pickle')
     return [
       { name: 'frames after the stray line survive', ok: folded?.choices?.[0]?.message?.content === 'ABC', detail: JSON.stringify(folded?.choices?.[0]?.message?.content) },
       { name: 'a legitimately wrapped (multi-line) frame still joins', ok: wrapped?.choices?.[0]?.message?.content === 'XY', detail: JSON.stringify(wrapped?.choices?.[0]?.message?.content) },
@@ -325,6 +325,9 @@ const scenarios = {
       ['structured limit marker', 400, '{"error":{"type":"FreeUsageLimitError"}}', 'limited'],
       ['500 that says rate limit in prose', 500, 'upstream rate limit reached', 'limited'],
       ['plain 500', 500, 'boom', 'transport'],
+      ['410 withdrawn by the provider', 410, '{"type":"error","error":{"type":"ModelDeprecated","message":"Model x has been deprecated."}}', 'gone'],
+      ['404 not found', 404, '{"error":{"message":"model_not_found"}}', 'gone'],
+      ['a 429 carrying a deprecation notice is still a withdrawal, not a rate limit', 429, '{"error":{"type":"ModelDeprecated"}}', 'gone'],
     ]
     return rows.map(([name, s, b, want]) => ({ name, ok: c(s, b).kind === want, detail: `got ${c(s, b).kind}, want ${want}` }))
   },

@@ -168,6 +168,22 @@ export function classifyUpstream (status, raw) {
   // can never be mistaken for an error.
   if (status < 400) return { kind: 'ok' }
 
+  // The model was withdrawn by the provider. This is PERMANENT, and it is checked
+  // before every status-driven verdict, because a body saying the model no longer
+  // exists is more specific than the status code carrying it. A 429 that arrives with
+  // a deprecation notice was previously read as "bucket exhausted" -- retiring a lane
+  // and churning the runner pool for a model that will never answer from any IP.
+  //
+  // Without its own kind this fell through to provider_error, which reads as
+  // "retryable in a moment": the client sat through six upstream calls across three
+  // lanes, and only then hit the generic quarantine. exo-free and fledge-alpha-free
+  // both answered 410 {"type":"ModelDeprecated"} for eight days before being removed
+  // from the catalogue (2026-10-15).
+  if (status === 404 || status === 410 ||
+      /ModelDeprecated|model (?:is )?(?:not found|no longer)|has been deprecated|model_not_found/i.test(text)) {
+    return { kind: 'gone', permanent: true }
+  }
+
   // Exhaustion is declared by the STATUS or a structured marker, never by prose that
   // may be quoting the user. A 4xx body routinely echoes the request ("invalid
   // prompt: how do I raise my rate limit?"), and matching it retired a healthy lane.
@@ -199,5 +215,6 @@ export function classifyUpstream (status, raw) {
   const proseLimit = status >= 500 && /rate[_ -]?limit/i.test(text)
   if (structuredLimit || proseLimit) return { kind: 'limited', retryAfter: null }
   if (status >= 500) return { kind: 'transport' }
+
   return { kind: 'provider_error', outage: false }
 }

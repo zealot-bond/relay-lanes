@@ -107,7 +107,7 @@ export const config = {
   TOOL_MODE: str('TOOL_MODE', 'passthrough'),
   TOOL_ROUNDS: num('TOOL_ROUNDS', 2),
   FIRST_BYTE_TIMEOUT_MS: num('FIRST_BYTE_TIMEOUT_MS', 600000),
-  STREAM_IDLE_TIMEOUT_MS: num('STREAM_IDLE_TIMEOUT_MS', 120000),
+  STREAM_IDLE_TIMEOUT_MS: num('STREAM_IDLE_TIMEOUT_MS', 240000),
   // Comment frame sent to a streaming client while the relay waits upstream, so an
   // intermediary's idle timer does not silently drop a legitimately slow prefill.
   STREAM_KEEPALIVE_MS: num('STREAM_KEEPALIVE_MS', 15000),
@@ -124,10 +124,10 @@ export const config = {
   ATTEMPT_MAX_MS: num('ATTEMPT_MAX_MS', 1800000),
   DELTA_BATCH_MS: num('DELTA_BATCH_MS', 40),
   // Lane liveness, shared by selection, attempt supervision and the claim reaper.
-  LANE_STALE_MS: num('LANE_STALE_MS', 45000),
+  LANE_STALE_MS: num('LANE_STALE_MS', 60000),
   // How long a claim may sit before its holder is judged on liveness, so a lane
   // that claimed a moment ago is not requeued out from under itself.
-  CLAIM_GRACE_MS: num('CLAIM_GRACE_MS', 15000),
+  CLAIM_GRACE_MS: num('CLAIM_GRACE_MS', 30000),
   END_DRAIN_TIMEOUT_MS: num('END_DRAIN_TIMEOUT_MS', 60000),
   ALLOW_STALE_LANES: str('ALLOW_STALE_LANES', '0'),
 }

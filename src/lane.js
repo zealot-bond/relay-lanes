@@ -74,6 +74,55 @@ const KEEPALIVE = new https.Agent({
  * Reasoning-only models (nemotron-3-ultra) stream their thinking in
  * delta.reasoning and put the answer in delta.content; only content counts.
  */
+function makeChatIndexer () {
+  // Upstream keys (the `index` it sent, and/or the call id) map to a CANONICAL
+  // position, handed out in order of first appearance and always dense from 0.
+  //
+  // Why not just pass the upstream index through: the fold used to end with
+  // `toolCalls.filter(Boolean)`, which COMPACTS away the holes left by
+  // non-contiguous indices, shifting every later call down one position. The stream
+  // kept the upstream indices. So with upstream sending call_B at index 2 and
+  // call_A at index 0, the client received call_B at index 2 while the folded
+  // completion held it at position 1 -- and the relay's finaliser compared
+  // position 1 against "nothing streamed at 1", concluded the call was missing, and
+  // restated it. The client then held THREE calls, call_B duplicated with its
+  // arguments appended twice (measured).
+  //
+  // Deriving both sides from this one map makes the two index spaces identical by
+  // construction, so there is nothing to disagree.
+  const byKey = new Map()
+  const canonical = []
+  let next = 0
+  const intern = (key) => {
+    if (byKey.has(key)) return byKey.get(key)
+    const at = next++
+    byKey.set(key, at)
+    canonical[at] = key
+    return at
+  }
+  return (tc) => {
+    const hasIdx = typeof tc?.index === 'number'
+    const hasId = typeof tc?.id === 'string' && tc.id !== ''
+    // Both keys present: pin them to one slot, whichever is already known. A call
+    // can arrive index-only in one frame and index+id in the next.
+    if (hasIdx && hasId) {
+      const at = byKey.has(tc.id)
+        ? byKey.get(tc.id)
+        : byKey.has(tc.index) ? byKey.get(tc.index) : next++
+      byKey.set(tc.id, at)
+      byKey.set(tc.index, at)
+      canonical[at] = tc.id
+      return at
+    }
+    if (hasId) return intern(tc.id)
+    if (hasIdx) return intern(tc.index)
+    // Neither: the fragment belongs to the call currently open. With nothing open
+    // yet there is nothing to attach it to, so it opens a synthetic one.
+    if (next === 0) return intern('anon')
+    return next - 1
+  }
+}
+
 function parseUpstream (raw, model, onText) {
   if (!raw) return null
   const trimmed = raw.trimStart()
@@ -99,19 +148,7 @@ function parseUpstream (raw, model, onText) {
   let dataParts = []
 
   // Real indices for chat-dialect calls that arrive without an explicit index.
-  const chatCallIndexById = new Map()
-  let lastChatCallIndex = 0
-  const resolveChatIndex = (tc, curLen) => {
-    if (typeof tc.index === 'number') return tc.index
-    if (tc.id) {
-      if (chatCallIndexById.has(tc.id)) return chatCallIndexById.get(tc.id)
-      const at = curLen
-      chatCallIndexById.set(tc.id, at)
-      lastChatCallIndex = at
-      return at
-    }
-    return lastChatCallIndex
-  }
+  const resolveChatIndex = makeChatIndexer()
 
   for (const line of raw.split(/\n/)) {
     // A blank line is the SSE event boundary. Whatever was accumulated and still does
@@ -145,7 +182,7 @@ function parseUpstream (raw, model, onText) {
     // completion look empty even though upstream had produced a valid response.
     if (Array.isArray(delta?.tool_calls)) {
       for (const tc of delta.tool_calls) {
-        const at = resolveChatIndex(tc, toolCalls.length)
+        const at = resolveChatIndex(tc)
         const cur = toolCalls[at] ||= {
           id: '', type: 'function',
           function: { name: '', arguments: '' },
@@ -610,20 +647,10 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       let nextFoldedPos = 0
       const callsByIndex = new Map()
       const outIdxToCall = new Map()
-      const chatCallIndexById = new Map()
-      let lastChatCallIndex = 0
-      let chatCallCount = 0
-      const resolveChatIndex = (d) => {
-        if (typeof d.index === 'number') return d.index
-        if (d.id) {
-          if (chatCallIndexById.has(d.id)) return chatCallIndexById.get(d.id)
-          const at = chatCallCount++
-          chatCallIndexById.set(d.id, at)
-          lastChatCallIndex = at
-          return at
-        }
-        return lastChatCallIndex
-      }
+      // The SAME indexer the fold uses, so the index space the client sees while
+      // streaming is identical to the one the folded completion ends up with. Two
+      // separate indexers is what allowed them to drift apart and duplicate calls.
+      const resolveChatIndex = makeChatIndexer()
       res.on('data', (c) => {
         // Every byte is progress. The first one spends the long prefill budget;
         // from then on a silent socket is a stall rather than legitimate prefill.

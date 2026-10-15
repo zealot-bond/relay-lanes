@@ -24,10 +24,10 @@ const RESPONSES_MODELS = new Set([
 //
 // chat / responses outcome per candidate:
 //
-//   PASS chat     exo-free                      2.2s
+//   GONE chat 410 exo-free                      2.2s on 10-07, 410 on 10-15
 //   PASS chat     space-bunny-free              0.8s
 //   PASS chat     longcat-2.5-preview-free     4.6s
-//   PASS chat     fledge-alpha-free             1.9s
+//   GONE chat 410 fledge-alpha-free             1.9s on 10-07, 410 on 10-15
 //   PASS chat     ling-3.1-flash-free           1.4s
 //   PASS chat     big-pickle                    4.3s
 //   PASS chat     nemotron-3-ultra-free         5.1s
@@ -42,6 +42,13 @@ const RESPONSES_MODELS = new Set([
 //   FAIL chat 400 "Model is unavailable"       deepseek-v4-flash-free
 //   FAIL chat 500 / responses 500              jev-1.13-free
 //   FAIL chat 410 "ModelDeprecated"            mimo-v2.5-free
+//   FAIL chat 410 "ModelDeprecated"            exo-free          (2026-10-15, was PASS 2.2s)
+//   FAIL chat 410 "ModelDeprecated"            fledge-alpha-free (2026-10-15, was PASS 1.9s)
+//
+// Re-probed 2026-10-15, every entry in the catalogue below. Two had been REMOVED by
+// the provider since the sweep above and now answer 410 ModelDeprecated on every call:
+// exo-free and fledge-alpha-free. Both were in the "reliable" list handed to the user
+// on 2026-10-07, so they were removed here rather than left to fail.
 //
 // Every addition was probed on BOTH dialects. The five new models answer 500 or
 // 401 on /v1/responses, so they are chat-only; mislabelling them would surface as
@@ -58,9 +65,10 @@ export const MODELS = [
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
   { id: 'muse-spark-1.2-contributor-free', contextWindow: 200000 },
   { id: 'muse-spark-1.3-contributor-free', contextWindow: 200000 },
-  // Verified present and answering on the chat dialect only.
-  { id: 'exo-free', contextWindow: 200000 },
-  { id: 'fledge-alpha-free', contextWindow: 200000 },
+  // exo-free and fledge-alpha-free were here until 2026-10-15 and are gone: the
+  // provider answers 410 ModelDeprecated. Removing them is not cosmetic -- an advertised
+  // model that cannot be served costs every client six upstream calls before the
+  // quarantine finally refuses it.
   { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
   { id: 'space-bunny-free', contextWindow: 200000 },
 ]

@@ -114,14 +114,42 @@ function noteFailure (model, result) {
 }
 
 const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'empty', 'transport', 'timeout', 'error'])
+// `gone` is counted once per request like provider_error, so it is not logged per attempt.
 
 /** Record an attempt's rejection in recentFailures without touching the health counter. */
 function logAttemptFailure (model, result) {
   if (!UNCOUNTED_KINDS.has(result.kind)) noteFailure(model, result)
 }
 
+/**
+ * The provider's own words about a rejection, as one short line.
+ *
+ * Falls back to the quarantined-model note when the attempt carried no body, so a
+ * refusal is never reported without a reason.
+ */
+function upstreamDetail (result, model) {
+  const body = String((result && result.raw) || '').slice(0, 200).replace(/\s+/g, ' ').trim()
+  return body || ((model && (modelHealthOf(model) || {}).note) || '')
+}
+
+// A withdrawn model is not coming back within a two-minute window, so it is held
+// off much longer. Retrying it every couple of minutes cost six upstream calls per
+// request from every client for as long as it stayed advertised.
+const GONE_QUARANTINE_MS = 60 * 60 * 1000
+
 export function noteModelResult (model, result, { log = true } = {}) {
   const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '', until: 0 }
+  if (result.kind === 'gone') {
+    // Count it up to the threshold so the refusal kicks in immediately, rather than
+    // making the next two requests each pay for the same lesson.
+    h.fails = Math.max(h.fails, HEALTH_THRESHOLD)
+    h.lastKind = 'gone'
+    h.note = 'the provider withdrew this model (HTTP 410/404); it is not coming back'
+    h.until = Date.now() + GONE_QUARANTINE_MS
+    modelHealth.set(model, h)
+    if (log) noteFailure(model, result)
+    return
+  }
   if (result.kind === 'ok') {
     h.fails = 0
     h.note = ''
@@ -193,6 +221,7 @@ export function modelHealthStats () {
  */
 // Retried at most once (see dispatch). `gate` is excluded: a rejected
 // fingerprint is identical from every egress IP, so retrying cannot help.
+//   gone           no  - the provider withdrew the model; identical from every IP
 const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error'])
 // Attempts per request, including the first. Two is deliberate: a 4xx is identical
 // from every egress IP, so a second try covers genuine transients and a third only
@@ -340,10 +369,15 @@ function waitForAttempt (entry, lane) {
     // The queue hands work to whichever lane claims first, so the hint can be a
     // different lane entirely; requeueing on the hint's staleness would abandon
     // work that another lane was serving correctly.
+    const activeLaneId = () => {
+      const held = queue.inflight.get(entry.id)
+      return held?.claimedBy || lane.id
+    }
+
     const laneGone = () => {
       const held = queue.inflight.get(entry.id)
       if (held && held.claimedAt && Date.now() - held.claimedAt < CLAIM_GRACE_MS) return false
-      return stale(held?.claimedBy || lane.id)
+      return stale(activeLaneId())
     }
 
     // A lane can exit cleanly (idle timeout, lifetime end, job cancelled) and
@@ -356,7 +390,7 @@ function waitForAttempt (entry, lane) {
       // Only safe while nothing has been streamed: once the client has text, the
       // response is committed and a retry would duplicate it.
       if (!entry.committed && laneGone()) {
-        fin({ kind: 'requeued', status: 0, ms: Date.now() - entry.enqueuedAt, data: null, laneId: lane.id })
+        fin({ kind: 'requeued', status: 0, ms: Date.now() - entry.enqueuedAt, data: null, laneId: activeLaneId() })
       }
     }, 2000)
     poll.unref?.()
@@ -364,10 +398,11 @@ function waitForAttempt (entry, lane) {
     const arm = () => {
       timer = setTimeout(() => {
         waited += ATTEMPT_HARD_MS
-        const rec = lanes.lanes.get(lane.id)
+        const currentLane = activeLaneId()
+        const rec = currentLane ? lanes.lanes.get(currentLane) : null
         const alive = rec && Date.now() - rec.lastSeen < LANE_STALE_MS
         if (alive && waited < ATTEMPT_MAX_MS) return arm()
-        fin({ kind: 'timeout', status: 0, ms: waited, data: null, laneId: lane.id })
+        fin({ kind: 'timeout', status: 0, ms: waited, data: null, laneId: currentLane })
       }, ATTEMPT_HARD_MS)
       timer.unref?.()
     }
@@ -867,8 +902,20 @@ async function handleChat (req, res) {
           // quoting MAX_ATTEMPTS-1 was frequently wrong -- it said "retried 1x"
           // on requests that had actually been tried several times, which made a
           // token-budget problem look like a single unlucky attempt.
-          message: `no lane could serve this request (${result.kind}); ` +
-            `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}`,
+          //
+          // Name the upstream reason here too. Only the non-streaming path did, so a
+          // STREAMING client -- which is every harness -- was told merely
+          // "(transport); tried 2 time(s) across lanes" for an upstream 400 reading
+          // "Missing required parameter: tools[4].type", and for a 500 reading
+          // "provider exploded". The kind alone cannot distinguish a provider outage
+          // from a schema the gateway rejected.
+          message: (result.kind === 'gone'
+            // Nothing to retry and nothing to wait for: say so instead of
+            // reporting an opaque upstream refusal.
+            ? `the provider withdrew ${PROVIDER}/${model}; it is no longer available`
+            : `no lane could serve this request (${result.kind}); ` +
+              `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}` +
+              `${upstreamDetail(result, model) ? `; upstream: ${upstreamDetail(result, model)}` : ''}`),
           type: 'upstream_unavailable',
         },
       }
@@ -887,8 +934,7 @@ async function handleChat (req, res) {
     }
     // Use the failure in hand, not just quarantined state: the very first rejection
     // must name the upstream reason, otherwise the client is told nothing useful.
-    const body = String(result.raw || '').slice(0, 180).replace(/\s+/g, ' ').trim()
-    const detail = body || (modelHealthOf(model) || {}).note || result.kind
+    const detail = upstreamDetail(result, model) || result.kind
     return json(res, 502, {
       error: {
         message: `upstream rejected ${PROVIDER}/${model}: ${detail}` +
@@ -947,33 +993,43 @@ async function handleChat (req, res) {
   if (bufferedCalls.length) {
     const sent = entry.streamedToolArgs || new Map()
     const sentNames = entry.streamedToolNames || new Map()
+    const sentIds = entry.streamedToolIds || new Map()
     const repair = []
     for (let i = 0; i < bufferedCalls.length; i++) {
       const c = bufferedCalls[i]
+      if (!c) continue
+      // Reconcile against the index this call ACTUALLY streamed under, not against
+      // its position in the folded array. Those can differ: a lane numbering calls by
+      // upstream index (2, 0) folds into a dense array at positions 1 and 0, and
+      // comparing position 1 with "what arrived at index 1" reads as a call that was
+      // never sent -- so it was restated and the client executed it twice, with the
+      // arguments appended twice. Identity is the only reliable link between the two.
+      const id = typeof c.id === 'string' ? c.id : ''
+      const at = (id && sentIds.has(id)) ? sentIds.get(id) : i
       const fullName = c.function?.name || ''
-      const gotName = sentNames.get(i) || ''
+      const gotName = sentNames.get(at) || ''
       const fullArgs = typeof c.function?.arguments === 'string' ? c.function.arguments : ''
-      const got = sent.get(i) || ''
+      const got = sent.get(at) || ''
       if (!entry.streamedTools) {
         // Nothing was streamed: send the whole call, name and id included.
-        repair.push({ ...c, index: i })
+        repair.push({ ...c, index: at })
         continue
       }
       // If the client's received name does not match the full folded name, the name
       // was split across batches or truncated in flight. Restate the call in full.
       if (fullName !== gotName) {
-        repair.push({ index: i, ...c })
+        repair.push({ index: at, ...c })
         continue
       }
       // Identity is never repeated: a client appending name fragments would turn
       // "edit" into "editedit". Only the argument tail, when one is missing.
       if (fullArgs.length > got.length && fullArgs.startsWith(got)) {
-        repair.push({ index: i, function: { arguments: fullArgs.slice(got.length) } })
+        repair.push({ index: at, function: { arguments: fullArgs.slice(got.length) } })
       } else if (fullArgs !== got) {
         // The client's copy is not a prefix of the folded call, so appending
         // cannot repair it. Restate the call in full rather than leave a harness
         // with JSON it cannot parse.
-        repair.push({ index: i, ...c })
+        repair.push({ index: at, ...c })
       }
     }
     if (repair.length) chunk({ tool_calls: repair })
@@ -1168,8 +1224,13 @@ async function laneDelta (req, res) {
       entry.streamedTools = true
       const args = entry.streamedToolArgs || (entry.streamedToolArgs = new Map())
       const names = entry.streamedToolNames || (entry.streamedToolNames = new Map())
+      // Which client-facing index carried which call. The finaliser reconciles by
+      // identity rather than by array position, so it needs this: a lane can number
+      // its calls differently from the order the folded completion ends up in.
+      const ids = entry.streamedToolIds || (entry.streamedToolIds = new Map())
       for (const c of body.toolCalls) {
         const i = typeof c.index === 'number' ? c.index : 0
+        if (typeof c.id === 'string' && c.id) ids.set(c.id, i)
         if (typeof c.function?.arguments === 'string') {
           const prev = args.get(i) || ''
           args.set(i, prev + c.function.arguments)
