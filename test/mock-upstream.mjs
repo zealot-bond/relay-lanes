@@ -31,6 +31,11 @@ const chunk = (delta, finish = null) => sse({ id: 'x', object: 'chat.completion.
 // send garbage, stall, reset the socket, or answer with a non-SSE body.
 const scenarios = {
   // --- well-behaved baselines
+  longtext: (res) => {
+    const body = 'A hash table stores keys in an array of buckets, computed from each key, so that lookups need only one array access plus a short chain walk. Collisions happen whenever two keys land in the same bucket, which is why the table resizes when the buckets get crowded.'
+    for (let i = 0; i < body.length; i += 24) res.write(chunk({ content: body.slice(i, i + 24) }))
+    res.end(chunk({}, 'stop') + 'data: [DONE]\n\n')
+  },
   plain: (res) => { for (const w of ['Hel', 'lo ', 'world']) res.write(chunk({ content: w })); res.end(sse({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + 'data: [DONE]\n\n') },
 
   // One call, arguments dribbled out in tiny pieces (how real streams look).
@@ -142,7 +147,11 @@ const handler = https.createServer({ key: fs.readFileSync(path.join(dir, 'k.pem'
     try { parsed = JSON.parse(body) } catch { /* recorded anyway */ }
     const text = body
     const m = /\[\[S:([a-z0-9_]+)\]\]/.exec(text)
-    const name = m ? m[1] : 'plain'
+    // No marker -> `longtext`, a paragraph. A prober treats "under 20 characters" as an
+    // empty answer, so the default fixture must be long enough to pass that threshold
+    // honestly. Tests that want the short exact-match fixture ask for [[S:plain]].
+    // MOCK_DEFAULT lets a prober be pointed at a fixture that answers in a chosen mode.
+    const name = m ? m[1] : (process.env.MOCK_DEFAULT || 'longtext')
     seen.push({ scenario: name, path: req.url, body: parsed, raw: body })
     const fn = scenarios[name]
     if (!fn) { res.writeHead(400); return res.end(JSON.stringify({ error: { message: 'unknown scenario ' + name } })) }

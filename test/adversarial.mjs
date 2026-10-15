@@ -7,6 +7,13 @@
 //
 //   node test/adversarial.mjs
 //   SRC_DIR=/path/to/older/src node test/adversarial.mjs     # negative control
+//   NO_BOOT=1 PORT=26002 node test/adversarial.mjs            # test a RUNNING relay
+//
+// NO_BOOT targets an already-running relay instead of starting one, which is how the
+// packed jar is verified. Note the trap it avoids: pointing this script at a port that
+// another relay already owns does NOT fail loudly -- its own relay cannot bind, but
+// the lanes it spawns register against whoever answers on that port. The run then
+// looks like a mass upstream failure rather than a port clash.
 //
 // The negative control is not optional. Two of the bugs below passed every other
 // suite, because each was green in isolation and only wrong in composition.
@@ -24,13 +31,14 @@ const LANES = Number(process.env.LANES || 6)
 const PORT = Number(process.env.PORT || 26021)
 const BASE = `http://127.0.0.1:${PORT}`
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const NO_BOOT_EARLY = process.env.NO_BOOT === '1'
 const kids = []
 
 const killKids = () => {
   for (const k of kids) { try { k.kill('SIGKILL') } catch { /* gone */ } }
   kids.length = 0
 }
-process.on('exit', () => { killKids(); stopMock() })
+process.on('exit', () => { killKids(); if (mockPort) stopMock() })
 
 // ---------------------------------------------------------------- boot
 const waitFor = async (check, ms = 25000) => {
@@ -42,8 +50,10 @@ const waitFor = async (check, ms = 25000) => {
   return false
 }
 
-const mockPort = await startMock()
-const ZEN = `https://127.0.0.1:${mockPort}`
+// In NO_BOOT mode the relay (and its lanes) already exist, so no mock is started here:
+// it would be a second, unused upstream.
+const mockPort = NO_BOOT_EARLY ? 0 : await startMock()
+const ZEN = mockPort ? `https://127.0.0.1:${mockPort}` : ''
 const env = { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' }
 const spawnNode = (script, extra) => {
   const k = spawn(process.execPath, [path.join(SRC, script)], { env: { ...env, ...extra }, stdio: 'ignore' })
@@ -51,18 +61,36 @@ const spawnNode = (script, extra) => {
   return k
 }
 
-console.log(`source under test: ${SRC}\nbooting relay + ${LANES} real lanes against a mock upstream...`)
-spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't' })
-if (!await waitFor(async () => (await fetch(BASE + '/health', { signal: AbortSignal.timeout(2000) })).ok)) {
-  console.error('relay did not start'); process.exit(1)
+const NO_BOOT = process.env.NO_BOOT === '1'
+if (NO_BOOT) {
+  const h = await (await fetch(BASE + '/health', { signal: AbortSignal.timeout(8000) })).json()
+  console.log(`testing a RUNNING relay: ${BASE}`)
+  console.log(`  build ${h.build} | lanes ${h.lanes} | laneCode ${JSON.stringify(h.laneCode)}\n`)
+  console.log('NOTE: its lanes must already point at a mock upstream for these checks to pass.\n')
+} else {
+  console.log(`source under test: ${SRC}\nbooting relay + ${LANES} real lanes against a mock upstream...`)
+  // Refuse early if something already owns the port: otherwise the relay below cannot
+  // bind and the lanes register against the squatter.
+  try {
+    const probe = await fetch(BASE + '/health', { signal: AbortSignal.timeout(2000) })
+    if (probe.ok) {
+      console.error(`refusing to start: something is already serving ${BASE}.`)
+      console.error('Use NO_BOOT=1 to test it deliberately, or pick another PORT.')
+      process.exit(1)
+    }
+  } catch { /* nothing there, which is what we want */ }
+  spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't' })
+  if (!await waitFor(async () => (await fetch(BASE + '/health', { signal: AbortSignal.timeout(2000) })).ok)) {
+    console.error('relay did not start'); process.exit(1)
+  }
+  for (let n = 1; n <= LANES; n++) {
+    spawnNode('worker.js', { RELAY_URL: BASE, RELAY_TOKEN: 't', LANE_ID: `t-${n}`, ZEN_BASE: ZEN })
+  }
+  if (!await waitFor(async () => (await (await fetch(BASE + '/health')).json()).lanes >= LANES)) {
+    console.error('lanes did not register'); process.exit(1)
+  }
+  console.log('up\n')
 }
-for (let n = 1; n <= LANES; n++) {
-  spawnNode('worker.js', { RELAY_URL: BASE, RELAY_TOKEN: 't', LANE_ID: `t-${n}`, ZEN_BASE: ZEN })
-}
-if (!await waitFor(async () => (await (await fetch(BASE + '/health')).json()).lanes >= LANES)) {
-  console.error('lanes did not register'); process.exit(1)
-}
-console.log('up\n')
 
 // ---------------------------------------------------------------- client
 const BASH = { type: 'object', properties: { command: { type: 'string' }, description: { type: 'string' } }, required: ['command', 'description'] }

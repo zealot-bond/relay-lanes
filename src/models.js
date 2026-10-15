@@ -28,6 +28,28 @@ const RESPONSES_MODELS = new Set([
 //   PASS chat     space-bunny-free              0.8s
 //   PASS chat     longcat-2.5-preview-free     4.6s
 //   GONE chat 410 fledge-alpha-free             1.9s on 10-07, 410 on 10-15
+//
+// The gateway's own model list is the one probe available from a machine whose egress
+// the free tier refuses, and on 2026-10-15 it proved decisive: it had shrunk from 88
+// entries (14 free) to 86 (10 free), and every free model it dropped was one already
+// known to fail. nemotron-3-ultra-free was among them -- a THIRD dead model that the
+// 410 sweep could not see, because a 403 FreeTierError on every request hides whatever
+// the model would have answered.
+//
+// Seven dropped, all previously broken:
+//   deepseek-v4-flash-free   400 model unavailable      ling-3.1-flash-free   endpoint down
+//   exo-free                 410 ModelDeprecated       mimo-v2.5-free        410 deprecated
+//   fledge-alpha-free        410 ModelDeprecated       nemotron-3-ultra-free (de-listed)
+//   ling-3.0-flash-fin-free  400 endpoint unavailable
+//
+// Being LISTED is not proof of life -- mimo-v2.5-free was listed for days while
+// answering 410 on every call -- so this narrows the catalogue, it does not verify it.
+//
+// Free-suffixed and newly listed on 2026-10-15, NOT added: none could be probed from a
+// gated egress, and adding an unprobed model is how ling-3.1-flash-free got in.
+//   cat-jam-free   deepseek-v4.1-flash-free   step-5-preview-free
+//
+//   GONE chat 410 fledge-alpha-free             1.9s on 10-07, 410 on 10-15
 //   PASS chat     ling-3.1-flash-free           1.4s
 //   PASS chat     big-pickle                    4.3s
 //   PASS chat     nemotron-3-ultra-free         5.1s
@@ -60,7 +82,6 @@ const RESPONSES_MODELS = new Set([
 // 200000 declared here. Treat it as a floor, not a limit.
 export const MODELS = [
   { id: 'big-pickle', contextWindow: 200000 },
-  { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
   { id: 'muse-spark-1.2-contributor-free', contextWindow: 200000 },

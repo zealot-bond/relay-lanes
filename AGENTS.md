@@ -244,15 +244,80 @@ node test/wire-toolcalls.mjs # serialised bytes a client reassembles
 node test/stream-safety.mjs  # keepalive, ordering, backpressure model
 node test/tool-shapes.mjs    # tool spec normalisation + gate-safe dedupe
 node test/codeversion.mjs    # the lane-code fingerprint
-node test/regressions.mjs    # 33 checks over 14 loopback scenarios
+node test/regressions.mjs    # 38 checks over 14 loopback scenarios
+node test/adversarial.mjs   # 48 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
+SRC_DIR=/older/src node test/adversarial.mjs   # negative control
+NO_BOOT=1 PORT=26002 node test/adversarial.mjs # test an ALREADY-RUNNING relay (the packed jar)
 ```
+
+`adversarial.mjs` boots `main.js` and `worker.js` UNMODIFIED and points them at
+`test/mock-upstream.mjs`, a local HTTPS server that scripts the provider's behaviour
+(including misbehaving: mid-stream resets, stalls, garbage bodies, 410s). It asserts what
+a CLIENT reassembles, which is the only place a disagreement between the streamed index
+space and the folded completion can surface. Two bugs found on 2026-10-15 passed every
+other suite because each was correct in isolation and wrong only in composition.
+
+**Never point `adversarial.mjs` at a port another relay already owns.** Its own relay
+cannot bind, its lanes then register against the squatter, and the run reports a mass
+upstream failure instead of a port clash. It now refuses to start if the port answers.
 
 `regressions.mjs` runs the real modules over loopback (real HTTP server, raw sockets,
 a TLS mock for the upstream), one process per scenario. **Point it at the pre-fix tree
 too and confirm those scenarios fail** — one backpressure test passed on the broken
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
+
+## The catalogue rots silently -- probe it, do not trust it
+
+Run `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
+gap of a few days and before trusting any model list. It measures plain generation AND
+tool calls, treats HTTP 200 as failure unless text or a valid call actually arrived, and
+prints which models to remove.
+
+Between 2026-10-07 and 2026-10-15 three advertised models stopped existing:
+
+| model | evidence |
+|---|---|
+| `exo-free` | HTTP 410 `ModelDeprecated` on every call; de-listed |
+| `fledge-alpha-free` | HTTP 410 `ModelDeprecated` on every call; de-listed |
+| `nemotron-3-ultra-free` | de-listed from `/zen/v1/models` |
+
+The third is the instructive one: a 410 sweep **could not see it**, because a 403
+`FreeTierError` on every request hides whatever the model would have answered. The
+gateway's own model list was the only probe available from a gated egress, and it had
+shrunk from 88 entries (14 free) to 86 (10 free) -- and every free model it dropped was
+one already known to fail.
+
+**Being listed is not proof of life.** `mimo-v2.5-free` was listed for days while
+answering 410 on every call. The list narrows the catalogue; it does not verify it.
+Never add a model that has not been probed.
+
+Free-suffixed and listed on 2026-10-15 but deliberately NOT added, because they could
+not be probed: `cat-jam-free`, `deepseek-v4.1-flash-free`, `step-5-preview-free`.
+
+## Defects found 2026-10-15 (by running it, not by reading it)
+
+1. **A provider using non-contiguous tool-call indices made the client run a tool twice.**
+   `parseUpstream` ended with `toolCalls.filter(Boolean)`, which COMPACTS away the holes
+   left by sparse indices, while the streaming path passed the upstream index straight
+   through. Upstream sending `call_B` at index 2 and `call_A` at index 0 put the client
+   and the fold in different index spaces; the finaliser compared position 1 against
+   "nothing arrived at 1", concluded the call was missing, and restated it. The client
+   held **three** calls with `call_B`'s arguments appended twice.
+   Fixed by deriving both index spaces from one indexer (`makeChatIndexer`), and by
+   having the finaliser reconcile by call `id` rather than array position -- so a lane
+   still running older code cannot reproduce it.
+2. **A streamed upstream error named no reason.** Only the non-streaming path included
+   the provider's message, so every harness (which streams) was told merely
+   `(transport); tried 2 time(s) across lanes` for an upstream 400 reading
+   `Missing required parameter: tools[4].type`. Both paths now share `upstreamDetail()`.
+3. **A model withdrawn by the provider was indistinguishable from a transient failure.**
+   A 410 `ModelDeprecated` classified as `provider_error`, so a client sat through six
+   upstream calls across three lanes for a model that would never answer. Now classified
+   `gone`: not retried across lanes, quarantined for an hour instead of two minutes, and
+   reported as withdrawn. Checked BEFORE the status-driven verdicts, because a 429
+   carrying a deprecation notice would otherwise be read as an exhausted bucket.
 
 ## Known issues
 
@@ -265,19 +330,27 @@ showed it. Never copy production logic into a test; import it.
    pending a decision, since clients may budget against it.
 4. GitHub Actions ToS: using CI runners as a request-serving relay violates the
    acceptable use. This can affect the token, not just quota.
-5. **Tool names are matched exactly when merging with the gateway's tools.** The
+5. **`LANE_STALE_MS` 60s and `CLAIM_GRACE_MS` 30s bound how long a request waits on a
+   lane that dies mid-flight.** These were raised from 45s/15s on 2026-10-11, which makes
+   a dying lane cost up to 60s of extra latency before the request is retried elsewhere.
+   Measured: a request arriving just after every lane was killed hung for the full
+   60s. Correct for slow-but-healthy GitHub runners, costly when they die. Watch it if
+   latency spikes coincide with runners cycling.
+6. **Tool names are matched exactly when merging with the gateway's tools.** The
    gateway's access check needs `bash`, `glob`, `grep`, `read` present as spelled; a
    client's `Bash` therefore sits alongside the gateway's `bash` instead of replacing
    it (a case-insensitive merge removed `bash` and every request answered 403).
    A harness using capitalised names may see the model call the lowercase one.
-6. `max_tokens` is floored at 4096. Reasoning tokens come out of the same budget, and
+7. `max_tokens` is floored at 4096. Reasoning tokens come out of the same budget, and
    anything lower produced an empty completion (measured), so a harness that sets
    `max_tokens=32` gets a larger budget than it asked for.
-7. Unproven, found in review but not triggered: chat tool calls that arrive without an
-   `index` are all streamed as index 0 while the fold keys by position; and a lost
-   first delta batch would leave a streamed call without its id/name.
-8. Model availability is not discoverable from the gateway's own model list: it still
-   lists `mimo-v2.5-free` (HTTP 410 on every call). Probe before adding a model.
+8. Unproven, found in review but not triggered: a lost first delta batch would leave a
+   streamed call without its id/name.
+9. **Seven models were advertised with no verification after 2026-10-07.** Three were
+   found dead and removed; the remaining seven answer on an Oct 7 measurement alone.
+   A gated egress cannot verify them (every request returns 403 `FreeTierError`, which
+   hides the model's actual state -- that is exactly how `nemotron-3-ultra-free` slipped
+   through). Run `scripts/probe-catalogue.mjs` once the panel is up.
 
 ## A note on `src/fingerprint.js`
 
