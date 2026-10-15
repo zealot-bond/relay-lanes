@@ -17,7 +17,19 @@ export const OPENCODE_UA = 'opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtim
 export const OPENCODE_CLIENT = 'cli'
 export const OPENCODE_PROJECT = 'global'
 
-export const ZEN_BASE = process.env.ZEN_BASE || 'https://opencode.ai/zen'
+// The upstream moved. models.dev -- the catalogue OpenCode v2 itself loads -- declares
+// the `opencode` provider as `@ai-sdk/openai-compatible` at
+//   https://opencode.ai/inference/v1
+// and the installed client (v2.0.22) calls exactly that. This relay was still calling the
+// older `https://opencode.ai/zen`, which is the path the reference proxy
+// (Steve3184/OpenCodeProxyHub) also hardcodes and which now answers
+//   HTTP 403 {"error":{"type":"FreeTierError",
+//     "message":"OpenCode's free tier can only be used from within OpenCode."}}
+// for every request. Both paths return that here, so switching is not by itself proven to
+// fix it -- but calling a path the current client does not use is wrong regardless, and
+// /zen/v1/models (the only list reachable without that 403) has shrunk to 86 entries and
+// omits models the real catalogue still carries, so it cannot be trusted either.
+export const ZEN_BASE = process.env.ZEN_BASE || 'https://opencode.ai/inference'
 export const RESPONSES_PATH = '/v1/responses'
 export const CHAT_PATH = '/v1/chat/completions'
 

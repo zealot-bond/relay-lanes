@@ -36,14 +36,22 @@ const RESPONSES_MODELS = new Set([
 // 410 sweep could not see, because a 403 FreeTierError on every request hides whatever
 // the model would have answered.
 //
-// Seven dropped, all previously broken:
+// Seven dropped from /zen/v1/models:
 //   deepseek-v4-flash-free   400 model unavailable      ling-3.1-flash-free   endpoint down
 //   exo-free                 410 ModelDeprecated       mimo-v2.5-free        410 deprecated
-//   fledge-alpha-free        410 ModelDeprecated       nemotron-3-ultra-free (de-listed)
+//   fledge-alpha-free        410 ModelDeprecated       nemotron-3.ultra-free (no direct evidence)
 //   ling-3.0-flash-fin-free  400 endpoint unavailable
 //
-// Being LISTED is not proof of life -- mimo-v2.5-free was listed for days while
-// answering 410 on every call -- so this narrows the catalogue, it does not verify it.
+// CORRECTION (2026-10-15, later the same day): it was concluded that every model the list
+// dropped was therefore broken, and nemotron-3-ultra-free was removed on that basis. That
+// inference is WRONG. /zen/v1/models is a static list, not a health signal, and the
+// authoritative one -- the models.dev catalogue that OpenCode v2 actually loads -- still
+// carries all 123 models for the `opencode` provider, including nemotron-3-ultra-free,
+// exo-free, mimo-v2.5-free and deepseek-v4-flash-free, every one of which is confirmed
+// dead. Neither list predicts anything. Only a live probe does.
+//
+// The 410 responses for exo-free and fledge-alpha-free ARE real evidence and those two
+// stay removed.
 //
 // Free-suffixed and newly listed on 2026-10-15, NOT added: none could be probed from a
 // gated egress, and adding an unprobed model is how ling-3.1-flash-free got in.
@@ -82,6 +90,13 @@ const RESPONSES_MODELS = new Set([
 // 200000 declared here. Treat it as a floor, not a limit.
 export const MODELS = [
   { id: 'big-pickle', contextWindow: 200000 },
+  // nemotron-3-ultra-free was removed on 2026-10-15 because it was absent from
+  // /zen/v1/models, then restored the same day: that list is not a health signal, so its
+  // absence proved nothing. It is still absent there and still present in the models.dev
+  // catalogue, which is ALSO not a health signal (it still lists exo-free and
+  // mimo-v2.5-free, both confirmed 410). Absence is evidence of nothing; only a live
+  // probe is.
+  { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
   { id: 'muse-spark-1.2-contributor-free', contextWindow: 200000 },

@@ -268,7 +268,30 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
-## The catalogue rots silently -- probe it, do not trust it
+## The upstream endpoint moved (2026-10-15)
+
+The relay called `https://opencode.ai/zen/v1`. The installed client (OpenCode **v2.0.22**)
+does not: the models.dev catalogue it loads declares the `opencode` provider as
+`@ai-sdk/openai-compatible` at **`https://opencode.ai/inference/v1`**, and the binary's
+request headers (`x-opencode-client`, `x-opencode-session`, `x-session-affinity`,
+`X-Session-Id`, `x-opencode-project`) were read straight out of it. `ZEN_BASE` now defaults
+to `https://opencode.ai/inference`.
+
+The reference proxy `Steve3184/OpenCodeProxyHub` hardcodes `/zen/v1` too. Useful as a
+cross-check on architecture -- it classifies this gate as an egress problem and fixes it
+with a pool of outbound proxies, the same idea as the runner pool here -- but its endpoint
+is the old one.
+
+Measured from this machine, **both** paths answer
+`403 {"error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used
+from within OpenCode."}}`, including when the request is built by
+`@ai-sdk/openai-compatible` itself. So switching the path is not proven to fix the gate; it
+is simply the path the current client uses. What was ruled out by measurement: every
+header variant (~25, including the real client's own set), HTTP/1.1 vs HTTP/2, Node vs Bun
+TLS, and authentication -- OpenCode runs anonymously here, with empty `account`,
+`control_account` and `credential` tables and no `OPENCODE_API_KEY`.
+
+## The catalogue rots silently -- and NO list predicts anything
 
 Run `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
 gap of a few days and before trusting any model list. It measures plain generation AND
@@ -289,9 +312,12 @@ gateway's own model list was the only probe available from a gated egress, and i
 shrunk from 88 entries (14 free) to 86 (10 free) -- and every free model it dropped was
 one already known to fail.
 
-**Being listed is not proof of life.** `mimo-v2.5-free` was listed for days while
-answering 410 on every call. The list narrows the catalogue; it does not verify it.
-Never add a model that has not been probed.
+**Being listed is not proof of life, and being ABSENT is not proof of death.** Both
+`/zen/v1/models` (86 entries) and the models.dev catalogue (123 for `opencode`, 38 free)
+still list `exo-free`, `mimo-v2.5-free` and `deepseek-v4-flash-free`, all confirmed dead
+with 410/400. An earlier round concluded the opposite error -- that a model dropped from
+`/zen/v1/models` must therefore be broken -- and removed `nemotron-3-ultra-free` on that
+basis. It has been restored. Neither list is a health signal; only a live probe is.
 
 Free-suffixed and listed on 2026-10-15 but deliberately NOT added, because they could
 not be probed: `cat-jam-free`, `deepseek-v4.1-flash-free`, `step-5-preview-free`.
