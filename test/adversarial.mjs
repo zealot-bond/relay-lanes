@@ -79,7 +79,8 @@ if (NO_BOOT) {
       process.exit(1)
     }
   } catch { /* nothing there, which is what we want */ }
-  spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't' })
+  // DIRECT_MODE defaults to 1 now; these scenarios are about the LANE path, so pin it off.
+  spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '0' })
   if (!await waitFor(async () => (await fetch(BASE + '/health', { signal: AbortSignal.timeout(2000) })).ok)) {
     console.error('relay did not start'); process.exit(1)
   }
@@ -96,11 +97,11 @@ if (NO_BOOT) {
 const BASH = { type: 'object', properties: { command: { type: 'string' }, description: { type: 'string' } }, required: ['command', 'description'] }
 const TOOLS = [{ type: 'function', function: { name: 'bash', description: 'Run a bash command.', parameters: BASH } }]
 
-async function ask ({ scenario, tools, stream = true, messages, timeout = 60000, model = 'big-pickle' }) {
+async function ask ({ scenario, tools, stream = true, messages, timeout = 60000, model = 'big-pickle', base }) {
   const t0 = Date.now()
   const body = { model: `github/${model}`, stream, messages: messages || [{ role: 'user', content: `[[S:${scenario}]] go` }] }
   if (tools) body.tools = tools
-  const res = await fetch(BASE + '/v1/chat/completions', {
+  const res = await fetch((base || BASE) + '/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body), signal: AbortSignal.timeout(timeout),
   })
@@ -317,6 +318,38 @@ group('concurrency and lifecycle')
     (await ask({ scenario: 'plain' })).text === 'Hello world')
   const h = await (await fetch(BASE + '/health')).json()
   check('no work is stranded in the queue after an abort', h.queue.pending === 0, JSON.stringify(h.queue))
+}
+
+// ---------------------------------------------------------------- direct mode
+// DIRECT_MODE bypasses the lane pool entirely: the relay calls the upstream from its own
+// host. Verified here with ZERO lanes registered, which is the whole point -- if any of
+// these pass because a lane happened to serve them, the test proves nothing.
+{
+  console.log('\ndirect mode: no lanes, no orchestrator')
+  const R = Number(process.env.DIRECT_PORT || PORT + 1)
+  const rel = spawn(process.execPath, [path.join(SRC, 'main.js')], {
+    env: { ...env, PORT: String(R), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '1', ZEN_BASE: ZEN },
+    stdio: 'ignore',
+  })
+  kids.push(rel)
+  const DBASE = `http://127.0.0.1:${R}`
+  const up = await waitFor(async () => (await fetch(DBASE + '/health', { signal: AbortSignal.timeout(2000) })).ok)
+  check('the relay starts in direct mode', up)
+  if (up) {
+    const h = await (await fetch(DBASE + '/health')).json()
+    check('with ZERO lanes registered', h.lanes === 0, `lanes=${h.lanes}`)
+    check('and direct mode reported on', h.direct?.enabled === true, JSON.stringify(h.direct))
+    const direct = await ask({ base: DBASE, scenario: 'plain' })
+    check('a plain request is served with no lane at all', direct.text === 'Hello world', JSON.stringify(direct.text))
+    const tools = await ask({ base: DBASE, scenario: 'tool_small_deltas', tools: TOOLS })
+    check('a tool call is served with no lane at all',
+      tools.calls.length === 1 && parse(tools.calls[0]?.args)?.command === 'ls -la /tmp',
+      JSON.stringify(tools.calls[0]?.args))
+    check('and the streamed tool name is not doubled', tools.calls[0]?.name === 'bash', JSON.stringify(tools.calls[0]?.name))
+  }
+  try { rel.kill('SIGKILL') } catch { /* already gone */ }
+  kids.pop()
+  await sleep(500)
 }
 
 killKids()

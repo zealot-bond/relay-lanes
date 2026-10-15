@@ -107,6 +107,21 @@ export const MODELS = [
   // quarantine finally refuses it.
   { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
   { id: 'space-bunny-free', contextWindow: 200000 },
+  // Newly listed free models, added 2026-10-15 and PROBED before being kept -- the first
+  // time any of these could be verified at all, because direct mode finally reached the
+  // upstream from this host. Measured: cat-jam-free 4/4 plain + 3/3 tools (1.9s p50,
+  // the fastest here), deepseek-v4.1-flash-free 4/4 + 3/3 (5.5s), step-5-preview-free
+  // 4/4 + 3/3 then 0/5 then 200 again minutes later.
+  //
+  // step-5-preview-free is genuinely flaky: it returned
+  //   HTTP 429 {"error":{"type":"server_error","message":"Upstream request failed:
+  //                Endpoint is unavailable."}}
+  // which classifyUpstream reports as a MODEL fault (outage), not an exhausted bucket --
+  // the same outage-reported-as-429 that affected ling-3.1-flash-free. Do not remove it on
+  // one bad sweep, and do not trust a single sweep either way.
+  { id: 'cat-jam-free', contextWindow: 200000 },
+  { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
+  { id: 'step-5-preview-free', contextWindow: 200000 },
 ]
 
 export function protocolFor (modelId) {

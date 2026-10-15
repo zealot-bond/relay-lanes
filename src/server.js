@@ -20,6 +20,7 @@ import { WorkQueue, LaneRegistry } from './queue.js'
 import { listModelsPayload, findModel, splitModelId, PROVIDER, MODELS } from './models.js'
 import { config } from './config.js'
 import { CODE_VERSION } from './codeversion.js'
+import { directEnabled, directStats, serveDirect } from './direct.js'
 
 // Config is read from config.js, which resolves baked credentials, then
 // start.properties, then the environment -- so a baked PORT is honoured even
@@ -433,6 +434,48 @@ async function dispatch (entry) {
     const held = Date.now() - entry.enqueuedAt
     if (!entry.committed && held > MAX_HOLD_MS) return last
     if (held > MAX_HOLD_MS * 2) return entry.committed ? { ...last, kind: 'partial' } : last
+
+    // DIRECT_MODE: call the upstream here, in-process, and skip the lane pool entirely.
+    // Placed before lane selection so nothing touches the queue, a claim, or a heartbeat.
+    if (directEnabled()) {
+      attempt++
+      const stream = entry.job.stream
+      const push = streamers.get(entry.id)
+      let result
+      try {
+        result = await serveDirect(entry.job, {
+          onDelta: stream && push ? (t) => { entry.streamedText = true; entry.streamedTextLen = (entry.streamedTextLen || 0) + t.length; push(t, null) } : undefined,
+          onToolCall: () => { if (stream && push) entry.committed = true },
+          onToolDelta: stream && push ? (d) => {
+            entry.streamedTools = true
+            const args = entry.streamedToolArgs || (entry.streamedToolArgs = new Map())
+            const names = entry.streamedToolNames || (entry.streamedToolNames = new Map())
+            const ids = entry.streamedToolIds || (entry.streamedToolIds = new Map())
+            for (const c of d) {
+              const i = typeof c.index === 'number' ? c.index : 0
+              if (typeof c.id === 'string' && c.id) ids.set(c.id, i)
+              if (typeof c.function?.arguments === 'string') args.set(i, (args.get(i) || '') + c.function.arguments)
+              if (typeof c.function?.name === 'string' && c.function.name) {
+                const prev = names.get(i) || ''
+                names.set(i, prev ? prev + c.function.name : c.function.name)
+              }
+            }
+            push('', d)
+          } : undefined,
+        })
+      } catch (e) {
+        result = { kind: 'error', status: 0, ms: 0, data: null, raw: String(e?.message || e) }
+      }
+      entry.outcome = result
+      console.log(`[relay] direct ${entry.job.model} -> ${result.kind} (${result.ms}ms)`)
+      if (result.kind === 'ok') {
+        lanes.record('direct', 'ok', result.ms || 0)
+        return result
+      }
+      // One IP is one bucket: a retry cannot land somewhere else, so it is not worth
+      // three round trips. Report the real reason instead.
+      return result
+    }
 
     const lane = pickLane(tried, busyLanes)
     if (!lane) {
@@ -1267,6 +1310,7 @@ export function createServer () {
           ok: true, provider: PROVIDER, models: MODELS.length,
           build: `${config.BUILD_ID} (${config.BUILD_BUILT})`,
           laneCode: laneCodeStats(),
+          direct: directStats(),
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is
           // doing wrong, so they are in the health payload rather than only in

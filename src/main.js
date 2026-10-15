@@ -25,7 +25,21 @@ const { start, lanes, queue, laneCodeStats } = await import('./server.js')
 
 const server = start()
 
-if (config.GH_TOKEN && config.GH_REPO) {
+// DIRECT_MODE turns the whole lane architecture off: the orchestrator is never started,
+// so no GitHub Actions runner is dispatched, and the relay answers from this machine's
+// own IP via src/direct.js.
+//
+// It defaults ON because for a single user on a single machine the runner pool buys
+// nothing that the free tier does not already give away: rate limiting is per egress IP,
+// and there is only one IP either way. Twenty CI runners were solving a capacity problem
+// this deployment does not have, and they were the source of every piece of deployment
+// complexity in the system (two deploy targets, lane code versions, recycling runs).
+//
+// Set DIRECT_MODE=0 to bring the pool back for serving many clients from many IPs.
+const direct = String(config.DIRECT_MODE) === '1'
+if (direct) {
+  say('DIRECT MODE: no lane orchestrator, no GitHub runners; upstream calls from this host')
+} else if (config.GH_TOKEN && config.GH_REPO) {
   import('./orchestrator.js')
     .then(() => say('lane orchestrator started'))
     .catch((e) => say(`lane orchestrator failed to load: ${e.message}`))

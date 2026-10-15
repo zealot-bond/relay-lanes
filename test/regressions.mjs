@@ -27,6 +27,9 @@ const H = { 'content-type': 'application/json', 'x-relay-token': 'relay' }
 const bootRelay = async (port, env = {}) => {
   process.env.PORT = String(port)
   process.env.HOST = '127.0.0.1'
+  // These scenarios exercise the QUEUE and LANE machinery. DIRECT_MODE now defaults to 1
+  // and would bypass it entirely, making them vacuous.
+  process.env.DIRECT_MODE = '0'
   Object.assign(process.env, env)
   const S = await imp('server.js')
   S.start()

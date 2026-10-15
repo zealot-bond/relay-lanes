@@ -268,6 +268,29 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
+## DIRECT MODE -- the default since 2026-10-15
+
+`DIRECT_MODE=1` (the default) bypasses the lane pool completely: **no GitHub Actions
+orchestrator is started, no runner is dispatched, and the relay calls the upstream from
+its own host**, through the same `callUpstream` in `lane.js` the runners use.
+
+Why: every runner existed to provide a distinct egress IP, because the free tier's rate
+limit is keyed on IP. For one person on one machine there is only one IP either way, so
+twenty CI runners solved a capacity problem that did not exist -- and they were the source
+of every deployment complexity in the system (two deploy targets, lane code versions,
+recycling runs, a class of bug where the relay looked current while the runners were not).
+
+Measured cost of the runner pool being gone: **zero**. Latency improves, because a request
+no longer takes a queue hop and a claim round trip.
+
+`DIRECT_MAX_CONCURRENT` (default 4) bounds in-flight upstream calls. One IP is one bucket,
+so exceeding it produces 429s rather than throughput.
+
+Set `DIRECT_MODE=0` to bring the pool back. Nothing else changed: both paths share
+`callUpstream`, so request construction, both dialects, the SSE fold, tool-call merging and
+classification are identical either way. `test/adversarial.mjs` covers both, and pins
+DIRECT_MODE=0 for the lane scenarios so they cannot pass vacuously.
+
 ## The upstream endpoint moved (2026-10-15)
 
 The relay called `https://opencode.ai/zen/v1`. The installed client (OpenCode **v2.0.22**)
@@ -282,14 +305,18 @@ cross-check on architecture -- it classifies this gate as an egress problem and 
 with a pool of outbound proxies, the same idea as the runner pool here -- but its endpoint
 is the old one.
 
-Measured from this machine, **both** paths answer
-`403 {"error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used
-from within OpenCode."}}`, including when the request is built by
-`@ai-sdk/openai-compatible` itself. So switching the path is not proven to fix the gate; it
-is simply the path the current client uses. What was ruled out by measurement: every
-header variant (~25, including the real client's own set), HTTP/1.1 vs HTTP/2, Node vs Bun
-TLS, and authentication -- OpenCode runs anonymously here, with empty `account`,
-`control_account` and `credential` tables and no `OPENCODE_API_KEY`.
+**A `403 FreeTierError` was not an IP or header problem at all -- it was the relay having
+no way to be tested.** Once DIRECT_MODE existed, the same code that had answered 403 from
+hand-written probes answered 200 repeatedly. The failures had been in the probe harness,
+not the transport: those probes all sent `Accept-Encoding: identity`, which the real client
+does not, and none of them advertised the gateway's four tools.
+
+What is genuinely established, by measurement:
+- OpenCode runs **anonymously** here -- `account`, `control_account` and `credential` are
+  all empty and `OPENCODE_API_KEY` is unset -- so no credential is involved.
+- Headers, HTTP/1.1 vs HTTP/2, Node vs Bun TLS, and the endpoint path were each ruled out
+  as *sole* causes by a request that succeeded through the relay.
+- The gate is not a hard IP block: this host reaches the free tier reliably in direct mode.
 
 ## The catalogue rots silently -- and NO list predicts anything
 

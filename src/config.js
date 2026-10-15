@@ -130,6 +130,20 @@ export const config = {
   CLAIM_GRACE_MS: num('CLAIM_GRACE_MS', 30000),
   END_DRAIN_TIMEOUT_MS: num('END_DRAIN_TIMEOUT_MS', 60000),
   ALLOW_STALE_LANES: str('ALLOW_STALE_LANES', '0'),
+  // DIRECT_MODE bypasses the lane pool entirely: the relay calls the upstream itself,
+  // from whatever machine it runs on. No GitHub runners, no queue, no claim/heartbeat
+  // machinery -- one in-process call per request.
+  //
+  // It exists because the whole lane architecture is a workaround for ONE thing: the
+  // free tier is rate-limited per egress IP, so capacity was bought with distinct IPs.
+  // When capacity is not the goal -- a single user, one machine, one IP -- that buys
+  // nothing but latency and a lot of moving parts.
+  //
+  // What it costs: one IP means one bucket, so concurrency beyond DIRECT_MAX_CONCURRENT
+  // gets 429s rather than landing on a fresh runner. It is the right mode for one person
+  // on their own machine and the wrong mode for serving many clients.
+  DIRECT_MODE: str('DIRECT_MODE', '1'),
+  DIRECT_MAX_CONCURRENT: num('DIRECT_MAX_CONCURRENT', 4),
 }
 
 /**
