@@ -115,11 +115,46 @@ function noteFailure (model, result) {
 }
 
 const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'empty', 'transport', 'timeout', 'error'])
+
+// Rate limiting is the single most important thing to see when the relay goes quiet, and
+// `limited` is in UNCOUNTED_KINDS because it must not count toward MODEL health (one IP's
+// exhausted bucket says nothing about the model). Being uncounted also meant it was never
+// logged, so /health reported `recentFailures: []` through an entire rate-limit storm --
+// the operator saw served=0 and an empty log and had nothing to go on. Tracked separately,
+// and still not counted.
+const rateLimits = { count: 0, lastAt: null, lastModel: null, lastDetail: '' }
+
+function noteRateLimit (model, result) {
+  rateLimits.count++
+  rateLimits.lastAt = new Date().toISOString().slice(11, 19)
+  rateLimits.lastModel = model
+  rateLimits.lastDetail = String(result.raw || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+  noteFailure(model, result)
+}
 // `gone` is counted once per request like provider_error, so it is not logged per attempt.
 
 /** Record an attempt's rejection in recentFailures without touching the health counter. */
 function logAttemptFailure (model, result) {
   if (!UNCOUNTED_KINDS.has(result.kind)) noteFailure(model, result)
+}
+
+/** Did the upstream actually say it was a rate limit, whatever status carried it? */
+function isRateLimitBody (result) {
+  return /FreeUsageLimitError|rate[_ ]limit exceeded|rate[_ ]limit reached/i.test(String((result && result.raw) || ''))
+}
+
+/**
+ * Seconds to suggest before retrying.
+ *
+ * Honoured from the upstream when it tells us (Retry-After, x-ratelimit-reset), because
+ * guessing short makes clients burn more of a quota that is already exhausted. Otherwise
+ * the free tier is hourly-ish, so say so rather than inviting an immediate retry.
+ */
+function rateLimitRetryAfter (result) {
+  const raw = result && result.raw
+  const m = /retry[-_ ]?after["':\s]*(\d+)/i.exec(String(raw || ''))
+  if (m) return Math.max(1, Number(m[1]))
+  return Number(process.env.RATE_LIMIT_RETRY_AFTER_S || 900)
 }
 
 /**
@@ -468,6 +503,7 @@ async function dispatch (entry) {
       }
       entry.outcome = result
       console.log(`[relay] direct ${entry.job.model} -> ${result.kind} (${result.ms}ms)`)
+      if (result.kind === 'limited') noteRateLimit(entry.job.model, result)
       if (result.kind === 'ok') {
         lanes.record('direct', 'ok', result.ms || 0)
         return result
@@ -567,6 +603,8 @@ async function dispatch (entry) {
       // once, as limited: counting it as a failure too inflated failed= and
       // tripped model quarantine for what is a per-IP quota event.
       lanes.record(served, 'limited', result.ms || 0)
+      // Make it visible: the count, which model, and the provider's own words.
+      noteRateLimit(entry.job.model, result)
       lanes.retire(served, 'egress bucket exhausted')
       // A retired lane is gone from the registry, so this only matters if retire
       // could not find it; keeping it costs nothing and closes the case where the
@@ -930,8 +968,12 @@ async function handleChat (req, res) {
   }
 
   if (result.kind !== 'ok') {
-    // Upstream is unusable for this request. That is NOT a client rate limit, so
-    // it must not be reported as 429.
+    // Upstream is unusable for this request. Most of these are NOT a client rate limit
+    // and must not be reported as 429 -- a 4xx is the endpoint refusing the request and
+    // identical from every IP. The EXCEPTION is a genuine rate limit, which IS reported as
+    // 429 below: the previous blanket "never 429" was what produced "This is an upstream
+    // fault, not a rate limit" on a body reading "FreeUsageLimitError: Rate limit exceeded".
+    // A client can only back off correctly if it is told the truth about which it is.
     if (stream) {
       // Headers are long gone, so the failure is reported in-band.
       const err = {
@@ -956,7 +998,18 @@ async function handleChat (req, res) {
             // Nothing to retry and nothing to wait for: say so instead of
             // reporting an opaque upstream refusal.
             ? `the provider withdrew ${PROVIDER}/${model}; it is no longer available`
-            : `no lane could serve this request (${result.kind}); ` +
+            : (result.kind === 'limited' || isRateLimitBody(result))
+              // A streaming client cannot see a 429 -- the headers are long gone --
+              // so the truth has to be in the message itself. It used to read
+              // "no lane could serve this request (limited); tried 1 time(s) across lanes",
+              // which is wrong twice over in direct mode: there are no lanes, and it is a
+              // quota, not a lane problem.
+              ? `${PROVIDER}/${model}: free-tier rate limit reached` +
+                `${upstreamDetail(result, model) ? ` (${upstreamDetail(result, model)})` : ''}. ` +
+                `In DIRECT_MODE every model shares one egress IP, so the whole catalogue ` +
+                `goes quiet together and retrying cannot help. Wait for the window to reset, ` +
+                `or set DIRECT_MODE=0 to rotate across runner IPs.`
+              : `no lane could serve this request (${result.kind}); ` +
               `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}` +
               `${upstreamDetail(result, model) ? `; upstream: ${upstreamDetail(result, model)}` : ''}`),
           type: 'upstream_unavailable',
@@ -978,6 +1031,33 @@ async function handleChat (req, res) {
     // Use the failure in hand, not just quarantined state: the very first rejection
     // must name the upstream reason, otherwise the client is told nothing useful.
     const detail = upstreamDetail(result, model) || result.kind
+
+    // A genuine rate limit is NOT an upstream fault, and saying so was actively
+    // misleading. This exact sentence was appended to every refusal regardless of
+    // cause, so a client that was simply out of free-tier quota was told "This is an
+    // upstream fault, not a rate limit" while the body said "FreeUsageLimitError:
+    // Rate limit exceeded". That sent the operator looking for a code bug for hours.
+    //
+    // So: a real rate limit gets HTTP 429 and Retry-After, which is both true and what
+    // lets a client back off on its own. Everything else keeps 502.
+    if (result.kind === 'limited' || isRateLimitBody(result)) {
+      const retryAfter = result.retryAfter ?? rateLimitRetryAfter(result)
+      return json(res, 429, {
+        error: {
+          message: `${PROVIDER}/${model}: free-tier rate limit reached` +
+            `${detail ? ` (${detail})` : ''}. ` +
+            (directEnabled()
+              ? 'DIRECT_MODE shares this one egress IP across every model, so the whole ' +
+                'catalogue goes quiet together -- and retrying cannot help, there is no ' +
+                'second bucket. Wait for the window to reset, set DIRECT_MODE=0 to rotate ' +
+                'across runner IPs, or reduce request volume.'
+              : 'Every lane shares the relay\'s own egress IP once the pool is out, so the ' +
+                'catalogue goes quiet together. Wait for the window to reset.'),
+          type: 'rate_limit_exceeded',
+        },
+      }, { 'Retry-After': String(retryAfter) })
+    }
+
     return json(res, 502, {
       error: {
         message: `upstream rejected ${PROVIDER}/${model}: ${detail}` +
@@ -1311,6 +1391,7 @@ export function createServer () {
           build: `${config.BUILD_ID} (${config.BUILD_BUILT})`,
           laneCode: laneCodeStats(),
           direct: directStats(),
+          rateLimits,
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is
           // doing wrong, so they are in the health payload rather than only in
