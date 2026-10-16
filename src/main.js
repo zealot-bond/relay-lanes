@@ -39,10 +39,13 @@ const server = start()
 const direct = String(config.DIRECT_MODE) === '1'
 if (direct) {
   say('DIRECT MODE: no lane orchestrator, no GitHub runners; upstream calls from this host')
-} else if (config.GH_TOKEN && config.GH_REPO) {
+} else if (String(config.LANES_ENABLED) === '1' && config.GH_TOKEN && config.GH_REPO) {
   import('./orchestrator.js')
     .then(() => say('lane orchestrator started'))
     .catch((e) => say(`lane orchestrator failed to load: ${e.message}`))
+} else if (String(config.LANES_ENABLED) !== '1') {
+  say('LANES_ENABLED is not 1: the GitHub Actions orchestrator is OFF. ' +
+    'Set LANES_ENABLED=1 (with DIRECT_MODE=0) to run a lane pool.')
 } else {
   say('no GH_TOKEN/GH_REPO: lane orchestration disabled, relay will hold requests until lanes appear')
 }

@@ -143,6 +143,19 @@ export const config = {
   // gets 429s rather than landing on a fresh runner. It is the right mode for one person
   // on their own machine and the wrong mode for serving many clients.
   DIRECT_MODE: str('DIRECT_MODE', '1'),
+  // LANES_ENABLED gates the GitHub Actions orchestrator, and defaults OFF.
+  //
+  // It has to be explicit and off by default. Setting DIRECT_MODE=0 alone was enough to
+  // start the orchestrator, which means any test relay run locally against the real
+  // repository -- `node src/main.js` with a throwaway RELAY_TOKEN -- dispatched REAL runs.
+  // On 2026-10-16 that happened: a local verification relay with RELAY_TOKEN=t (one
+  // character) dispatched 14 runs to the production repo, and every one died at
+  // registration with `{"error":"bad token"}`, burning CI minutes and filling the run list
+  // with failures that looked like a broken lane system.
+  //
+  // Dispatching to a repository costs money and cannot be undone, so it is never implied.
+  // Turn it on only in the deployment that is meant to run lanes.
+  LANES_ENABLED: str('LANES_ENABLED', '0'),
   DIRECT_MAX_CONCURRENT: num('DIRECT_MAX_CONCURRENT', 4),
 }
 

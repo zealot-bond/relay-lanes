@@ -315,6 +315,95 @@ const scenarios = {
     ]
   },
 
+  // A genuine rate limit must reach the client AS a 429. It used to be flattened into a
+  // 502 whose message ended "This is an upstream fault, not a rate limit" while the body
+  // said "FreeUsageLimitError: Rate limit exceeded" -- which sent the operator hunting a
+  // code bug instead of waiting out the quota.
+  async 'client: a rate limit is reported as 429 with Retry-After' () {
+    const { B, post } = await bootRelay(18924, { RATE_LIMIT_RETRY_AFTER_S: '900' })
+    // Several lanes: `limited` RETIRES the lane that drew it, so a single-lane pool would
+    // leave nothing for the retry and the request would sit until the hold deadline.
+    // (That retirement is correct -- that egress IP's bucket is spent.)
+    for (const id of ['A', 'B', 'C']) await post('/lane/register', { laneId: id })
+    for (const id of ['A', 'B', 'C']) {
+      ;(async () => {
+        for (;;) {
+          const r = await fetch(B + `/lane/claim?laneId=${id}&wait=1000`, { headers: H }).catch(() => null)
+          if (!r) return
+          if (r.status !== 200) continue
+          const c = await r.json()
+          await post('/lane/result', { laneId: id, entryId: c.entryId, result: { kind: 'limited', status: 429, ms: 5,
+            raw: '{"error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}', data: null } })
+        }
+      })()
+    }
+    const res = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
+    const body = await res.json().catch(() => ({}))
+    const msg = String(body?.error?.message || '')
+    return [
+      { name: 'the status is 429, not 502', ok: res.status === 429, detail: 'status ' + res.status },
+      { name: 'Retry-After is present', ok: Boolean(res.headers.get('retry-after')), detail: String(res.headers.get('retry-after')) },
+      { name: 'the message says it is a rate limit', ok: /rate limit/i.test(msg), detail: msg.slice(0, 90) },
+      { name: 'and does NOT claim it is not one', ok: !/not a rate limit/i.test(msg), detail: msg.slice(0, 90) },
+      { name: 'it names direct mode as the reason retrying will not help',
+        ok: /DIRECT_MODE/.test(msg) || /egress IP/i.test(msg), detail: msg.slice(0, 120) },
+    ]
+  },
+
+  // /health went through an entire rate-limit storm reporting recentFailures: [] because
+  // `limited` was excluded from logging along with the kinds that must not count toward
+  // model health. The operator had served=0 and nothing else to go on.
+  async 'health: rate limiting is visible on /health' () {
+    const { B, post } = await bootRelay(18926)
+    for (const id of ['A', 'B']) await post('/lane/register', { laneId: id })
+    for (const id of ['A', 'B']) {
+      ;(async () => {
+        for (;;) {
+          const r = await fetch(B + `/lane/claim?laneId=${id}&wait=1000`, { headers: H }).catch(() => null)
+          if (!r) return
+          if (r.status !== 200) continue
+          const c = await r.json()
+          await post('/lane/result', { laneId: id, entryId: c.entryId, result: { kind: 'limited', status: 429, ms: 5,
+            raw: '{"error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}', data: null } })
+        }
+      })()
+    }
+    const res = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
+    await res.text()
+    const h = await (await fetch(B + '/health')).json()
+    const rl = h.rateLimits || {}
+    return [
+      { name: '/health counts rate limits', ok: (rl.count || 0) > 0, detail: JSON.stringify(rl) },
+      { name: 'and records which model was refused', ok: rl.lastModel === 'big-pickle', detail: String(rl.lastModel) },
+      { name: 'and it does NOT quarantine the model for it',
+        ok: !(h.modelHealth?.['big-pickle']?.quarantined), detail: JSON.stringify(h.modelHealth?.['big-pickle']) },
+    ]
+  },
+
+  // The converse must be preserved: an ordinary upstream fault is still a 502.
+  async 'client: a genuine upstream fault is still 502' () {
+    const { B, post } = await bootRelay(18925)
+    await post('/lane/register', { laneId: 'A' })
+    ;(async () => {
+      for (;;) {
+        const r = await fetch(B + '/lane/claim?laneId=A&wait=1000', { headers: H }).catch(() => null)
+        if (!r || r.status !== 200) { if (!r) return; continue }
+        const c = await r.json()
+        await post('/lane/result', { laneId: 'A', entryId: c.entryId, result: { kind: 'provider_error', status: 400, ms: 5,
+          raw: '{"error":{"message":"Missing required parameter: tools[4].type"}}', data: null } })
+      }
+    })()
+    const res = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
+    const body = await res.json().catch(() => ({}))
+    return [
+      { name: 'a 400 upstream rejection is NOT reported as 429', ok: res.status === 502, detail: 'status ' + res.status },
+      { name: 'and it keeps the upstream detail', ok: /tools\[4\]/.test(String(body?.error?.message || '')), detail: String(body?.error?.message).slice(0, 90) },
+    ]
+  },
+
   // classification: prose that quotes the user must not retire a lane.
   async 'classify: echoed text cannot exhaust a lane' () {
     const { classifyUpstream: c } = await imp('fingerprint.js')

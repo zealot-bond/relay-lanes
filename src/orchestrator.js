@@ -30,6 +30,8 @@ const PORT = config.PORT
 // jar never has to be told its own public URL, which is the one value that is
 // impossible to know reliably from inside a container.
 const RELAY_TOKEN = config.RELAY_TOKEN
+// A token this short is a test placeholder, never a deployment value.
+const TOKEN_PLAUSIBLE = typeof RELAY_TOKEN === 'string' && RELAY_TOKEN.length >= 16
 const PUBLIC_URL = config.RELAY_PUBLIC_URL.replace(/\/$/, '')
 
 // Two polls every tick, for the life of the process. Without keep-alive each one
@@ -123,6 +125,18 @@ const LANE_FRESH_MS = config.LANE_FRESH_MS
 async function main () {
   if (!TOKEN || !REPO) {
     console.error('[orch] GH_TOKEN and GH_REPO are required; lane top-up disabled')
+    return
+  }
+  // Refuse to dispatch on an implausible relay token. A lane that cannot authenticate is
+  // worse than no lane: every run it starts burns CI minutes and then dies at registration
+  // with {"error":"bad token"}. A one-character token is the signature of a test relay that
+  // should never have been dispatching, and it is exactly what produced 14 failed
+  // production runs on 2026-10-16. The existing check above (no relay URL -> do not
+  // dispatch) exists for the same reason: never spend minutes proving it cannot work.
+  if (!TOKEN_PLAUSIBLE) {
+    console.error('[orch] REFUSING TO DISPATCH: RELAY_TOKEN is ' +
+      `${RELAY_TOKEN ? RELAY_TOKEN.length + ' characters' : 'empty'}. Lanes would fail every ` +
+      'registration and burn CI minutes for nothing. Set a real token, or unset LANES_ENABLED.')
     return
   }
   const relayUrl = await resolveRelayUrl()
