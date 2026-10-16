@@ -148,5 +148,29 @@ console.log('escalation: a spent bucket falls through to a runner IP\n')
     res.status + ' in ' + (Date.now() - t) + 'ms')
 }
 
+// 4. "Why is it using direct mode first?" -- every request was paying for a doomed direct
+// call before escalating. Measured on the panel: 782ms, 710ms, 742ms, 1010ms, 1544ms of
+// pure latency on calls that were certain to 429. The direct path must switch OFF.
+{
+  const esc = (await (await fetch(B + '/health')).json()).escalate
+  check('the direct path is reported blocked', esc?.directBlocked === true, JSON.stringify(esc))
+  check('with a visible remaining window', esc?.directBlockedForS > 0, JSON.stringify(esc))
+
+  let touches = 0
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (u, o) => { if (String(u).includes(String(spentPort))) touches++; return realFetch(u, o) }
+  const rs = await Promise.all([...Array(6)].map(() => fetch(B + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'go' }] }),
+    signal: AbortSignal.timeout(60000),
+  })))
+  globalThis.fetch = realFetch
+  const bodies = await Promise.all(rs.map((r) => r.json().catch(() => ({}))))
+  check('six more requests are all served by the runner',
+    bodies.every((b) => b?.choices?.[0]?.message?.content === 'Hello world'),
+    JSON.stringify(bodies.map((b) => b?.choices?.[0]?.message?.content || String(b?.error?.message).slice(0, 34))))
+  check('and NONE of them retried the known-spent bucket', touches === 0, touches + ' wasted direct call(s)')
+}
+
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL ESCALATION CHECKS PASSED')
 process.exit(failures ? 1 : 0)

@@ -94,6 +94,25 @@ const RESPONSES_MODELS = new Set([
 // exo-free and fledge-alpha-free. Both were in the "reliable" list handed to the user
 // on 2026-10-07, so they were removed here rather than left to fail.
 //
+// Listed on 2026-10-16 but NOT usable -- 23 of the 26 free ids not already here. Being
+// listed is not availability, and the failure is usually the provider's:
+//
+//   HTTP 400 "Upstream request failed: Model is unavailable."
+//     glm-4.7-free, glm-5-free, hy3-free, hy3-preview-free, kimi-k2.5-free,
+//     laguna-s-2.1-free, ling-2.6-flash-free, ling-3.0-flash-free, ling-3.0-tiny-free,
+//     longcat-2.0-free, mimo-v2-flash-free, mimo-v2-omni-free, mimo-v2-pro-free,
+//     minimax-m2.1-free, minimax-m2.5-free, minimax-m3-free, nemotron-3-super-free,
+//     north-mini-code-free, qwen3.6-plus-free, ring-2.6-1t-free,
+//     trinity-large-preview-free, x-preview-f-free
+//
+//   HTTP 429 "Upstream request failed: Endpoint is unavailable."  (an OUTAGE, not a limit)
+//     glm-5.3-flash-free -- asked for by name; the endpoint is simply down, so it is a
+//     candidate to re-probe rather than one to delete.
+//
+//   HTTP 400, still unavailable 0/3: deepseek-v4-flash-free, ling-3.0-flash-fin-free,
+//     ling-3.1-flash-free
+//   HTTP 410 ModelDeprecated 0/3:  fledge-alpha-free, mimo-v2.5-free
+//
 // Every addition was probed on BOTH dialects. The five new models answer 500 or
 // 401 on /v1/responses, so they are chat-only; mislabelling them would surface as
 // `input[N] did not match any supported type` at request time rather than as a
@@ -136,6 +155,17 @@ export const MODELS = [
   { id: 'cat-jam-free', contextWindow: 200000 },
   { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
   { id: 'step-5-preview-free', contextWindow: 200000 },
+  // Added 2026-10-16 after probing all 42 free ids in the models.dev catalogue. Three of
+  // the 26 that were not already here answered 3/3 on a probe AND on a confirmation run:
+  //   beam-free, ll-alpha-free, nemotron-3.5-super-vl-free.
+  { id: 'beam-free', contextWindow: 200000 },
+  { id: 'll-alpha-free', contextWindow: 200000 },
+  { id: 'nemotron-3.5-super-vl-free', contextWindow: 200000 },
+  // exo-free is BACK. Removed on 2026-10-07 for 410 ModelDeprecated; answered 3/3 on
+  // 2026-10-16. A withdrawal is not necessarily permanent, and removing on a single
+  // observation discards a working model. fledge-alpha-free was still 410 the same day, so
+  // it stays out -- the difference is repeated observation, not the error text.
+  { id: 'exo-free', contextWindow: 200000 },
 ]
 
 export function protocolFor (modelId) {

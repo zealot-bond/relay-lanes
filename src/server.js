@@ -22,7 +22,10 @@ import { config } from './config.js'
 import { CODE_VERSION } from './codeversion.js'
 import { directEnabled, directStats, serveDirect } from './direct.js'
 import { zenBase } from './fingerprint.js'
-import { escalate, stats as escalateStats, onEscalate } from './escalate.js'
+import {
+  escalate, stats as escalateStats, onEscalate,
+  directAvailable, directBlocked, noteDirectLimited, noteDirectOk, noteDirectProbed,
+} from './escalate.js'
 
 // Config is read from config.js, which resolves baked credentials, then
 // start.properties, then the environment -- so a baked PORT is honoured even
@@ -474,7 +477,13 @@ async function dispatch (entry) {
 
     // DIRECT_MODE: call the upstream here, in-process, and skip the lane pool entirely.
     // Placed before lane selection so nothing touches the queue, a claim, or a heartbeat.
-    if (directEnabled() && !entry.escalated) {
+    // The direct path is skipped entirely while its bucket is known spent. Asking anyway
+    // costs a wasted upstream call and up to ~1.5s of latency per request, to learn
+    // something already known. After DIRECT_RECOVER_MS one probe is allowed through,
+    // because the quota resets and the single IP becomes free again.
+    const tryDirect = directEnabled() && !entry.escalated &&
+      (directAvailable() || !noteDirectProbed())
+    if (tryDirect) {
       attempt++
       const stream = entry.job.stream
       const push = streamers.get(entry.id)
@@ -507,6 +516,8 @@ async function dispatch (entry) {
       console.log(`[relay] direct ${entry.job.model} -> ${result.kind} (${result.ms}ms) via ${zenBase()}`)
       if (result.kind === 'ok') {
         lanes.record('direct', 'ok', result.ms || 0)
+        // The bucket is alive again; the breaker must not keep skipping direct.
+        noteDirectOk()
         return result
       }
       if (result.kind !== 'limited') {
@@ -519,6 +530,8 @@ async function dispatch (entry) {
       // once a lane exists, fall through to the normal lane path below. A lane has a
       // DIFFERENT egress IP and therefore a different bucket, so this genuinely answers.
       noteRateLimit(entry.job.model, result)
+      // Switch the direct path off, so the NEXT request goes straight to a lane.
+      noteDirectLimited()
       const laneReady = () => lanes.liveLanes(LANE_STALE_MS)
         .some((l) => l.status !== 'exhausted')
       if (!(await escalate(laneReady))) {
@@ -540,7 +553,13 @@ async function dispatch (entry) {
 
     const lane = pickLane(tried, busyLanes)
     if (!lane) {
-      // No lane available. Hold the client rather than failing them.
+      // Direct is out and no lane has appeared. The pool may be starting, so a short hold
+      // is right -- but the client's own deadline must not be spent here. Once we have
+      // already seen the rate limit, there is nothing to wait for that this request can
+      // usefully do, so answer with the real reason instead of holding for MAX_HOLD_MS
+      // (10 minutes) and then reporting it anyway.
+      if (directBlocked() && last.kind === 'limited') return last
+      // No lane available yet. Hold the client rather than failing them.
       await sleep(250)
       continue
     }

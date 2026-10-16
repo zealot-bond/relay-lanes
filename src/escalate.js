@@ -26,10 +26,68 @@ const waitMs = () => Number(config.ESCALATE_WAIT_MS || 90000)
 let armed = false
 let armHook = null
 
+// Circuit breaker for the direct path.
+//
+// Escalation alone is not enough, because "direct first" costs a wasted upstream call on
+// EVERY request for as long as the bucket is spent. Measured on the panel: five
+// consecutive requests burned 782ms, 710ms, 742ms, 1010ms and 1544ms on direct calls that
+// were certain to 429 before escalating to a runner. That is up to 1.5s of pure latency
+// added to every request, forever, to serve a bucket already known to be empty.
+//
+// So the direct path switches OFF on the first `FreeUsageLimitError` and stays off for
+// DIRECT_RECOVER_MS. Requests go straight to lanes. After the window, ONE probe is allowed
+// through (half-open), because the quota resets and the single IP becomes free again --
+// which is the whole saving that direct mode exists for.
+let blockedUntil = 0
+let consecutiveLimited = 0
+let probes = 0
+
+const recoverMs = () => Number(config.DIRECT_RECOVER_MS || 600000)
+
+/** Is the direct path worth trying right now? */
+export const directAvailable = () => Date.now() >= blockedUntil
+
+export const directBlocked = () => Date.now() < blockedUntil
+
+export function noteDirectLimited () {
+  consecutiveLimited++
+  // A FreeUsageLimitError is unambiguous -- unlike a timeout or a 5xx -- so one is enough.
+  blockedUntil = Date.now() + recoverMs()
+  probes = 0
+}
+
+export function noteDirectOk () {
+  consecutiveLimited = 0
+  blockedUntil = 0
+}
+
+/** Half-open: a window that has expired allows a probe, then goes back to blocking. */
+export function noteDirectProbed () {
+  if (probes > 0) return true
+  probes = 1
+  blockedUntil = Date.now() + recoverMs()
+  return false
+}
+
 /** main.js supplies this so the orchestrator can be started lazily, on first exhaustion. */
 export function onEscalate (fn) { armHook = fn }
 
-export const stats = () => ({ enabled: enabled(), armed, waitedMs: waitMs() })
+export const stats = () => ({
+  enabled: enabled(),
+  armed,
+  waitedMs: waitMs(),
+  directBlocked: directBlocked(),
+  directBlockedForS: directBlocked() ? Math.ceil((blockedUntil - Date.now()) / 1000) : 0,
+  consecutiveLimited,
+  recoverMs: recoverMs(),
+})
+
+/** Test hook: forget the breaker ever tripped. */
+export function resetBreaker () {
+  blockedUntil = 0
+  consecutiveLimited = 0
+  probes = 0
+}
 
 /**
  * Called when a direct call comes back `limited`.

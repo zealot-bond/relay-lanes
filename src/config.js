@@ -164,6 +164,12 @@ export const config = {
   // How long a request waits for a runner to appear after exhaustion is first noticed.
   // The pool takes a minute or two to fill; past this the client gets its 429 instead.
   ESCALATE_WAIT_MS: num('ESCALATE_WAIT_MS', 90000),
+  // DIRECT_RECOVER_MS: how long the direct path stays switched off after a bucket is
+  // reported spent. Without this the relay re-asked a known-dead bucket on every single
+  // request: measured on the panel, five consecutive requests each burned 700-1500ms on a
+  // direct call that was guaranteed to 429 before escalating. One probe per window, not one
+  // per request.
+  DIRECT_RECOVER_MS: num('DIRECT_RECOVER_MS', 600000),
   DIRECT_MAX_CONCURRENT: num('DIRECT_MAX_CONCURRENT', 4),
 }
 

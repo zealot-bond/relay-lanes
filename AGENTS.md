@@ -268,6 +268,27 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
+## Direct mode is SKIPPED once its bucket is spent (2026-10-17)
+
+Escalation alone was not enough, because "direct first" costs a wasted upstream call on
+**every** request for as long as the bucket is empty. Measured on the panel: five
+consecutive requests burned 782ms, 710ms, 742ms, 1010ms and 1544ms on direct calls that were
+certain to 429 before escalating. Up to 1.5s of pure latency, per request, forever, to ask
+a bucket already known to be empty.
+
+So `src/escalate.js` holds a **circuit breaker**: the first `FreeUsageLimitError` switches
+the direct path OFF for `DIRECT_RECOVER_MS` (default 600s) and requests go straight to
+lanes. After the window, **one** probe is allowed through (half-open), because the quota
+resets and the single IP becomes free again -- which is the entire saving direct mode
+exists for. A successful probe clears the breaker.
+
+If direct is blocked and no lane has appeared, the client gets its 429 immediately rather
+than being held for `MAX_HOLD_MS` (10 minutes) and told the same thing at the end.
+
+`/health` -> `escalate` reports `directBlocked`, `directBlockedForS`, `consecutiveLimited`
+and `recoverMs`, and `test/escalation.mjs` asserts that **no** request touches the spent
+upstream while a lane is available.
+
 ## Escalation: direct first, runners when this IP's bucket is spent
 
 `DIRECT_ESCALATE` (default ON) is what stops a spent bucket becoming a dead relay:
@@ -295,6 +316,14 @@ Three details that are not obvious:
 - **If no lane appears in time the client still gets its 429**, bounded by
   `ESCALATE_WAIT_MS`. The pool takes a minute or two to fill; holding a request longer than
   that would be worse than telling the truth.
+
+A caution that cost a full debugging cycle: `nemotron-3.5-super-vl-free` measured 3/3 direct
+and 0/4 through the relay. It was not flaky. A brief provider outage had produced three
+consecutive failures, which armed the model quarantine, so the relay refused it while a
+**direct** probe -- which bypasses the relay and cannot see a quarantine -- kept succeeding.
+`/health` -> `modelHealth` was the only place both facts were visible at once. When a model
+disagrees between "direct" and "through the relay", check quarantine before concluding it is
+unreliable, and never judge a model without the relay in the path.
 
 `test/escalation.mjs` runs two mocks in separate processes -- one answering
 `FreeUsageLimitError` to every call, one answering normally -- because "a different IP has a
