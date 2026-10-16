@@ -79,8 +79,9 @@ if (NO_BOOT) {
       process.exit(1)
     }
   } catch { /* nothing there, which is what we want */ }
-  // DIRECT_MODE defaults to 1 now; these scenarios are about the LANE path, so pin it off.
-  spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '0' })
+  // These scenarios are about the LANE path, and lanes are primary again, so pin direct
+  // off explicitly rather than relying on a default.
+  spawnNode('main.js', { PORT: String(PORT), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '0', DIRECT_FALLBACK: '0' })
   if (!await waitFor(async () => (await fetch(BASE + '/health', { signal: AbortSignal.timeout(2000) })).ok)) {
     console.error('relay did not start'); process.exit(1)
   }
@@ -328,7 +329,7 @@ group('concurrency and lifecycle')
   console.log('\ndirect mode: no lanes, no orchestrator')
   const R = Number(process.env.DIRECT_PORT || PORT + 1)
   const rel = spawn(process.execPath, [path.join(SRC, 'main.js')], {
-    env: { ...env, PORT: String(R), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '1', ZEN_BASE: ZEN },
+    env: { ...env, PORT: String(R), HOST: '127.0.0.1', RELAY_TOKEN: 't', DIRECT_MODE: '1', DIRECT_FALLBACK: '0', ZEN_BASE: ZEN },
     stdio: 'ignore',
   })
   kids.push(rel)

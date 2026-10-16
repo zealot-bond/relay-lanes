@@ -30,6 +30,7 @@ const bootRelay = async (port, env = {}) => {
   // These scenarios exercise the QUEUE and LANE machinery. DIRECT_MODE now defaults to 1
   // and would bypass it entirely, making them vacuous.
   process.env.DIRECT_MODE = '0'
+  process.env.DIRECT_FALLBACK = '0'   // lanes-only: the backup must not mask a lane bug
   Object.assign(process.env, env)
   const S = await imp('server.js')
   S.start()

@@ -35,6 +35,12 @@ const HOST = config.HOST
 const RELAY_TOKEN = config.RELAY_TOKEN
 const MAX_LANES = config.MAX_LANES
 const MAX_HOLD_MS = config.MAX_HOLD_MS
+/** Use this host as a BACKUP when no lane can serve, even with lanes as the primary path. */
+const directFallbackEnabled = () => String(config.DIRECT_FALLBACK) === '1'
+// Lanes that could actually serve: fresh, and not retired for an exhausted bucket. A pool
+// of retired lanes is the case the direct backup exists for -- otherwise "lanes exist" would
+// look like service while every one of them answers 429.
+const usableLanes = () => lanes.liveLanes(LANE_STALE_MS).filter((l) => l.status !== 'exhausted')
 const RETRY_LIMIT = config.RETRY_LIMIT
 const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
 const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
@@ -477,12 +483,16 @@ async function dispatch (entry) {
 
     // DIRECT_MODE: call the upstream here, in-process, and skip the lane pool entirely.
     // Placed before lane selection so nothing touches the queue, a claim, or a heartbeat.
-    // The direct path is skipped entirely while its bucket is known spent. Asking anyway
-    // costs a wasted upstream call and up to ~1.5s of latency per request, to learn
-    // something already known. After DIRECT_RECOVER_MS one probe is allowed through,
-    // because the quota resets and the single IP becomes free again.
-    const tryDirect = directEnabled() && !entry.escalated &&
-      (directAvailable() || !noteDirectProbed())
+    // DIRECT: either primary (DIRECT_MODE=1) or the backup used when no lane can serve
+    // (DIRECT_FALLBACK, the default). Lanes are primary again as of 2026-10-17.
+    //
+    // Skipped entirely while the direct bucket is known spent -- asking anyway costs a
+    // wasted upstream call and up to ~1.5s of latency, to learn something already known.
+    // After DIRECT_RECOVER_MS one probe is allowed through, because the quota resets and
+    // this IP becomes free again.
+    const directOk = directAvailable() || !noteDirectProbed()
+    const tryDirect = directOk && !entry.escalated &&
+      (directEnabled() || (!usableLanes().length && directFallbackEnabled()))
     if (tryDirect) {
       attempt++
       const stream = entry.job.stream

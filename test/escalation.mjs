@@ -10,6 +10,7 @@ process.env.HOST = '127.0.0.1'
 process.env.RELAY_TOKEN = 't'
 // Direct mode, escalation on, orchestrator pointed nowhere so nothing is dispatched.
 process.env.DIRECT_MODE = '1'
+process.env.DIRECT_FALLBACK = '0'   // primary-direct scenario, not the fallback path
 process.env.DIRECT_ESCALATE = '1'
 process.env.ESCALATE_WAIT_MS = '20000'
 process.env.GH_REPO = 'no-such-owner/no-such-repo'

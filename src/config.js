@@ -142,7 +142,14 @@ export const config = {
   // What it costs: one IP means one bucket, so concurrency beyond DIRECT_MAX_CONCURRENT
   // gets 429s rather than landing on a fresh runner. It is the right mode for one person
   // on their own machine and the wrong mode for serving many clients.
-  DIRECT_MODE: str('DIRECT_MODE', '1'),
+  // DIRECT_MODE=0 means LANES ARE PRIMARY: the runner pool serves requests and the
+  // orchestrator keeps it full. This is the default again as of 2026-10-17 -- the runner
+  // pool is the point of the system, and direct mode was a fallback for a machine that
+  // could not keep runners alive.
+  //
+  // Direct mode is still used as a BACKUP (see DIRECT_FALLBACK) when not one lane can
+  // serve, so a relay with an empty pool degrades instead of hanging.
+  DIRECT_MODE: str('DIRECT_MODE', '0'),
   // LANES_ENABLED gates the GitHub Actions orchestrator, and defaults OFF.
   //
   // It has to be explicit and off by default. Setting DIRECT_MODE=0 alone was enough to
@@ -155,7 +162,17 @@ export const config = {
   //
   // Dispatching to a repository costs money and cannot be undone, so it is never implied.
   // Turn it on only in the deployment that is meant to run lanes.
-  LANES_ENABLED: str('LANES_ENABLED', '0'),
+  // LANES_ENABLED gates the GitHub Actions orchestrator and now defaults ON, because the
+  // lanes are the primary path. It is still an explicit switch rather than a side effect of
+  // DIRECT_MODE, so a deployment can run lanes without dispatching them (an operator
+  // starting the pool by hand, say).
+  //
+  // Safety no longer rests on this being OFF. Two guards stop a stray relay from spending
+  // real CI minutes -- see "REFUSING TO DISPATCH" in orchestrator.js.
+  LANES_ENABLED: str('LANES_ENABLED', '1'),
+  // When lanes are primary but none can serve, fall back to calling upstream from this
+  // host rather than holding the client. Degraded, not dead.
+  DIRECT_FALLBACK: str('DIRECT_FALLBACK', '1'),
   // DIRECT_ESCALATE: in direct mode, when this IP's bucket is spent, start the runner pool
   // and serve from a runner IP instead of failing the client with a 429. Defaults ON, so
   // "one bucket" degrades into "many buckets" on demand rather than becoming a dead relay.

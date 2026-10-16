@@ -32,6 +32,22 @@ const PORT = config.PORT
 const RELAY_TOKEN = config.RELAY_TOKEN
 // A token this short is a test placeholder, never a deployment value.
 const TOKEN_PLAUSIBLE = typeof RELAY_TOKEN === 'string' && RELAY_TOKEN.length >= 16
+
+// A loopback callback URL cannot work, and refusing it is what makes an always-on
+// orchestrator safe.
+//
+// With LANES_ENABLED defaulting to 1 (lanes are primary again), any relay started locally
+// for testing -- `node src/main.js`, RELAY_TOKEN=t, whatever -- would dispatch REAL runs to
+// the production repository. That happened on 2026-10-16: a local verification relay
+// dispatched 14 runs that all died at registration.
+//
+// The token check alone is not enough, because a test relay may well carry the real baked
+// credentials. This one is better: a runner is a separate machine, so a callback URL that
+// resolves to loopback means every dispatched run would try to call back to itself and
+// fail. It is the same reasoning as the existing "no relay URL -> do not dispatch" -- never
+// spend CI minutes proving a run cannot work -- and it needs no operator discipline.
+const UNROUTABLE = /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1)([:/]|$)/i
+const isUnroutable = (url) => !url || UNROUTABLE.test(url.trim())
 const PUBLIC_URL = config.RELAY_PUBLIC_URL.replace(/\/$/, '')
 
 // Two polls every tick, for the life of the process. Without keep-alive each one
@@ -133,6 +149,13 @@ async function main () {
   // should never have been dispatching, and it is exactly what produced 14 failed
   // production runs on 2026-10-16. The existing check above (no relay URL -> do not
   // dispatch) exists for the same reason: never spend minutes proving it cannot work.
+  if (isUnroutable(PUBLIC_URL)) {
+    console.error('[orch] REFUSING TO DISPATCH: RELAY_PUBLIC_URL is ' +
+      `${PUBLIC_URL || '(empty)'} -- a runner is a separate machine and cannot call back ` +
+      'to loopback. Every dispatched run would fail at registration while burning CI ' +
+      'minutes. Set a routable RELAY_PUBLIC_URL, or LANES_ENABLED=0.')
+    return
+  }
   if (!TOKEN_PLAUSIBLE) {
     console.error('[orch] REFUSING TO DISPATCH: RELAY_TOKEN is ' +
       `${RELAY_TOKEN ? RELAY_TOKEN.length + ' characters' : 'empty'}. Lanes would fail every ` +

@@ -333,6 +333,38 @@ nothing. Its first version passed for the wrong reason: the request prompt carri
 upstream was answering normally. It now asserts the spent upstream really refuses before
 testing anything else.
 
+## Lanes are PRIMARY again (2026-10-17)
+
+`DIRECT_MODE` defaults back to **0** and `LANES_ENABLED` to **1**. The runner pool serves
+requests and the orchestrator keeps it full, which is the whole point of this system.
+
+Direct mode remains, as a **BACKUP**: `DIRECT_FALLBACK` (default on) calls upstream from
+the relay's own host when *no usable lane* can serve. "Usable" means fresh and not retired
+for an exhausted bucket -- a pool of retired lanes looks like service while every member
+answers 429, and that is precisely the case the backup exists for. So the relay degrades
+instead of hanging, but CI does the real work.
+
+Turning the orchestrator back on removed the "off by default" protection that stopped a
+local test relay dispatching 14 production runs, so the protection is now intrinsic:
+
+**A relay whose `RELAY_PUBLIC_URL` is loopback refuses to dispatch.** A runner is a
+separate machine; a loopback callback means every dispatched run would try to call back to
+itself and fail at registration while burning CI minutes. Same reasoning as the existing "no
+relay URL -> do not dispatch" check, and it needs no operator discipline -- a test relay
+cannot trip it even if it carries the real baked credentials. The token-plausibility guard
+stays as a second line.
+
+```
+[orch] REFUSING TO DISPATCH: RELAY_PUBLIC_URL is http://127.0.0.1:26071 -- a runner is a
+       separate machine and cannot call back to loopback. Every dispatched run would fail
+       at registration while burning CI minutes.
+```
+
+Verified with the real jar against the real repository: the refusals are logged and **zero
+runs are created**. `test/orchestrator-guard.mjs` extracts the pattern from the source,
+recompiles it, and asserts every loopback form is caught and a routable one is not -- so the
+test cannot pass by finding the right words in the file.
+
 ## The orchestrator is opt-in, because a test relay once dispatched real runs
 
 `LANES_ENABLED=1` is now required, on top of `DIRECT_MODE=0`, before the orchestrator will
