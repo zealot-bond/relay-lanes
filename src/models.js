@@ -106,8 +106,8 @@ const RESPONSES_MODELS = new Set([
 //     trinity-large-preview-free, x-preview-f-free
 //
 //   HTTP 429 "Upstream request failed: Endpoint is unavailable."  (an OUTAGE, not a limit)
-//     glm-5.3-flash-free -- asked for by name; the endpoint is simply down, so it is a
-//     candidate to re-probe rather than one to delete.
+//     glm-5.3-flash-free -- was down on 2026-10-16 and answering on 2026-10-17, so it is
+//     ADDED, with the intermittency recorded above rather than treated as a deletion.
 //
 //   HTTP 400, still unavailable 0/3: deepseek-v4-flash-free, ling-3.0-flash-fin-free,
 //     ling-3.1-flash-free
@@ -159,6 +159,17 @@ export const MODELS = [
   // the 26 that were not already here answered 3/3 on a probe AND on a confirmation run:
   //   beam-free, ll-alpha-free, nemotron-3.5-super-vl-free.
   { id: 'beam-free', contextWindow: 200000 },
+  // glm-5.3-flash-free was reported unavailable on 2026-10-16 and then answered on
+  // 2026-10-17, minutes apart, on all three bases (/inference/v1, /inference/openai/v1 and
+  // the legacy /zen/v1) and on the chat dialect. So its endpoint is INTERMITTENT, not gone --
+  // the same pattern as ling-3.1-flash-free and nemotron-3.5-super-vl-free. Its whole family
+  // (glm-5-free, glm-4.7-free) does answer 400 "Model is unavailable" consistently, so the
+  // difference is this endpoint, not the family.
+  //
+  // Note what it answers when it is down: HTTP 429 "Endpoint is unavailable". That is an
+  // OUTAGE reported with a rate-limit status code, and classifyUpstream already treats it as
+  // a model fault rather than an exhausted bucket.
+  { id: 'glm-5.3-flash-free', contextWindow: 200000 },
   { id: 'll-alpha-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-super-vl-free', contextWindow: 200000 },
   // exo-free is BACK. Removed on 2026-10-07 for 410 ModelDeprecated; answered 3/3 on
