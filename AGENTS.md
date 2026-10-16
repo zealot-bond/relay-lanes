@@ -268,6 +268,42 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
+## Escalation: direct first, runners when this IP's bucket is spent
+
+`DIRECT_ESCALATE` (default ON) is what stops a spent bucket becoming a dead relay:
+
+```
+direct call
+  -> ok       : done
+  -> limited  : start the runner pool (lazily), wait up to ESCALATE_WAIT_MS for a lane,
+                then serve the request from a RUNNER ip
+  -> else     : report it
+```
+
+A runner egresses from a different IP, so it has a **different bucket** -- escalation is
+not a retry, it is a genuinely different answer. One machine therefore serves light traffic
+with no CI spend at all, and only grows a lane pool when it actually needs one.
+
+Three details that are not obvious:
+
+- **The orchestrator is imported lazily, on the first rate limit**, not at boot. Booting it
+  would mean every relay spends CI minutes whether or not it needs them.
+- **`entry.escalated` is set before `continue`.** Without it the dispatch loop re-enters the
+  direct branch and spins at ~1ms per pass, never reaching the lanes it is waiting for.
+  Caught by `test/escalation.mjs`, which caught it only because that test uses a mock that
+  genuinely refuses rather than one that is lenient.
+- **If no lane appears in time the client still gets its 429**, bounded by
+  `ESCALATE_WAIT_MS`. The pool takes a minute or two to fill; holding a request longer than
+  that would be worse than telling the truth.
+
+`test/escalation.mjs` runs two mocks in separate processes -- one answering
+`FreeUsageLimitError` to every call, one answering normally -- because "a different IP has a
+different bucket" has to be modelled as two genuinely different upstreams or the test proves
+nothing. Its first version passed for the wrong reason: the request prompt carried a
+`[[S:plain]]` marker, which overrides the mock's default scenario, so the supposedly-spent
+upstream was answering normally. It now asserts the spent upstream really refuses before
+testing anything else.
+
 ## The orchestrator is opt-in, because a test relay once dispatched real runs
 
 `LANES_ENABLED=1` is now required, on top of `DIRECT_MODE=0`, before the orchestrator will

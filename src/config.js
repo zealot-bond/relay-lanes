@@ -156,6 +156,14 @@ export const config = {
   // Dispatching to a repository costs money and cannot be undone, so it is never implied.
   // Turn it on only in the deployment that is meant to run lanes.
   LANES_ENABLED: str('LANES_ENABLED', '0'),
+  // DIRECT_ESCALATE: in direct mode, when this IP's bucket is spent, start the runner pool
+  // and serve from a runner IP instead of failing the client with a 429. Defaults ON, so
+  // "one bucket" degrades into "many buckets" on demand rather than becoming a dead relay.
+  // Set DIRECT_ESCALATE=0 for a strictly single-IP deployment that should fail fast.
+  DIRECT_ESCALATE: str('DIRECT_ESCALATE', '1'),
+  // How long a request waits for a runner to appear after exhaustion is first noticed.
+  // The pool takes a minute or two to fill; past this the client gets its 429 instead.
+  ESCALATE_WAIT_MS: num('ESCALATE_WAIT_MS', 90000),
   DIRECT_MAX_CONCURRENT: num('DIRECT_MAX_CONCURRENT', 4),
 }
 

@@ -132,6 +132,9 @@ const scenarios = {
   // The provider withdrew the model. exo-free and fledge-alpha-free both answered
   // this for eight days before being taken out of the catalogue (2026-10-15).
   http_410_gone: (res) => { res.writeHead(410, { 'content-type': 'application/json' }); res.end(JSON.stringify({ type: 'error', error: { type: 'ModelDeprecated', message: 'Model demo-gone has been deprecated.' } })) },
+  // This IP's bucket is spent. A client behind a rate-limited relay sees this as the whole
+  // catalogue going quiet at once, and the only real remedy is a different egress IP.
+  free_usage_limit: (res) => { res.writeHead(429, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' } })) },
   empty_200: (res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }] })) },
   error_after_text: (res) => { res.write(chunk({ content: 'committed text ' })); setTimeout(() => { res.write(sse({ error: { message: 'died mid answer' } })); res.end() }, 20) },
   json_not_sse: (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'json body' }, finish_reason: 'stop' }] })) },

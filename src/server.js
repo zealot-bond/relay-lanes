@@ -21,6 +21,8 @@ import { listModelsPayload, findModel, splitModelId, PROVIDER, MODELS } from './
 import { config } from './config.js'
 import { CODE_VERSION } from './codeversion.js'
 import { directEnabled, directStats, serveDirect } from './direct.js'
+import { zenBase } from './fingerprint.js'
+import { escalate, stats as escalateStats, onEscalate } from './escalate.js'
 
 // Config is read from config.js, which resolves baked credentials, then
 // start.properties, then the environment -- so a baked PORT is honoured even
@@ -472,7 +474,7 @@ async function dispatch (entry) {
 
     // DIRECT_MODE: call the upstream here, in-process, and skip the lane pool entirely.
     // Placed before lane selection so nothing touches the queue, a claim, or a heartbeat.
-    if (directEnabled()) {
+    if (directEnabled() && !entry.escalated) {
       attempt++
       const stream = entry.job.stream
       const push = streamers.get(entry.id)
@@ -502,15 +504,38 @@ async function dispatch (entry) {
         result = { kind: 'error', status: 0, ms: 0, data: null, raw: String(e?.message || e) }
       }
       entry.outcome = result
-      console.log(`[relay] direct ${entry.job.model} -> ${result.kind} (${result.ms}ms)`)
-      if (result.kind === 'limited') noteRateLimit(entry.job.model, result)
+      console.log(`[relay] direct ${entry.job.model} -> ${result.kind} (${result.ms}ms) via ${zenBase()}`)
       if (result.kind === 'ok') {
         lanes.record('direct', 'ok', result.ms || 0)
         return result
       }
-      // One IP is one bucket: a retry cannot land somewhere else, so it is not worth
-      // three round trips. Report the real reason instead.
-      return result
+      if (result.kind !== 'limited') {
+        // An outage, a withdrawn model, a bad request: another IP would answer exactly
+        // the same. Report it.
+        return result
+      }
+
+      // This IP's bucket is spent. Escalate rather than fail: arm the runner pool and,
+      // once a lane exists, fall through to the normal lane path below. A lane has a
+      // DIFFERENT egress IP and therefore a different bucket, so this genuinely answers.
+      noteRateLimit(entry.job.model, result)
+      const laneReady = () => lanes.liveLanes(LANE_STALE_MS)
+        .some((l) => l.status !== 'exhausted')
+      if (!(await escalate(laneReady))) {
+        // No lane in time. The honest answer is still the 429, with the escalation
+        // already under way for the next request.
+        return result
+      }
+      // Mark the entry so the next pass goes to the LANE path.
+      //
+      // Without this the loop re-entered the direct branch forever: direct -> limited ->
+      // escalate -> continue -> direct -> limited, spinning at ~1ms per pass and never
+      // reaching the lanes it was waiting for. Caught by test/escalation.mjs.
+      entry.escalated = true
+      // The direct call told us about the BUCKET, not about this request, so it must not
+      // consume an attempt; the lane attempt that follows is the one that counts.
+      attempt--
+      continue
     }
 
     const lane = pickLane(tried, busyLanes)
@@ -1391,6 +1416,7 @@ export function createServer () {
           build: `${config.BUILD_ID} (${config.BUILD_BUILT})`,
           laneCode: laneCodeStats(),
           direct: directStats(),
+          escalate: escalateStats(),
           rateLimits,
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is

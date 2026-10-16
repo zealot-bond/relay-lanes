@@ -22,6 +22,7 @@ say(`starting: port=${config.PORT} lanes=${config.LANES_TARGET} ` +
   `repo=${config.GH_REPO || '(unset)'} workflow=${config.GH_WORKFLOW}`)
 
 const { start, lanes, queue, laneCodeStats } = await import('./server.js')
+const { onEscalate } = await import('./escalate.js')
 
 const server = start()
 
@@ -37,8 +38,26 @@ const server = start()
 //
 // Set DIRECT_MODE=0 to bring the pool back for serving many clients from many IPs.
 const direct = String(config.DIRECT_MODE) === '1'
+let orchestratorStarted = false
+const startOrchestrator = () => {
+  if (orchestratorStarted) return
+  if (!config.GH_TOKEN || !config.GH_REPO) {
+    say('escalation wanted a lane pool, but no GH_TOKEN/GH_REPO is configured')
+    return
+  }
+  orchestratorStarted = true
+  say('starting the lane orchestrator: this IP\'s free-tier bucket is exhausted')
+  import('./orchestrator.js')
+    .then(() => say('lane orchestrator started'))
+    .catch((e) => say(`lane orchestrator failed to load: ${e.message}`))
+}
+
 if (direct) {
-  say('DIRECT MODE: no lane orchestrator, no GitHub runners; upstream calls from this host')
+  say('DIRECT MODE: upstream calls from this host. Lane pool is held in reserve and ' +
+    'starts only if this IP\'s bucket is exhausted (DIRECT_ESCALATE).')
+  // Lazy: the orchestrator is imported on the FIRST rate limit, not at boot, so light
+  // traffic costs no CI at all and sustained traffic grows a pool on demand.
+  onEscalate(startOrchestrator)
 } else if (String(config.LANES_ENABLED) === '1' && config.GH_TOKEN && config.GH_REPO) {
   import('./orchestrator.js')
     .then(() => say('lane orchestrator started'))
