@@ -268,6 +268,59 @@ too and confirm those scenarios fail** — one backpressure test passed on the b
 code because its volume never reached the buffer limit, and only the negative control
 showed it. Never copy production logic into a test; import it.
 
+## The orchestrator is opt-in, because a test relay once dispatched real runs
+
+`LANES_ENABLED=1` is now required, on top of `DIRECT_MODE=0`, before the orchestrator will
+dispatch anything. It defaults OFF.
+
+This is not hypothetical hardening. On 2026-10-16 a local verification relay
+(`node src/main.js` with `DIRECT_MODE=0` and a throwaway `RELAY_TOKEN=t`) started the real
+orchestrator, which had live GitHub credentials baked in, and dispatched **14 runs to the
+production repository**. All 14 died within a second at registration with
+`{"error":"bad token"}`, because the token was one character long. It burned CI minutes and
+filled the run list with failures that made a working lane system look broken.
+
+`orchestrator.js` additionally refuses to dispatch when `RELAY_TOKEN` is shorter than 16
+characters, logging why and returning before the dispatch endpoint is reached. It sits next
+to the existing "no relay URL -> do not dispatch" check for the same reason: never spend CI
+minutes proving a run cannot work.
+
+`test/orchestrator-guard.mjs` asserts both guards, including that the refusal *precedes*
+the dispatch call rather than merely existing in the file.
+
+To actually run a lane pool you now need **both**:
+
+```properties
+DIRECT_MODE=0
+LANES_ENABLED=1
+```
+
+## Rate limiting is per egress IP, so DIRECT_MODE has one bucket (2026-10-16)
+
+The free tier's quota is keyed on egress IP. DIRECT_MODE uses exactly one IP, so when that
+bucket is spent **every model goes quiet at once** with
+`FreeUsageLimitError: Rate limit exceeded` -- observed on the panel, all 11 models, while the
+same catalogue from a different IP answered 9 of 11 normally. The limit is not global and
+not per-model.
+
+This is the trade the runner pool existed to solve, and direct mode gives it up. Direct mode
+is right until the single bucket runs out; for sustained use, `DIRECT_MODE=0` plus
+`LANES_ENABLED=1` and let 20 runner IPs rotate.
+
+Three fixes came out of that incident:
+
+1. **A rate limit was reported as a 502 ending "This is an upstream fault, not a rate
+   limit."** The sentence was appended to every refusal regardless of cause, so a client
+   out of quota was told the opposite while the body said `FreeUsageLimitError`. That is
+   what sent the operator hunting a phantom code bug. A genuine rate limit now returns
+   **429 with `Retry-After`**, which is both true and lets a client back off. Every other
+   upstream fault stays 502.
+2. **Rate limits were invisible on `/health`.** `limited` was excluded from logging along
+   with the kinds that must not count toward model health, so `/health` reported
+   `recentFailures: []` through an entire storm. There is now a `rateLimits` block with
+   `count`, `lastAt`, `lastModel` and the provider's own words.
+3. **Direct mode does not retry a limited call.** There is no second bucket to land on.
+
 ## Verified working on BOTH paths (2026-10-15)
 
 The `/inference` endpoint change touched lane-side code, so the lane path was re-verified
