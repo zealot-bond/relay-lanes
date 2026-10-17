@@ -113,6 +113,49 @@ const RESPONSES_MODELS = new Set([
 //     ling-3.1-flash-free
 //   HTTP 410 ModelDeprecated 0/3:  fledge-alpha-free, mimo-v2.5-free
 //
+// REMOVAL LEDGER -- 2026-10-17, re-verified with repeated runs rather than one probe.
+// A model that fails part of the time is worse than a missing one: the client gets a 502 or
+// 503 instead of a clean "not offered", and the failure looks like the relay's fault.
+//
+//   muse-spark-1.3-contributor-free  0/5  HTTP 410 ModelDeprecated
+//       The provider really did withdraw it. Worth stating plainly because `gone` is the
+//       most consequential verdict in the relay -- not retried, quarantined for an hour,
+//       reported as a permanent withdrawal -- so a false positive there would take a working
+//       model out of service for everyone for the hour. The raw body is unambiguous:
+//         {"error":{"type":"ModelDeprecated","message":"Model muse-spark-1.3-contributor-free
+//          has been deprecated."}}
+//       The CONVERTER is not the problem: muse-spark-1.2 uses the identical responses-dialect
+//       path, identical tool conversion and identical SSE folding, and answered 5/5 in the
+//       same sweep.
+//
+//   ll-alpha-free                     0/5  HTTP 410 ModelDeprecated
+//       Answered 3/3 about six hours earlier. So a withdrawal here is NOT permanent either --
+//       which is exactly why exo-free was RESTORED below rather than removed, and why a
+//       single observation must never be the basis for a deletion.
+//
+//   glm-5.3-flash-free                2/5  three answered, then HTTP 429 "Endpoint is
+//       unavailable" three times; and 0/5 both before and after that window. A coin flip on
+//       every request. It was added on the strength of a 3/3 window and has been cut on the
+//       strength of 2/5 and two 0/5s. Its family (glm-5-free, glm-4.7-free) answers
+//       400 "Model is unavailable" consistently.
+//
+//   nemotron-3-ultra-free             1/5  four empty 200s. Recoverable upstream flakiness
+//       at its worst; the empty-answer counter has to reach its cap before anything is said.
+//
+//   step-5-preview-free               0/5  HTTP 400 "Model is unavailable"
+//   deepseek-v4-flash-free            0/3  HTTP 400 Model is unavailable (re-checked)
+//   ling-3.0-flash-fin-free           0/3  HTTP 400 (re-checked)
+//   ling-3.1-flash-free               0/3  HTTP 400 (re-checked)
+//   mimo-v2.5-free                    0/3  HTTP 410 (re-checked)
+//   fledge-alpha-free                 0/3  HTTP 410 (re-checked)
+//
+//   Also listed but never available: beam-free's neighbours -- glm-4.7-free, glm-5-free,
+//   hy3-free, hy3-preview-free, kimi-k2.5-free, laguna-s-2.1-free, ling-2.6-flash-free,
+//   ling-3.0-flash-free, ling-3.0-tiny-free, longcat-2.0-free, mimo-v2-flash-free,
+//   mimo-v2-omni-free, mimo-v2-pro-free, minimax-m2.1/m2.5/m3-free, nemotron-3-super-free,
+//   north-mini-code-free, qwen3.6-plus-free, ring-2.6-1t-free, trinity-large-preview-free,
+//   x-preview-f-free -- all HTTP 400 "Model is unavailable".
+//
 // Every addition was probed on BOTH dialects. The five new models answer 500 or
 // 401 on /v1/responses, so they are chat-only; mislabelling them would surface as
 // `input[N] did not match any supported type` at request time rather than as a
@@ -122,61 +165,23 @@ const RESPONSES_MODELS = new Set([
 // metadata, and big-pickle has been observed serving 852k tokens despite the
 // 200000 declared here. Treat it as a floor, not a limit.
 export const MODELS = [
+  // Every entry verified on 2026-10-17 with repeated runs, not a single probe:
+  // 4-5/4-5 answered each. See the removal ledger above for what was cut and why.
   { id: 'big-pickle', contextWindow: 200000 },
-  // nemotron-3-ultra-free was removed on 2026-10-15 because it was absent from
-  // /zen/v1/models, then restored the same day: that list is not a health signal, so its
-  // absence proved nothing. It is still absent there and still present in the models.dev
-  // catalogue, which is ALSO not a health signal (it still lists exo-free and
-  // mimo-v2.5-free, both confirmed 410). Absence is evidence of nothing; only a live
-  // probe is.
-  { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
   { id: 'muse-spark-1.2-contributor-free', contextWindow: 200000 },
-  { id: 'muse-spark-1.3-contributor-free', contextWindow: 200000 },
-  // exo-free and fledge-alpha-free were here until 2026-10-15 and are gone: the
-  // provider answers 410 ModelDeprecated. Removing them is not cosmetic -- an advertised
-  // model that cannot be served costs every client six upstream calls before the
-  // quarantine finally refuses it.
   { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
   { id: 'space-bunny-free', contextWindow: 200000 },
-  // Newly listed free models, added 2026-10-15 and PROBED before being kept -- the first
-  // time any of these could be verified at all, because direct mode finally reached the
-  // upstream from this host. Measured: cat-jam-free 4/4 plain + 3/3 tools (1.9s p50,
-  // the fastest here), deepseek-v4.1-flash-free 4/4 + 3/3 (5.5s), step-5-preview-free
-  // 4/4 + 3/3 then 0/5 then 200 again minutes later.
-  //
-  // step-5-preview-free is genuinely flaky: it returned
-  //   HTTP 429 {"error":{"type":"server_error","message":"Upstream request failed:
-  //                Endpoint is unavailable."}}
-  // which classifyUpstream reports as a MODEL fault (outage), not an exhausted bucket --
-  // the same outage-reported-as-429 that affected ling-3.1-flash-free. Do not remove it on
-  // one bad sweep, and do not trust a single sweep either way.
   { id: 'cat-jam-free', contextWindow: 200000 },
   { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
-  { id: 'step-5-preview-free', contextWindow: 200000 },
-  // Added 2026-10-16 after probing all 42 free ids in the models.dev catalogue. Three of
-  // the 26 that were not already here answered 3/3 on a probe AND on a confirmation run:
-  //   beam-free, ll-alpha-free, nemotron-3.5-super-vl-free.
   { id: 'beam-free', contextWindow: 200000 },
-  // glm-5.3-flash-free was reported unavailable on 2026-10-16 and then answered on
-  // 2026-10-17, minutes apart, on all three bases (/inference/v1, /inference/openai/v1 and
-  // the legacy /zen/v1) and on the chat dialect. So its endpoint is INTERMITTENT, not gone --
-  // the same pattern as ling-3.1-flash-free and nemotron-3.5-super-vl-free. Its whole family
-  // (glm-5-free, glm-4.7-free) does answer 400 "Model is unavailable" consistently, so the
-  // difference is this endpoint, not the family.
-  //
-  // Note what it answers when it is down: HTTP 429 "Endpoint is unavailable". That is an
-  // OUTAGE reported with a rate-limit status code, and classifyUpstream already treats it as
-  // a model fault rather than an exhausted bucket.
-  { id: 'glm-5.3-flash-free', contextWindow: 200000 },
-  { id: 'll-alpha-free', contextWindow: 200000 },
-  { id: 'nemotron-3.5-super-vl-free', contextWindow: 200000 },
-  // exo-free is BACK. Removed on 2026-10-07 for 410 ModelDeprecated; answered 3/3 on
-  // 2026-10-16. A withdrawal is not necessarily permanent, and removing on a single
-  // observation discards a working model. fledge-alpha-free was still 410 the same day, so
-  // it stays out -- the difference is repeated observation, not the error text.
+  // exo-free RESTORED. Removed on 2026-10-07 for 410 ModelDeprecated; answered 5/5 on
+  // 2026-10-17. And ll-alpha-free was withdrawn the same way within hours of working -- so a
+  // withdrawal here is not permanent, and deleting on one observation throws away a model
+  // that is still serving. Re-probe before re-adding.
   { id: 'exo-free', contextWindow: 200000 },
+  { id: 'nemotron-3.5-super-vl-free', contextWindow: 200000 },
 ]
 
 export function protocolFor (modelId) {
