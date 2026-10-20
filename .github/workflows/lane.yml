@@ -44,6 +44,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The relay-side sources live in this repo but run in the JAR, not here, so
+      # nothing on a runner would ever notice if one of them stopped parsing. A
+      # broken server.js is invisible until someone builds a jar from it. Check
+      # them here, where the failure is cheap to see. Never fatal: a broken
+      # relay-side file must not take the lane pool down with it.
+      - name: Check that the relay-side sources parse
+        run: |
+          set -uo pipefail
+          for f in src/server.js src/queue.js src/orchestrator.js src/main.js src/models.js src/config.js src/lane.js src/worker.js src/fingerprint.js src/toolmerge.js src/codeversion.js; do
+            if node --check "$f" 2>/tmp/chk.err; then
+              echo "parse OK   $f"
+            else
+              echo "parse FAIL $f"
+              sed "s/^/    /" /tmp/chk.err
+            fi
+          done
       - name: Serve until the bucket is spent
         env:
           # Dispatch input wins; the repo secret is the fallback for the scheduled
