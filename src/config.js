@@ -61,8 +61,21 @@ const str = (key, fallback = '') => {
   const e = process.env[key]
   if (typeof e === 'string' && e.length > 0) return e
   if (typeof props[key] === 'string' && props[key].length > 0) return props[key]
+  // A baked value may legitimately be a NUMBER -- PORT, MAX_LANES, the timeouts.
+  // Reading only strings silently ignored every numeric setting in the baked file, so a
+  // correctly baked PORT was dropped and the relay listened on the config default
+  // instead. On 2026-10-20 that put it on 8791 while the daemon expected 25566, so every
+  // lane tried to register against a dead port, died in seconds, and the orchestrator
+  // re-dispatched 20 runs a minute against a pool that could never fill.
+  //
+  // Coerce, rather than only accepting strings. Booleans are excluded: 'false' is a
+  // non-empty string and would read as true.
   const b = baked[key]
-  return typeof b === 'string' && b.length > 0 ? b : fallback
+  if (b !== undefined && b !== null && typeof b !== 'boolean') {
+    const s = String(b)
+    if (s.length > 0) return s
+  }
+  return fallback
 }
 
 const num = (key, fallback) => {
