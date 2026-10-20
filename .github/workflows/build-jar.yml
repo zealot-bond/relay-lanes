@@ -12,6 +12,10 @@ on:
         description: 'Publish the jar as a release asset as well as an artifact'
         required: false
         default: 'true'
+      credentials:
+        description: 'The contents of baked-credentials.json, as JSON. Never committed.'
+        required: true
+        default: ''
 
 permissions:
   contents: write
@@ -22,6 +26,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Write the baked credentials
+        env:
+          CREDENTIALS: ${{ inputs.credentials }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CREDENTIALS:-}" ]; then echo '::error::no credentials supplied'; exit 1; fi
+          printf '%s' "$CREDENTIALS" > baked-credentials.json
+          chmod 600 baked-credentials.json
+          python3 -c "import json;json.load(open('baked-credentials.json'));print('credentials parse OK')" || { echo '::error::credentials are not valid JSON'; exit 1; }
 
       - name: Build server.jar
         run: |
