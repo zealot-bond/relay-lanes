@@ -294,9 +294,16 @@ let replenishTried = false
 async function replenishPool (why) {
   if (replenishTried) return
   replenishTried = true
-  const token = config.GH_TOKEN
-  const repo = config.GH_REPO
-  if (!token || !repo) return
+  // The lane runs from the repo checkout, which has no baked-credentials.json, so
+  // config.GH_TOKEN is empty here. The runner's own RELAY_TOKEN is the same PAT for a
+  // dispatched run (the orchestrator passes it), and the repo secret for a cron run --
+  // so fall back to it. Without this the replenish did nothing at all, silently.
+  const token = config.GH_TOKEN || process.env.RELAY_TOKEN
+  const repo = config.GH_REPO || (process.env.GITHUB_REPOSITORY || '')
+  if (!token || !repo) {
+    console.log('[lane] no GitHub credentials available; cannot replenish the pool')
+    return
+  }
   const gh = (p) => `https://api.github.com${p}`
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -304,6 +311,7 @@ async function replenishPool (why) {
     'User-Agent': 'relay-lane',
   }
   const workflow = config.GH_WORKFLOW || 'lane.yml'
+  console.log(`[lane] replenish check: repo=${repo} workflow=${workflow} token=${token.length} chars`)
   const liveRuns = async () => {
     const r = await fetch(gh(`/repos/${repo}/actions/workflows/${workflow}/runs?status=in_progress&per_page=100`), { headers })
     const j = await r.json()
@@ -330,7 +338,8 @@ async function replenishPool (why) {
         inputs: { relay_url: RELAY, relay_token: TOKEN },
       }),
     })
-    console.log(`[lane] dispatched a replacement run (${why}); pool was ${live2}/${REPLENISH_TARGET}, dispatch status ${d.status}`)
+    const body = d.status >= 200 && d.status < 300 ? '' : ' ' + (await d.text().catch(() => '')).slice(0, 160)
+    console.log(`[lane] dispatched a replacement run (${why}); pool was ${live2}/${REPLENISH_TARGET}, dispatch status ${d.status}${body}`)
   } catch (e) {
     console.error(`[lane] could not replenish the pool: ${e?.message || e}`)
   }
