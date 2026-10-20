@@ -73,6 +73,17 @@ cp "$NODE_BIN" build/stage/app-payload/node/bin/node
 chmod +x build/stage/app-payload/node/bin/node
 echo "    node binary $(du -h build/stage/app-payload/node/bin/node | cut -f1)"
 
+# assemble the jar
+STAGE=build/stage
+mkdir -p "$STAGE/META-INF"
+printf 'Manifest-Version: 1.0\nMain-Class: com.relay.launcher.Launcher\n\n' > "$STAGE/META-INF/MANIFEST.MF"
+cp -r build/classes/. "$STAGE"/
+if command -v jar >/dev/null 2>&1; then
+  (cd "$STAGE" && jar cfm "$ROOT/server.jar" META-INF/MANIFEST.MF .) || { echo "FAIL: jar failed" >&2; exit 1; }
+else
+  (cd "$STAGE" && zip -q -r "$ROOT/server.jar" .) || { echo "FAIL: zip failed" >&2; exit 1; }
+fi
+
 echo "    build local built $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ls -la server.jar
 echo "built $(du -h server.jar | cut -f1)  ->  $ROOT/server.jar"
