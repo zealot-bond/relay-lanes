@@ -125,7 +125,7 @@ function noteFailure (model, result) {
   console.error(`[relay] upstream rejected ${model}: ${detail.slice(0, 200)}`)
 }
 
-const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'empty', 'transport', 'timeout', 'error'])
+const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'ip_blocked', 'empty', 'transport', 'timeout', 'error'])
 
 // Rate limiting is the single most important thing to see when the relay goes quiet, and
 // `limited` is in UNCOUNTED_KINDS because it must not count toward MODEL health (one IP's
@@ -149,9 +149,29 @@ function logAttemptFailure (model, result) {
   if (!UNCOUNTED_KINDS.has(result.kind)) noteFailure(model, result)
 }
 
+/** Was this egress IP BLACKLISTED, rather than merely out of quota?
+ *
+ * The provider says: "OpenCode's free models aren't available from your current network
+ * because we've detected abusive traffic from this IP address."
+ *
+ * That is a per-IP reputation block: the remedy is a different egress IP, not a wait.
+ * It arrives as a 403 carrying FreeTierError, the same envelope the fingerprint gate
+ * uses -- so the two are told apart by their words, not by their status.
+ */
+function ipIsBlacklisted (result) {
+  return /abusive traffic from this IP|aren't available from your current network/i.test(String((result && result.raw) || ''))
+}
+
+/** One phrase for why an egress was refused, used by both error paths. */
+function limitHeadline (result) {
+  return ipIsBlacklisted(result)
+    ? 'this egress IP is blacklisted by the provider for abusive traffic'
+    : 'free-tier rate limit reached'
+}
+
 /** Did the upstream actually say it was a rate limit, whatever status carried it? */
 function isRateLimitBody (result) {
-  return /FreeUsageLimitError|rate[_ ]limit exceeded|rate[_ ]limit reached/i.test(String((result && result.raw) || ''))
+  return /FreeUsageLimitError|rate[_ ]limit exceeded|rate[_ ]limit reached|abusive traffic from this IP|aren't available from your current network/i.test(String((result && result.raw) || ''))
 }
 
 /**
@@ -209,7 +229,7 @@ export function noteModelResult (model, result, { log = true } = {}) {
   // against the model let three consecutive lane-level blips (an upstream 5xx, a
   // reset socket) take a whole model offline for the quarantine window -- even
   // though the same outcomes are treated as retryable on another lane.
-  if (result.kind === 'limited' || result.kind === 'empty' ||
+  if (result.kind === 'limited' || result.kind === 'ip_blocked' || result.kind === 'empty' ||
       result.kind === 'transport' || result.kind === 'timeout' || result.kind === 'error') {
     h.fails = 0
     h.until = 0
@@ -269,7 +289,7 @@ export function modelHealthStats () {
 // Retried at most once (see dispatch). `gate` is excluded: a rejected
 // fingerprint is identical from every egress IP, so retrying cannot help.
 //   gone           no  - the provider withdrew the model; identical from every IP
-const RETRYABLE = new Set(['limited', 'empty', 'transport', 'timeout', 'error'])
+const RETRYABLE = new Set(['limited', 'ip_blocked', 'empty', 'transport', 'timeout', 'error'])
 // Attempts per request, including the first. Two is deliberate: a 4xx is identical
 // from every egress IP, so a second try covers genuine transients and a third only
 // holds the client longer before the same answer.
@@ -651,7 +671,7 @@ async function dispatch (entry) {
     // returned here first, so a permanent failure was never counted: the panel
     // showed failed=0 while clients were being refused, and model health never
     // tripped, which is why the misleading message kept coming back.
-    if (result.kind === 'limited') {
+    if (result.kind === 'limited' || result.kind === 'ip_blocked') {
       // This egress IP is spent. Retire the lane so the orchestrator replaces it
       // with a runner holding a fresh bucket, then hand the work back. Recorded
       // once, as limited: counting it as a failure too inflated failed= and
@@ -659,7 +679,9 @@ async function dispatch (entry) {
       lanes.record(served, 'limited', result.ms || 0)
       // Make it visible: the count, which model, and the provider's own words.
       noteRateLimit(entry.job.model, result)
-      lanes.retire(served, 'egress bucket exhausted')
+      lanes.retire(served, result.kind === 'ip_blocked'
+        ? 'egress IP blacklisted for abusive traffic'
+        : 'egress bucket exhausted')
       // A retired lane is gone from the registry, so this only matters if retire
       // could not find it; keeping it costs nothing and closes the case where the
       // record was pruned first.
@@ -1052,13 +1074,13 @@ async function handleChat (req, res) {
             // Nothing to retry and nothing to wait for: say so instead of
             // reporting an opaque upstream refusal.
             ? `the provider withdrew ${PROVIDER}/${model}; it is no longer available`
-            : (result.kind === 'limited' || isRateLimitBody(result))
+            : (result.kind === 'limited' || result.kind === 'ip_blocked' || isRateLimitBody(result))
               // A streaming client cannot see a 429 -- the headers are long gone --
               // so the truth has to be in the message itself. It used to read
               // "no lane could serve this request (limited); tried 1 time(s) across lanes",
               // which is wrong twice over in direct mode: there are no lanes, and it is a
               // quota, not a lane problem.
-              ? `${PROVIDER}/${model}: free-tier rate limit reached` +
+              ? `${PROVIDER}/${model}: ${limitHeadline(result)}` +
                 `${upstreamDetail(result, model) ? ` (${upstreamDetail(result, model)})` : ''}. ` +
                 `In DIRECT_MODE every model shares one egress IP, so the whole catalogue ` +
                 `goes quiet together and retrying cannot help. Wait for the window to reset, ` +
@@ -1094,7 +1116,7 @@ async function handleChat (req, res) {
     //
     // So: a real rate limit gets HTTP 429 and Retry-After, which is both true and what
     // lets a client back off on its own. Everything else keeps 502.
-    if (result.kind === 'limited' || isRateLimitBody(result)) {
+    if (result.kind === 'limited' || result.kind === 'ip_blocked' || isRateLimitBody(result)) {
       const retryAfter = result.retryAfter ?? rateLimitRetryAfter(result)
       return json(res, 429, {
         error: {
