@@ -220,6 +220,25 @@ export function classifyUpstream (status, raw) {
   // and a prose message from the upstream provider. Checked BEFORE prose rate-limit
   // matching: a 403 gate message that merely mentions "rate limits" is still a gate,
   // not an exhausted bucket -- retiring the lane would not change the fingerprint.
+  // A blacklisted EGRESS IP is not the same as the fingerprint gate.
+  //
+  //   "OpenCode's free models aren't available from your current network because we've
+  //    detected abusive traffic from this IP address."
+  //
+  // The gate ("can only be used from within OpenCode") is about WHO is asking, and no
+  // other IP helps, so it must not be retried. THIS one is about the IP's REPUTATION,
+  // and a different IP answers normally.
+  //
+  // Reported as `limited` deliberately, because that is the kind the relay already
+  // handles correctly: it retires that lane, requeues the work and retries it on
+  // another egress, and it does NOT count the failure against the MODEL's health.
+  // Classified as `gate` -- which is what every 403 carrying FreeTierError became --
+  // the blacklisted lane stayed in the pool failing every request, and the model was
+  // quarantined for everyone over an IP-level fault. Measured 2026-10-20: one lane
+  // served 174 requests and was then blacklisted mid-run, and the pool never healed.
+  const ipBlocked = /aren't available from your current network|detected abusive traffic|abusive traffic from this IP/i.test(text)
+  if (ipBlocked) return { kind: 'limited', retryAfter: null, ipBlocked: true }
+
   const gate = text.includes('FreeTierError') ||
     /free tier can only be used from within/i.test(text)
   if (gate && !structuredLimit) return { kind: 'gate' }
