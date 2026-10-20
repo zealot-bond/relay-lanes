@@ -65,22 +65,13 @@ else
 fi
 printf '{"id":"local","built":"%s"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > build/stage/app-payload/build-info.json
 
-echo "    bundling the node runtime"
-mkdir -p build/stage/app-payload/node
-cp -r "$NODE_RUNTIME"/. build/stage/app-payload/node/
-chmod +x build/stage/app-payload/node/bin/* 2>/dev/null
-
-# assemble the jar
-STAGE=build/stage
-mkdir -p "$STAGE/META-INF"
-printf 'Manifest-Version: 1.0\nMain-Class: com.relay.launcher.Launcher\n\n' > "$STAGE/META-INF/MANIFEST.MF"
-cp -r build/classes/. "$STAGE"/
-
-if command -v jar >/dev/null 2>&1; then
-  (cd "$STAGE" && jar cfm ../../server.jar META-INF/MANIFEST.MF .) || { echo "FAIL: jar failed" >&2; exit 1; }
-else
-  (cd "$STAGE" && zip -q -r ../../server.jar .) || { echo "FAIL: zip failed" >&2; exit 1; }
-fi
+echo "    bundling the node binary (only the binary: the rest of the install is npm and docs, and archiving those took 13 minutes)"
+NODE_BIN="$NODE_RUNTIME/bin/node"
+if [ ! -x "$NODE_BIN" ]; then echo "FAIL: $NODE_BIN is not executable" >&2; exit 1; fi
+mkdir -p build/stage/app-payload/node/bin
+cp "$NODE_BIN" build/stage/app-payload/node/bin/node
+chmod +x build/stage/app-payload/node/bin/node
+echo "    node binary $(du -h build/stage/app-payload/node/bin/node | cut -f1)"
 
 echo "    build local built $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ls -la server.jar
