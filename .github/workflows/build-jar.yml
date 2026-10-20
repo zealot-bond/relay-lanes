@@ -76,10 +76,12 @@ jobs:
       - name: Verify the baked port is the port it listens on
         run: |
           set -uo pipefail
-          rm -rf /tmp/verify2 && mkdir -p /tmp/verify2 && cp server.jar /tmp/verify2/
-          cd /tmp/verify2
+          # Read the baked port BEFORE changing directory: baked-credentials.json lives in
+          # the repository root, and the step below moves to /tmp/verify2.
           EXPECTED=$(python3 -c "import json;print(json.load(open('baked-credentials.json')).get('PORT',8791))")
           echo "baked port: $EXPECTED"
+          rm -rf /tmp/verify2 && mkdir -p /tmp/verify2 && cp server.jar /tmp/verify2/
+          cd /tmp/verify2
           PATH=/usr/bin:/bin nohup java -jar server.jar > jar.log 2>&1 &
           echo $! > jar.pid
           for i in $(seq 1 45); do
