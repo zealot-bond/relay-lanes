@@ -67,6 +67,31 @@ jobs:
           grep -q "using bundled node runtime" jar.log || { echo "::error::the jar did not use its BUNDLED node runtime"; exit 1; }
           echo "jar verified"
 
+      # The PORT and HOST the relay listens on are BAKED, and the panel has no
+      # start.properties entry for them. A build that omits them listens on the config
+      # default (8791) instead of the port the daemon expects (25566), so every lane
+      # registers against a dead port and dies instantly -- which is exactly what
+      # happened on 2026-10-20. So boot the jar with NO port override and check it
+      # listens on the port that was actually baked in.
+      - name: Verify the baked port is the port it listens on
+        run: |
+          set -uo pipefail
+          rm -rf /tmp/verify2 && mkdir -p /tmp/verify2 && cp server.jar /tmp/verify2/
+          cd /tmp/verify2
+          EXPECTED=$(python3 -c "import json;print(json.load(open('baked-credentials.json')).get('PORT',8791))")
+          echo "baked port: $EXPECTED"
+          PATH=/usr/bin:/bin nohup java -jar server.jar > jar.log 2>&1 &
+          echo $! > jar.pid
+          for i in $(seq 1 45); do
+            if curl -sf --max-time 3 "http://127.0.0.1:$EXPECTED/health" > health.json; then break; fi
+            sleep 1
+          done
+          cat jar.log
+          grep -q "listening on http://0.0.0.0:$EXPECTED" jar.log || { echo "::error::the jar is NOT listening on the baked port $EXPECTED"; exit 1; }
+          cat health.json 2>/dev/null || echo "(no health)"
+          kill "$(cat jar.pid)" 2>/dev/null || true
+          echo "baked port verified"
+
       - name: Upload as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
