@@ -1,0 +1,67 @@
+name: build-jar
+
+# Builds the relay jar on a runner and publishes it, so the jar can be produced
+# without a JDK on the operator's machine.
+#
+# The jar is VERIFIED before it is published: it is booted here and /health is
+# fetched, so an artifact that cannot start never reaches the panel.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish the jar as a release asset as well as an artifact'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build server.jar
+        run: |
+          set -uo pipefail
+          echo "node $(node --version)   java $(java -version 2>&1 | head -1)"
+          export NODE_RUNTIME="$(dirname "$(dirname "$(command -v node)")")"
+          bash scripts/pack-jar.sh
+          ls -la server.jar
+
+      - name: Verify the jar boots and serves
+        run: |
+          set -uo pipefail
+          rm -rf /tmp/verify && mkdir -p /tmp/verify && cp server.jar /tmp/verify/
+          cd /tmp/verify
+          PORT=25999 HOST=127.0.0.1 RELAY_TOKEN=relay nohup java -jar server.jar > jar.log 2>&1 &
+          echo $! > jar.pid
+          ok=0
+          for i in $(seq 1 45); do
+            if curl -sf --max-time 3 http://127.0.0.1:25999/health > health.json; then ok=1; break; fi
+            sleep 1
+          done
+          cat jar.log
+          echo "--- /health ---"
+          cat health.json 2>/dev/null || echo "(no health)"
+          kill "$(cat jar.pid)" 2>/dev/null || true
+          if [ "$ok" != "1" ]; then echo "::error::the built jar did not answer /health"; exit 1; fi
+          echo "jar verified"
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server.jar
+          path: server.jar
+          if-no-files-found: error
+
+      - name: Publish as a release asset
+        if: ${{ inputs.release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" server.jar --title "server.jar $TAG" --notes "Automated build of the relay jar." --repo "${{ github.repository }}"
