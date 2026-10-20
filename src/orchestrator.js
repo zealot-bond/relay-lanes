@@ -187,6 +187,7 @@ async function main () {
   // start take 30 minutes (one lane per 90s), which is the opposite of what a
   // pool is for. GitHub queues dispatches itself and starts them as concurrency
   // slots free, so a burst is safe and is the fastest path to N lanes.
+  const NO_GROWTH_BACKOFF_MS = Number(process.env.ORCH_NO_GROWTH_BACKOFF_MS || 120000)
   const BUDGET_PER_HOUR = config.DISPATCH_BUDGET
   const MAX_BURST = config.DISPATCH_BURST
   const DISPATCH_SPACING_MS = config.DISPATCH_SPACING_MS
@@ -194,6 +195,9 @@ async function main () {
   const COOLDOWN_MS = config.DISPATCH_COOLDOWN_MS
   let dispatches = []
   let cooldownUntil = 0
+// A dispatch that produced NO lanes must not be repeated on the next tick.
+let lastDispatchAt = 0
+let lanesAtLastDispatch = 0
 
   const budgetLeft = () => {
     const hourAgo = Date.now() - 3600000
@@ -245,6 +249,18 @@ async function main () {
         const wait = Math.ceil((cooldownUntil - Date.now()) / 1000)
         console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} want=${target} ` +
           `pending=${q.pending} cooling down ${wait}s`)
+      } else if (deficit > 0 && lastDispatchAt && liveLanes <= lanesAtLastDispatch &&
+                 Date.now() - lastDispatchAt < NO_GROWTH_BACKOFF_MS) {
+        // The previous dispatch did not produce a single lane, so repeating it would
+        // not either. This happened on 2026-10-20: the relay was listening on the wrong
+        // port, so every dispatched run died at registration within seconds. GitHub then
+        // reported 0 active + 0 queued, the deficit looked like 20 again, and the
+        // orchestrator dispatched another 20 every minute -- 1200 runs an hour, burning
+        // the budget on runs that provably cannot work.
+        const wait = Math.ceil((NO_GROWTH_BACKOFF_MS - (Date.now() - lastDispatchAt)) / 1000)
+        console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} want=${target} ` +
+          `pending=${q.pending} but the last dispatch produced no lanes -- waiting ${wait}s ` +
+          'instead of dispatching again (those runs are failing to register)')
       } else if (deficit > 0) {
         // Fire the whole deficit at once, spaced just enough to avoid the API's
         // secondary rate limits. A cold start goes from ~30 minutes to seconds.
@@ -278,6 +294,8 @@ async function main () {
           if (i < want - 1) await sleep(DISPATCH_SPACING_MS)
         }
         if (sent) {
+          lastDispatchAt = Date.now()
+          lanesAtLastDispatch = liveLanes
           console.log(`${stamp()} [orch] lanes=${liveLanes} github=${active}+${queued} ` +
             `want=${target} deficit=${deficit} -> dispatched ${sent} ` +
             `(${dispatches.length}/${BUDGET_PER_HOUR} this hour)`)
