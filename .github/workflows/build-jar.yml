@@ -50,7 +50,9 @@ jobs:
           set -uo pipefail
           rm -rf /tmp/verify && mkdir -p /tmp/verify && cp server.jar /tmp/verify/
           cd /tmp/verify
-          PORT=25999 HOST=127.0.0.1 RELAY_TOKEN=relay nohup java -jar server.jar > jar.log 2>&1 &
+          # PATH deliberately has no node: the container this jar runs in has none
+          # either, so a jar that only works because of a PATH fallback must fail here.
+          PATH=/usr/bin:/bin PORT=25999 HOST=127.0.0.1 RELAY_TOKEN=relay nohup java -jar server.jar > jar.log 2>&1 &
           echo $! > jar.pid
           ok=0
           for i in $(seq 1 45); do
@@ -62,6 +64,7 @@ jobs:
           cat health.json 2>/dev/null || echo "(no health)"
           kill "$(cat jar.pid)" 2>/dev/null || true
           if [ "$ok" != "1" ]; then echo "::error::the built jar did not answer /health"; exit 1; fi
+          grep -q "using bundled node runtime" jar.log || { echo "::error::the jar did not use its BUNDLED node runtime"; exit 1; }
           echo "jar verified"
 
       - name: Upload as a workflow artifact
