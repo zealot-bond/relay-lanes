@@ -131,6 +131,16 @@ public final class Launcher {
                     try { copy(in, os); } finally { os.close(); }
                 } finally { in.close(); }
                 if (e.getTime() > 0) out.toFile().setLastModified(e.getTime());
+                // The EXECUTABLE BIT must survive the extraction. Files.newOutputStream
+                // creates them 0644, so the bundled Node runtime came out non-executable,
+                // the launcher could not find it, and it fell back to node from PATH --
+                // which the Pterodactyl container does not have, so the jar would have
+                // failed to start on the panel. Caught by the CI boot test, which is the
+                // only reason it was caught at all.
+                if (rel.startsWith("node/bin/")) {
+                    out.toFile().setReadable(true, false);
+                    out.toFile().setExecutable(true, false);
+                }
             }
         } finally { zip.close(); }
     }
