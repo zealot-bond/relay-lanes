@@ -119,6 +119,15 @@ export const config = {
   MODEL_QUARANTINE_MS: num('MODEL_QUARANTINE_MS', 120000),
   TOOL_MODE: str('TOOL_MODE', 'passthrough'),
   TOOL_ROUNDS: num('TOOL_ROUNDS', 2),
+  // Forward the model's thinking to the client as delta.reasoning_content.
+  //
+  // Thinking is not the answer and never enters the folded completion, but it is
+  // most of the wait on the slow models: measured 2026-10-20, longcat-2.5-preview-free
+  // spent 9.5s thinking before its first visible character and mimo-v2.6-flash-free
+  // 2.4s. Without this the client sits on a blank screen for that whole time.
+  // '0' restores the old behaviour (content only) without a rebuild, for a client
+  // that renders reasoning badly.
+  REASONING_STREAM: str('REASONING_STREAM', '1'),
   FIRST_BYTE_TIMEOUT_MS: num('FIRST_BYTE_TIMEOUT_MS', 600000),
   STREAM_IDLE_TIMEOUT_MS: num('STREAM_IDLE_TIMEOUT_MS', 240000),
   // Comment frame sent to a streaming client while the relay waits upstream, so an

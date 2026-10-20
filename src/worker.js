@@ -133,6 +133,12 @@ async function main () {
     // tokens into one request.
     let pending = []
     let pendingTools = []
+    // Thinking tokens travel on their own list. They are never part of the answer,
+    // so they must not be counted as streamed text -- the relay compares
+    // streamedTextLen against the folded completion to decide how much of it the
+    // client already has, and reasoning in that number would make it believe the
+    // answer had been delivered when none of it had.
+    let pendingReasoning = []
     let deltaTimer = null
     let streamedText = false
     let streamedTools = false
@@ -147,12 +153,15 @@ async function main () {
     const doFlush = async () => {
       const hasText = pending.length > 0
       const hasTools = pendingTools.length > 0
-      if (!hasText && !hasTools) return
+      const hasReasoning = pendingReasoning.length > 0
+      if (!hasText && !hasTools && !hasReasoning) return
       const body = { laneId: LANE_ID, entryId: claim.entryId }
       if (hasText) body.text = pending.join('')
       if (hasTools) body.toolCalls = mergeToolDeltas(pendingTools, toolAcc)
+      if (hasReasoning) body.reasoning = pendingReasoning.join('')
       pending = []
       pendingTools = []
+      pendingReasoning = []
       const r = await post('/lane/delta', body).catch(() => null)
       if (r?.ok) {
         // Tracked separately: a turn can stream tool calls and no text, and the
@@ -194,6 +203,16 @@ busyHeartbeat.unref?.()
         onDelta: claim.job.stream
           ? (text) => {
               pending.push(text)
+              schedule()
+            }
+          : undefined,
+        // Thinking, forwarded on its own channel. Not counted as text (see
+        // pendingReasoning above) and not gated on tool calls: a model that thinks
+        // for 9s before deciding to call a tool would otherwise be silent for all
+        // of it.
+        onReasoning: claim.job.stream
+          ? (text) => {
+              pendingReasoning.push(text)
               schedule()
             }
           : undefined,

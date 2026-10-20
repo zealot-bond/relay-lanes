@@ -207,6 +207,68 @@ The cost is dominated by **provider-side prefill**. All measurements used the fr
 tier; authenticated traffic may be prioritised differently, which is not yet
 separated.
 
+### Measured 2026-10-20: the lane pool is NOT the latency, the model is
+
+Same prompt (~60 words), median of 3-5 runs, run twice: once against a local relay in
+DIRECT_MODE (this host's egress) and once through the Singapore panel's 20 runners.
+
+| model | direct | through lanes |
+|---|---|---|
+| beam-free | 2.29s | 2.37s |
+| cat-jam-free | 2.26s | 2.60s |
+| exo-free | 2.39s | 3.12s |
+| deepseek-v4.1-flash-free | 2.44s | 3.05s |
+| mimo-v2.6-flash-free | 5.49s | 3.65s |
+| big-pickle | 7.70s | 7.77s |
+| nemotron-3.5-super-vl-free | 3.61s | 8.07s |
+| nemotron-3.5-lightning-free | 23.3s | 9.20s |
+| longcat-2.5-preview-free | 16.3s | 15.0s |
+
+So the queue hop, claim round trip and delta POSTs cost **0.3–0.7s**, and for the slow
+models the panel was *faster* than this host. An earlier `/health` reading of
+`avgMs: 33315` was blamed on the architecture; it was two slow models (longcat 16s,
+lightning 23s) plus retries during a pool refill. Before optimising the transport,
+look at which model is answering.
+
+## Thinking is streamed separately (2026-10-20)
+
+The models are reasoning models, and the provider sends their thinking on the same SSE
+stream, under a field name that is not consistent:
+
+- `delta.reasoning_content` — beam-free
+- `delta.reasoning` (plus a structured `reasoning_details` duplicate) — nemotron-3.5-lightning-free
+- `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` — responses dialect
+
+`lane.js` correctly excluded all of it from the answer (folding it in would corrupt the
+completion and the client's text accounting), but it also **discarded** it, so the client
+sat on a blank screen for the whole thinking phase. Measured, first visible byte before
+and after forwarding it:
+
+| model | first byte, thinking dropped | first byte, thinking forwarded |
+|---|---|---|
+| beam-free | 1.31s | **0.74s** |
+| cat-jam-free | 1.21s | **0.82s** |
+| nemotron-3.5-lightning-free | 19.3s | **0.79s** |
+| longcat-2.5-preview-free | 17.4s | **6.58s** |
+| big-pickle | 7.85s | **6.03s** |
+
+The total time is unchanged — the model still thinks for as long — but the wait stops
+being dead air, which is what a harness shows as "no response".
+
+The rules that keep it safe, each of which is a way this could have broken the stream:
+
+- **Thinking is never `content`.** It travels on `onReasoning`, its own channel, and never
+  reaches the fold. `test/regressions.mjs` asserts the folded completion is the answer only.
+- **It is never counted as streamed text.** `entry.streamedTextLen` is compared against the
+  folded answer to decide what still has to be sent; counting thinking there would make the
+  relay believe the answer had been delivered. A regression scenario asserts the answer
+  still arrives in full when only thinking has been streamed.
+- **It is emitted as `delta.reasoning_content`**, the field DeepSeek-style harnesses and
+  `@ai-sdk/openai-compatible` read, and it is emitted *before* `delta.content`. A client
+  that ignores unknown delta fields is unaffected.
+- `REASONING_STREAM=0` restores the old behaviour without a rebuild.
+
+
 ## Lane pool
 
 - `LANES_TARGET` / `LANES_STANDBY` (20) — pool size.
@@ -515,6 +577,51 @@ basis. It has been restored. Neither list is a health signal; only a live probe 
 
 Free-suffixed and listed on 2026-10-15 but deliberately NOT added, because they could
 not be probed: `cat-jam-free`, `deepseek-v4.1-flash-free`, `step-5-preview-free`.
+
+### Full sweep 2026-10-20: 43 free ids, 12 work
+
+Probed directly through `callUpstream` (no relay in the path), so the result is what each
+model does today rather than what any list claims.
+
+**Working (12)**, in the order they are advertised — measured latency first:
+`cat-jam-free` `beam-free` `exo-free` `deepseek-v4.1-flash-free` `minimax-m3.1-flash-free`
+`nemotron-3-ultra-free` `nemotron-3.5-super-vl-free` `mimo-v2.6-flash-free` `big-pickle`
+`glm-5.3-flash-free` `nemotron-3.5-lightning-free` `longcat-2.5-preview-free`
+
+Three were added on this sweep, each then run 5× plain + 5× with tools:
+
+| model | plain | tools | median | why it was absent |
+|---|---|---|---|---|
+| `minimax-m3.1-flash-free` | 5/5 | 5/5 | 2.4s | never probed; `space-bunny-free`'s replacement |
+| `nemotron-3-ultra-free` | 5/5 | 5/5 | 2.5s | cut at 1/5 empty answers on 10-17 |
+| `glm-5.3-flash-free` | 5/5 | 5/5 | 8.5s | cut at 2/5 on 10-17 |
+
+**Withdrawn upstream, HTTP 410**: `fledge-alpha-free` `ll-alpha-free` `mimo-v2.5-free`
+`muse-spark-1.2-contributor-free` `muse-spark-1.3-contributor-free` `space-bunny-free`.
+Both muse-spark models are gone, so **the responses dialect now has no live model** — the
+converter is kept and still exercised by `test/units.mjs`.
+
+**HTTP 400 "Model is unavailable" (25)**: unchanged from 10-17.
+
+`glm-5.3-flash-free` is the argument against deleting on one bad window: it was cut when
+three `429 "Endpoint is unavailable"` landed inside one sweep, and it answers 10/10 three
+days later. Cut a model for being *withdrawn*; re-probe one that failed for an outage.
+
+**Tool argument shape, same sweep**: `big-pickle` returned `bash {"command":"ls -la /tmp"}`
+with **no `description`** on one probe and included it on the next — inconsistent, not
+reliably broken (`muse-spark-1.3` was reliably missing it, which is what made that
+diagnosable). A harness that marks `description` required will reject the calls that omit
+it. `glm-5.3-flash-free`, `minimax-m3.1-flash-free` and `nemotron-3-ultra-free` included it
+5/5 in the same sweep, so they are the safer choice for a strict harness.
+
+**`test/catalogue.mjs` was testing the wrong tree.** It imported
+`/home/rhythm/Desktop/glm/src/lane.js` — a local working copy — rather than `../src`. It
+passed while reporting models that had already been removed from this repository, and
+would have failed on a catalogue nobody could see. It now imports from `../src`, and the
+adversarial suite's `gone` scenario no longer names a model that has been deleted (it
+answered `unknown model` without ever calling upstream, so three checks were silently
+passing on nothing).
+
 
 ## Defects found 2026-10-15 (by running it, not by reading it)
 

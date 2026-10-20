@@ -4,8 +4,12 @@
 //
 // This is deliberately not the same probe that discovered the models: that one
 // hand-built a body, this one goes through the relay's own converter.
-import { callUpstream, destroyKeepalive } from '/home/rhythm/Desktop/glm/src/lane.js'
-import { MODELS, protocolFor, listModelsPayload } from '/home/rhythm/Desktop/glm/src/models.js'
+// Imported from THIS tree. It used to import '/home/rhythm/Desktop/glm/src', a local
+// working copy, so the test validated a catalogue that was not the one in this repository
+// -- it passed while reporting models that had already been removed here, and failed on a
+// model list nobody could see. A test that does not read the code under test proves nothing.
+import { callUpstream, destroyKeepalive } from '../src/lane.js'
+import { MODELS, protocolFor, listModelsPayload } from '../src/models.js'
 
 const TOOLS = [
   { type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } },

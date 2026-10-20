@@ -72,7 +72,9 @@ const KEEPALIVE = new https.Agent({
  * answer. It is purely additive: folding the final completion is unchanged.
  *
  * Reasoning-only models (nemotron-3-ultra) stream their thinking in
- * delta.reasoning and put the answer in delta.content; only content counts.
+ * delta.reasoning and put the answer in delta.content; only content counts toward
+ * the folded completion. Thinking is forwarded separately via `onReasoning` so the
+ * client sees progress during it, but it can never enter the answer text.
  */
 function makeChatIndexer () {
   // Upstream keys (the `index` it sent, and/or the call id) map to a CANONICAL
@@ -602,7 +604,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
  *
  * This is the single-shot form. callUpstream() wraps it to handle tool calls.
  */
-async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta } = {}) {
+async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta, onReasoning } = {}) {
   const { model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls } = job || {}
   const protocol = protocolFor(model)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls }))
@@ -657,7 +659,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
         sawByte = true
         armIdle(STREAM_IDLE_TIMEOUT_MS)
         chunks.push(c)
-        if (!onDelta && !onToolCall && !onToolDelta) return
+        if (!onDelta && !onToolCall && !onToolDelta && !onReasoning) return
         carry += decoder.write(c)
         let nl
         while ((nl = carry.indexOf('\n')) !== -1) {
@@ -731,6 +733,29 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
               onToolDelta?.([{ index: cur.index, function: { arguments: ev.delta } }])
             }
           }
+
+          // Reasoning (thinking) tokens. They are NOT part of the answer, so they
+          // must never reach `onDelta` -- that text is folded into the completion
+          // and its length is compared against what the client received. They are
+          // forwarded on their own channel so the client is not looking at a blank
+          // screen for the whole thinking phase.
+          //
+          // Measured 2026-10-20: longcat-2.5-preview-free thinks for 9.5s before
+          // its first visible character, mimo-v2.6-flash-free for 2.4s, big-pickle
+          // for 0.7s. Those seconds used to be dead air, and the relay reported the
+          // turn as merely slow (or, when the model spent its entire budget
+          // thinking, as `empty`).
+          //
+          // The provider is not consistent about the field name: beam-free sends
+          // `reasoning_content`, nemotron-3.5-lightning-free sends `reasoning` plus
+          // a structured `reasoning_details` duplicate, and the responses dialect
+          // sends its own event types. All of them are normalised to one channel.
+          const d0 = ev?.choices?.[0]?.delta
+          const think = d0?.reasoning_content ??
+            (typeof d0?.reasoning === 'string' ? d0.reasoning : undefined) ??
+            (ev?.type === 'response.reasoning_text.delta' ||
+             ev?.type === 'response.reasoning_summary_text.delta' ? ev.delta : undefined)
+          if (typeof think === 'string' && think) onReasoning?.(think)
 
           const text = ev?.choices?.[0]?.delta?.content ??
             (ev?.type === 'response.output_text.delta' ? ev.delta : undefined)

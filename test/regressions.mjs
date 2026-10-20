@@ -440,6 +440,63 @@ const scenarios = {
       { name: 'calls are distinct', ok: new Set(calls).size === calls.length, detail: calls.join(',') },
     ]
   },
+
+  // Thinking is forwarded on its own channel. Two things must hold, and the second
+  // is the one that matters: reasoning must never be folded into the answer text,
+  // because the fold is what a non-streaming client receives and what the relay
+  // measures its streamed-text accounting against.
+  async 'lane: thinking is forwarded, never folded into content' () {
+    const { stop, port } = await mockUpstream((res) => {
+      // Both field names the provider actually uses: reasoning_content (beam-free)
+      // and reasoning (nemotron-3.5-lightning-free).
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: 'pondering' } }] })}\n\n`)
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning: ' more' } }] })}\n\n`)
+      res.write(chatChunk('the answer'))
+      res.end('data: [DONE]\n\n')
+    })
+    process.env.ZEN_BASE = `https://127.0.0.1:${port}`
+    const { callUpstream } = await imp('lane.js')
+    const text = []
+    const think = []
+    const r = await callUpstream(
+      { model: 'big-pickle', messages: [{ role: 'user', content: 'x' }], stream: true },
+      { onDelta: (t) => text.push(t), onReasoning: (t) => think.push(t) })
+    stop()
+    return [
+      { name: 'both provider field names reach onReasoning', ok: think.join('') === 'pondering more', detail: JSON.stringify(think.join('')) },
+      { name: 'reasoning never reaches onDelta', ok: text.join('') === 'the answer', detail: JSON.stringify(text.join('')) },
+      { name: 'the folded completion is the answer only', ok: r.data?.choices?.[0]?.message?.content === 'the answer', detail: JSON.stringify(r.data?.choices?.[0]?.message?.content) },
+    ]
+  },
+
+  // #N the client-facing half: reasoning is written to the SSE stream as
+  // delta.reasoning_content, and must NOT be counted as delivered answer text --
+  // the finaliser uses that count to decide how much of the answer to send, so
+  // counting thinking there would leave the client with no answer at all.
+  async 'relay: thinking reaches the client without swallowing the answer' () {
+    const { B, post } = await bootRelay(18909, { LANE_STALE_MS: '60000' })
+    await post('/lane/register', { laneId: 'L1' })
+    const client = fetch(B + '/v1/chat/completions', {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    }).then((r) => r.text())
+    const c1 = await fetch(B + '/lane/claim?laneId=L1&wait=3000', { headers: H }).then((r) => r.json())
+    const d = await post('/lane/delta', { laneId: 'L1', entryId: c1.entryId, reasoning: 'thinking hard' })
+    await post('/lane/result', {
+      laneId: 'L1', entryId: c1.entryId,
+      result: { kind: 'ok', status: 200, ms: 5, data: { choices: [{ index: 0, message: { role: 'assistant', content: 'the answer' }, finish_reason: 'stop' }] } },
+    })
+    const out = await Promise.race([client, sleep(4000).then(() => '')])
+    const deltas = [...out.matchAll(/^data: (\{.*\})$/gm)].map((m) => JSON.parse(m[1])).map((j) => j.choices?.[0]?.delta || {})
+    const thinking = deltas.map((x) => x.reasoning_content || '').join('')
+    const answer = deltas.map((x) => x.content || '').join('')
+    return [
+      { name: 'the delta is accepted', ok: d.ok === true, detail: JSON.stringify(d) },
+      { name: 'the client receives the thinking as reasoning_content', ok: thinking === 'thinking hard', detail: JSON.stringify(thinking) },
+      { name: 'thinking is not delivered as answer content', ok: !answer.includes('thinking hard'), detail: JSON.stringify(answer) },
+      { name: 'the answer still arrives in full', ok: answer.replace(/[^\x20-\x7e]/g, '').trim() === 'the answer', detail: JSON.stringify(answer) },
+    ]
+  },
 }
 
 // A TLS mock standing in for the upstream gateway.

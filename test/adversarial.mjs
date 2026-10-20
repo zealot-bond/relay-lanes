@@ -272,7 +272,13 @@ group('a withdrawn model is refused clearly and cheaply')
   // client must be told the real reason and must not pay for six upstream calls.
   // Uses its own model: the quarantine is global and lasts an hour, so reusing
   // big-pickle here would hand every later test a 503.
-  const VICTIM = 'muse-spark-1.2-contributor-free'
+  //
+  // It must also still be IN THE CATALOGUE. This used muse-spark-1.2-contributor-free,
+  // which was removed from models.js when the provider withdrew it -- so the relay
+  // answered "unknown model" without calling upstream, nothing was quarantined, and
+  // three checks here failed for a reason that had nothing to do with `gone`. A test
+  // model that stops existing silently turns this group into a no-op.
+  const VICTIM = 'glm-5.3-flash-free'
   const r = await ask({ scenario: 'http_410_gone', model: VICTIM })
   check('the client is told the model was withdrawn', /withdrew|gone|no longer/i.test(r.err || ''), String(r.err))
   check('and the answer arrives promptly, without a retry storm', r.ms < 20000, r.ms + 'ms')

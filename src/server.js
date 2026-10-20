@@ -521,6 +521,10 @@ async function dispatch (entry) {
       try {
         result = await serveDirect(entry.job, {
           onDelta: stream && push ? (t) => { entry.streamedText = true; entry.streamedTextLen = (entry.streamedTextLen || 0) + t.length; push(t, null) } : undefined,
+          // Thinking is written straight through and deliberately NOT recorded as
+          // delivered text: it is not the answer, and marking it as such would make
+          // the finaliser believe the client already had content it never received.
+          onReasoning: stream && push ? (t) => { push('', null, t) } : undefined,
           onToolCall: () => { if (stream && push) entry.committed = true },
           onToolDelta: stream && push ? (d) => {
             entry.streamedTools = true
@@ -1000,11 +1004,16 @@ async function handleChat (req, res) {
   // Registered after push (which assigns the id) but before dispatch, so a fast
   // lane cannot have its first delta arrive with nowhere to go.
   if (stream) {
-    streamers.set(entry.id, (text, toolCalls) => {
+    streamers.set(entry.id, (text, toolCalls, reasoning) => {
       // Text and tool calls are separate delta shapes. An agent harness reads
       // delta.tool_calls and delta.tool_calls[].function to decide what to run, so
       // these must be emitted in the standard chat format, not folded into text.
       const delta = {}
+      // Thinking precedes the answer, so it is emitted first and on its own field.
+      // A client that renders `reasoning_content` shows progress during a long
+      // think instead of a blank screen; one that ignores it is unaffected.
+      // REASONING_STREAM=0 turns the forwarding off without a rebuild.
+      if (reasoning && String(config.REASONING_STREAM) !== '0') delta.reasoning_content = reasoning
       if (text) delta.content = text
       if (toolCalls && toolCalls.length) delta.tool_calls = toolCalls
       if (!Object.keys(delta).length) return
@@ -1441,7 +1450,8 @@ async function laneDelta (req, res) {
       }
     }
   }
-  writer(body.text ?? '', Array.isArray(body.toolCalls) ? body.toolCalls : null)
+  writer(body.text ?? '', Array.isArray(body.toolCalls) ? body.toolCalls : null,
+    typeof body.reasoning === 'string' ? body.reasoning : '')
   return json(res, 200, { ok: true })
 }
 

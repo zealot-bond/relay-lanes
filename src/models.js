@@ -161,25 +161,87 @@ const RESPONSES_MODELS = new Set([
 // `input[N] did not match any supported type` at request time rather than as a
 // clear failure here.
 //
+// FULL SWEEP -- 2026-10-20. All 43 free ids in the provider's own catalogue, probed
+// directly through the lane's request construction (no relay in the path), so this is
+// what each model actually does today. 12 work; 31 do not.
+//
+//   WORK (12): cat-jam, beam, exo, deepseek-v4.1-flash, minimax-m3.1-flash,
+//              nemotron-3-ultra, nemotron-3.5-super-vl, mimo-v2.6-flash, big-pickle,
+//              glm-5.3-flash, nemotron-3.5-lightning, longcat-2.5-preview
+//
+//   HTTP 410 ModelDeprecated -- withdrawn upstream:
+//     fledge-alpha-free, ll-alpha-free, mimo-v2.5-free ("Use mimo-v2.6-flash-free
+//     instead"), muse-spark-1.2-contributor-free, muse-spark-1.3-contributor-free,
+//     space-bunny-free ("Use minimax-m3.1-flash-free instead")
+//     Both muse-spark models are now gone, so the responses dialect has no live model.
+//     RESPONSES_MODELS stays: the converter is still exercised by the tests.
+//
+//   HTTP 400 "Model is unavailable" -- unchanged from the 2026-10-17 sweep:
+//     glm-4.7-free, glm-5-free, hy3-free, hy3-preview-free, kimi-k2.5-free,
+//     laguna-s-2.1-free, ling-2.6-flash-free, ling-3.0-flash-fin-free,
+//     ling-3.0-flash-free, ling-3.0-tiny-free, ling-3.1-flash-free, longcat-2.0-free,
+//     mimo-v2-flash-free, mimo-v2-omni-free, mimo-v2-pro-free, minimax-m2.1-free,
+//     minimax-m2.5-free, minimax-m3-free, nemotron-3-super-free, north-mini-code-free,
+//     qwen3.6-plus-free, ring-2.6-1t-free, step-5-preview-free,
+//     trinity-large-preview-free, x-preview-f-free, deepseek-v4-flash-free
+//
+// Three were ADDED on this sweep, and each was then run 5x plain + 5x with tools:
+//
+//   minimax-m3.1-flash-free  5/5   5/5   2.4s   NEW -- space-bunny-free's replacement
+//   nemotron-3-ultra-free    5/5   5/5   2.5s   RESTORED -- 1/5 empty answers on 10-17
+//   glm-5.3-flash-free       5/5   5/5   8.5s   RESTORED -- cut on 10-17 at 2/5
+//
+// glm is why this ledger keeps saying "re-probe": the evidence for cutting it was real
+// (three HTTP 429 "Endpoint is unavailable" in one window, then 0/5 either side of it) and
+// it now answers 10/10. A model cut for an OUTAGE is not a model that is gone.
+//
+// TOOL ARGUMENT SHAPE -- measured the same day, and this one bites a harness:
+//   big-pickle returned bash {"command":"ls -la /tmp"} with NO `description` on one probe
+//   and included it on the next. It is INCONSISTENT, not reliably broken (muse-spark-1.3
+//   was reliably missing it, which is what made that one diagnosable). A harness that
+//   marks `description` required will reject whichever calls omit it.
+//   glm-5.3-flash, minimax-m3.1-flash and nemotron-3-ultra included it 5/5 in the same
+//   sweep, so they are the safer choice for a strict harness.
+//
 // contextWindow is unverified for every entry -- the gateway's listing carries no
 // metadata, and big-pickle has been observed serving 852k tokens despite the
 // 200000 declared here. Treat it as a floor, not a limit.
 export const MODELS = [
-  // Every entry verified on 2026-10-17 with repeated runs, not a single probe:
-  // 4-5/4-5 answered each. See the removal ledger above for what was cut and why.
-  { id: 'big-pickle', contextWindow: 200000 },
-  { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
-  { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
-  { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
+  // Ordered by MEASURED latency, fastest first, on 2026-10-20 (median of 5 runs of a
+  // ~60-word prompt, warm connection, from the same egress). A client that takes
+  // data[0] as its default should get a fast, reliable model and not a 16-second one.
+  //
+  //   model                             plain    tools    median
+  //   cat-jam-free                      5/5      5/5      2.3s
+  //   beam-free                         5/5      5/5      2.3s
+  //   exo-free                          3/3      3/3      2.4s
+  //   deepseek-v4.1-flash-free          3/3      3/3      2.4s
+  //   minimax-m3.1-flash-free           5/5      5/5      2.4s
+  //   nemotron-3-ultra-free             5/5      5/5      2.5s
+  //   nemotron-3.5-super-vl-free        3/3      1/1      3.6s   (one 500 before that)
+  //   mimo-v2.6-flash-free              3/3      3/3      5.5s
+  //   big-pickle                        3/3      3/3      7.7s
+  //   glm-5.3-flash-free                5/5      5/5      8.5s
+  //   nemotron-3.5-lightning-free       3/3      3/3      9-23s
+  //   longcat-2.5-preview-free          3/3      3/3      15-16s
+  //
+  // The two at the bottom WORK -- they are not broken, they are slow, and the spread is
+  // theirs, not the relay's. Latency through the lane pool measured 0.3-0.7s above a
+  // direct call for the same model, so a 16-second answer is the model thinking, not the
+  // architecture. They stay because a working model is not deleted for being slow; pick
+  // one of the first six unless you need what they do.
   { id: 'cat-jam-free', contextWindow: 200000 },
-  { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
   { id: 'beam-free', contextWindow: 200000 },
-  // exo-free RESTORED. Removed on 2026-10-07 for 410 ModelDeprecated; answered 5/5 on
-  // 2026-10-17. And ll-alpha-free was withdrawn the same way within hours of working -- so a
-  // withdrawal here is not permanent, and deleting on one observation throws away a model
-  // that is still serving. Re-probe before re-adding.
   { id: 'exo-free', contextWindow: 200000 },
+  { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
+  { id: 'minimax-m3.1-flash-free', contextWindow: 200000 },
+  { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
   { id: 'nemotron-3.5-super-vl-free', contextWindow: 200000 },
+  { id: 'mimo-v2.6-flash-free', contextWindow: 200000 },
+  { id: 'big-pickle', contextWindow: 200000 },
+  { id: 'glm-5.3-flash-free', contextWindow: 200000 },
+  { id: 'nemotron-3.5-lightning-free', contextWindow: 200000 },
+  { id: 'longcat-2.5-preview-free', contextWindow: 200000 },
 ]
 
 export function protocolFor (modelId) {

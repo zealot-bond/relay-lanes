@@ -56,15 +56,23 @@ function release () {
  * `onDelta` / `onToolDelta` receive already-merged fragments, so the caller writes them
  * straight to the client exactly as it does for /lane/delta.
  */
-export async function serveDirect (job, { onDelta, onToolCall, onToolDelta } = {}) {
+export async function serveDirect (job, { onDelta, onToolCall, onToolDelta, onReasoning } = {}) {
   await acquire()
   let pendingText = []
   let pendingTools = []
+  // Thinking is kept separate from text for the same reason as on a lane: it is
+  // not the answer, and the caller measures delivery of the answer in characters.
+  let pendingReasoning = []
   let timer = null
   let stopped = false
 
   const flush = () => {
     timer = null
+    if (pendingReasoning.length) {
+      const thought = pendingReasoning.join('')
+      pendingReasoning = []
+      onReasoning?.(thought)
+    }
     if (pendingText.length) {
       const text = pendingText.join('')
       pendingText = []
@@ -91,6 +99,7 @@ export async function serveDirect (job, { onDelta, onToolCall, onToolDelta } = {
   try {
     result = await callUpstream(job, {
       onDelta: job.stream ? (t) => { pendingText.push(t); schedule() } : undefined,
+      onReasoning: job.stream ? (t) => { pendingReasoning.push(t); schedule() } : undefined,
       onToolCall: () => {
         // Withhold pre-tool text the client has not seen yet, so it is not shown
         // "I'll read that file" and then given nothing to run. Same rule as the lane.
@@ -110,6 +119,7 @@ export async function serveDirect (job, { onDelta, onToolCall, onToolDelta } = {
   }
   // Last flush: anything still batched is part of the answer.
   if (job.stream) {
+    if (pendingReasoning.length) { onReasoning?.(pendingReasoning.join('')); pendingReasoning = [] }
     if (pendingText.length) { onDelta?.(pendingText.join('')); pendingText = [] }
     if (pendingTools.length) { onToolDelta?.(mergeToolDeltas(pendingTools, toolAcc)); pendingTools = [] }
   }
