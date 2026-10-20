@@ -26,6 +26,10 @@ on:
         description: 'Shared token for the relay lane endpoints'
         required: false
         default: ''
+      lane_lifetime_s:
+        description: 'Override the lane lifetime, for testing self-replenishment'
+        required: false
+        default: ''
   schedule:
     - cron: '*/15 * * * *'
 
@@ -67,7 +71,7 @@ jobs:
           RELAY_URL: ${{ inputs.relay_url || secrets.RELAY_URL }}
           RELAY_TOKEN: ${{ inputs.relay_token || secrets.RELAY_TOKEN }}
           LANE_ID: lane-${{ github.run_id }}-${{ github.run_attempt }}
-          LANE_LIFETIME_S: '3300'
+          LANE_LIFETIME_S: ${{ inputs.lane_lifetime_s || '3300' }}
           LANE_IDLE_EXIT_S: '2400'
           # Split by phase: prefill on a large prompt is slow but healthy,
           # so allow a long wait for the first byte, then tighten once
