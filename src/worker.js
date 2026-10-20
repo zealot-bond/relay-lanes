@@ -257,16 +257,84 @@ busyHeartbeat.unref?.()
       // runner, which gets a fresh bucket.
       console.log(`[lane] bucket exhausted after ${served} served; retiring this lane`)
       console.log(`[lane] totals served=${served} limited=${limited} timeouts=${timeouts} empty=${empty} failed=${failed}`)
+      await replenishPool('bucket exhausted')
       destroyKeepalive()
       process.exit(75)   // distinctive: burned IP, not a crash
     }
   }
 
   console.log(`[lane] lifetime done served=${served} limited=${limited} timeouts=${timeouts} empty=${empty} failed=${failed}`)
+  await replenishPool('lifetime done')
   destroyKeepalive()
   process.exit(0)
 }
 
+// --- keep the runner pool topped up from the LANE side ----------------------
+//
+// The relay's orchestrator is what should refill the pool, but it lives in the JAR
+// and cannot be changed without a jar rebuild. A lane, however, is exactly the thing
+// that disappears and needs replacing: when its bucket is spent it exits (75) and the
+// pool is one runner short. Left alone the pool only ever shrinks.
+//
+// Two rules keep this from becoming a CI-minute fire:
+//
+//   * AT MOST ONE replacement per lane, ever. If 20 lanes die together that is 20
+//     replacements, which is exactly the shortfall. Letting each lane dispatch
+//     "however many are missing" would turn one mass failure into hundreds of runs.
+//   * Ask GitHub, not the relay. GitHub's in-flight run count is the ground truth
+//     for the 20-concurrent limit; the relay's lane registry keeps a lane for
+//     LANE_STALE_MS after it has exited, so it under-reports the shortfall.
+//
+// The jitter is not decoration: lanes that exit together would otherwise all query
+// GitHub before any of their dispatches are visible, and each would see the same
+// shortfall.
+const REPLENISH_TARGET = Number(config.LANES_TARGET || 20)
+let replenishTried = false
+
+async function replenishPool (why) {
+  if (replenishTried) return
+  replenishTried = true
+  const token = config.GH_TOKEN
+  const repo = config.GH_REPO
+  if (!token || !repo) return
+  const gh = (p) => `https://api.github.com${p}`
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'relay-lane',
+  }
+  const workflow = config.GH_WORKFLOW || 'lane.yml'
+  const liveRuns = async () => {
+    const r = await fetch(gh(`/repos/${repo}/actions/workflows/${workflow}/runs?status=in_progress&per_page=100`), { headers })
+    const j = await r.json()
+    return Array.isArray(j.workflow_runs) ? j.workflow_runs.length : null
+  }
+  try {
+    const live = await liveRuns()
+    if (live === null) return
+    if (live >= REPLENISH_TARGET) {
+      console.log(`[lane] pool is at ${live}/${REPLENISH_TARGET}; no replacement needed`)
+      return
+    }
+    await new Promise((r) => setTimeout(r, 3000 + Math.floor(Math.random() * 7000)))
+    const live2 = (await liveRuns()) ?? live
+    if (live2 >= REPLENISH_TARGET) {
+      console.log(`[lane] pool recovered to ${live2}; no replacement needed`)
+      return
+    }
+    const d = await fetch(gh(`/repos/${repo}/actions/workflows/${workflow}/dispatches`), {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ref: config.GH_REF || 'main',
+        inputs: { relay_url: RELAY, relay_token: TOKEN },
+      }),
+    })
+    console.log(`[lane] dispatched a replacement run (${why}); pool was ${live2}/${REPLENISH_TARGET}, dispatch status ${d.status}`)
+  } catch (e) {
+    console.error(`[lane] could not replenish the pool: ${e?.message || e}`)
+  }
+}
 main().catch((e) => {
   console.error('[lane] fatal:', e?.stack || e)
   process.exit(1)
