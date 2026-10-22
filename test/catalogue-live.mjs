@@ -1,12 +1,13 @@
-// The live catalogue, against a local stand-in for the gateway's /v1/models. No network.
+// The live catalogue, against a local stand-in for the gateway's /v1/models. The ping is
+// injected, so no test ever spends quota on the real upstream. No network.
 //
 //   node test/catalogue-live.mjs
 import http from 'node:http'
 
-let next = { status: 200, body: '' }
+let listing = { status: 200, body: '' }
 const gateway = http.createServer((req, res) => {
-  res.writeHead(next.status, { 'content-type': 'application/json' })
-  res.end(next.body)
+  res.writeHead(listing.status, { 'content-type': 'application/json' })
+  res.end(listing.body)
 })
 await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
 process.env.CATALOGUE_URL = `http://127.0.0.1:${gateway.address().port}/v1/models`
@@ -17,60 +18,96 @@ const check = (name, ok, detail = '') => {
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' -- ' + detail : ''}`)
   if (!ok) failures++
 }
-const listing = (ids) => JSON.stringify({ object: 'list', data: ids.map((id) => ({ id, object: 'model' })) })
-const ids = (n) => Array.from({ length: n }, (_, i) => `alpha-${String(i + 1).padStart(3, '0')}`)
+const list = (ids) => { listing = { status: 200, body: JSON.stringify({ object: 'list', data: ids.map((id) => ({ id, object: 'model' })) }) } }
+const ids = (from, to, prefix = 'alpha') => Array.from({ length: to - from + 1 }, (_, i) => `${prefix}-${String(from + i).padStart(3, '0')}`)
+const num = (id) => Number(id.slice(id.lastIndexOf('-') + 1))
+
+// alpha-001..100 answer; 101..120 are paid (refuse this relay); 121..150 are withdrawn.
+let verdict = (id) => {
+  const n = num(id)
+  if (n <= 100) return 'ok'
+  if (n <= 120) return 'provider_error'
+  return 'gone'
+}
+const ping = async (id) => verdict(id)
 
 console.log('1. before the first load, the seed is served')
 check('seed is the source', cat.status().source === 'seed')
 check('a seed model is known', cat.find('big-pickle') !== null)
 
-console.log('2. the gateway list is passed through whole, with no cap')
-next = { status: 200, body: listing(ids(150)) }
-let r = await cat.refresh()
+console.log('2. only models that answer a ping are listed')
+list(ids(1, 150))
+let r = await cat.refresh({ ping })
 check('refresh succeeds', r.ok === true)
-check('all 150 are served', cat.count() === 150, `count=${cat.count()}`)
+check('the 100 that answered are served', cat.count() === 100, `count=${cat.count()}`)
+check('paid models (refused) are not served', cat.find('alpha-101') === null && cat.find('alpha-120') === null)
+check('withdrawn models are not served', cat.find('alpha-121') === null)
 check('the seed is replaced once the gateway has answered', cat.find('big-pickle') === null)
 const p = cat.payload('test')
-check('every id is github/-prefixed', p.data.length === 150 && p.data.every((m) => m.id.startsWith('github/')))
+check('every id is github/-prefixed', p.data.every((m) => m.id.startsWith('github/')))
 check('lookup accepts the prefixed and the bare id',
   cat.find('github/alpha-001')?.id === 'alpha-001' && cat.find('alpha-001')?.id === 'alpha-001')
+check('the ping tally is reported', cat.status().lastPing?.answering === 100 && cat.status().lastPing?.tested === 150,
+  JSON.stringify(cat.status().lastPing?.byKind))
 
 console.log('3. a model the gateway drops is removed, and the change is reported')
-next = { status: 200, body: listing(ids(150).filter((id) => id !== 'alpha-007')) }
-r = await cat.refresh()
-check('alpha-007 is no longer served', cat.find('alpha-007') === null)
-check('the removal is reported', r.removed.join() === 'alpha-007' && r.added.length === 0)
+list([...ids(1, 150).filter((id) => id !== 'alpha-050')])
+r = await cat.refresh({ ping })
+check('alpha-050 is no longer served', cat.find('alpha-050') === null)
+check('the removal is reported', r.removed.join() === 'alpha-050' && r.added.length === 0)
+check('the count follows', cat.count() === 99)
 
-console.log('4. a model the gateway adds appears on the next refresh')
-next = { status: 200, body: listing([...ids(150).filter((id) => id !== 'alpha-007'), 'gamma-new']) }
-r = await cat.refresh()
+console.log('4. a model the gateway adds is listed once it answers a ping')
+list([...ids(1, 150).filter((id) => id !== 'alpha-050'), 'gamma-new'])
+verdict = (id) => (id === 'gamma-new' ? 'ok' : (num(id) <= 100 ? 'ok' : num(id) <= 120 ? 'provider_error' : 'gone'))
+r = await cat.refresh({ ping })
 check('gamma-new is served', cat.find('gamma-new') !== null)
-check('the addition is reported', r.added.join() === 'gamma-new' && r.removed.length === 0)
+check('the addition is reported', r.added.join() === 'gamma-new')
+check('the count follows', cat.count() === 100)
 
-console.log('5. a failed refresh keeps the last good list')
-const before = cat.count()
-next = { status: 500, body: 'upstream down' }
-r = await cat.refresh()
+console.log('5. a rate-limited ping does not evict a model that was listed')
+verdict = (id) => (id === 'alpha-010' ? 'limited' : id === 'delta-new' ? 'limited' : (num(id) <= 100 || id === 'gamma-new' ? 'ok' : 'provider_error'))
+list([...ids(1, 100), 'gamma-new', 'delta-new'])
+r = await cat.refresh({ ping })
+check('the refresh succeeds (2 of 102 limited is not a quota problem)', r.ok === true)
+check('alpha-010 stays listed', cat.find('alpha-010') !== null)
+check('a new model that was only rate-limited is not added', cat.find('delta-new') === null)
+
+console.log('6. a refresh where most pings are rate-limited keeps the last good list')
+verdict = () => 'limited'
+const before6 = cat.count()
+r = await cat.refresh({ ping })
 check('the refresh reports failure', r.ok === false)
-check('the list is unchanged', cat.count() === before && cat.find('gamma-new') !== null)
-check('the error is visible in status', cat.status().lastError === 'HTTP 500', String(cat.status().lastError))
+check('the list is unchanged', cat.count() === before6)
+check('the reason is visible', /rate-limited/.test(cat.status().lastError || ''), String(cat.status().lastError))
 
-console.log('6. an empty or unusable answer keeps the last good list')
-for (const [name, body] of [
-  ['empty data array', JSON.stringify({ object: 'list', data: [] })],
-  ['not JSON', '<html>blocked</html>'],
-  ['no data field', JSON.stringify({ models: [] })],
+console.log('7. a refresh where nothing answers keeps the last good list')
+verdict = () => 'gone'
+r = await cat.refresh({ ping })
+check('the refresh reports failure', r.ok === false)
+check('the list is unchanged', cat.count() === before6)
+check('the reason is visible', /none of .* answered a ping/.test(cat.status().lastError || ''))
+
+console.log('8. a failed gateway fetch keeps the last good list')
+verdict = (id) => (num(id) <= 100 ? 'ok' : 'gone')
+for (const [name, l] of [
+  ['HTTP 500', { status: 500, body: 'upstream down' }],
+  ['empty data array', { status: 200, body: JSON.stringify({ object: 'list', data: [] }) }],
+  ['not JSON', { status: 200, body: '<html>blocked</html>' }],
+  ['no data field', { status: 200, body: JSON.stringify({ models: [] }) }],
 ]) {
-  next = { status: 200, body }
+  listing = l
   const b = cat.count()
-  const rr = await cat.refresh()
+  const rr = await cat.refresh({ ping })
   check(`${name}: refused, list kept`, rr.ok === false && cat.count() === b, `count=${cat.count()}`)
 }
 
-console.log('7. the catalogue recovers when the gateway does')
-next = { status: 200, body: listing(ids(150)) }
-r = await cat.refresh()
+console.log('9. the catalogue recovers when everything is healthy again')
+list(ids(1, 150))
+verdict = (id) => (num(id) <= 100 ? 'ok' : num(id) <= 120 ? 'provider_error' : 'gone')
+r = await cat.refresh({ ping })
 check('recovers and clears the error', r.ok === true && cat.status().lastError === null)
+check('the count is back to the answering set', cat.count() === 100)
 
 gateway.close()
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CATALOGUE CHECKS PASSED')
