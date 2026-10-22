@@ -1,0 +1,26 @@
+name: effort-probe
+
+# Manual diagnostic. Asks the gateway which reasoning_effort values each model accepts,
+# and what each one costs, from a runner's own egress IP. Changes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'space-separated model ids'
+        required: true
+        default: 'beam-free big-pickle deepseek-v4.1-flash-free glm-5.3-flash-free'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe reasoning efforts
+        env:
+          MODELS: ${{ inputs.models }}
+        run: node scripts/effort-probe.mjs $MODELS
