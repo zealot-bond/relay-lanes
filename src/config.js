@@ -102,6 +102,9 @@ export const config = {
   GH_REF: str('GH_REF', 'main'),
   LANES_TARGET: num('LANES_TARGET', 20),
   RELAY_PUBLIC_URL: str('RELAY_PUBLIC_URL', ''),
+  // The model list is the gateway's own, refreshed this often. Empty URL = <zenBase>/v1/models.
+  CATALOGUE_REFRESH_S: num('CATALOGUE_REFRESH_S', 3600),
+  CATALOGUE_URL: str('CATALOGUE_URL', ''),
   ORCH_TICK_MS: num('ORCH_TICK_MS', 20000),
   // Everything below is read by a module that used to fall back to its own
   // `process.env.X || default` at import time. Because ES imports are hoisted,

@@ -17,7 +17,8 @@
 
 import http from 'node:http'
 import { WorkQueue, LaneRegistry } from './queue.js'
-import { listModelsPayload, findModel, splitModelId, PROVIDER, MODELS } from './models.js'
+import { splitModelId, PROVIDER } from './models.js'
+import * as catalogue from './catalogue.js'
 import { config } from './config.js'
 import { CODE_VERSION } from './codeversion.js'
 import { directEnabled, directStats, serveDirect } from './direct.js'
@@ -832,10 +833,10 @@ async function handleChat (req, res) {
   } = payload || {}
 
   const { model } = splitModelId(rawModel || '')
-  if (!findModel(model)) {
+  if (!catalogue.find(model)) {
     return json(res, 404, {
       error: {
-        message: `unknown model: ${rawModel}. Available: ${MODELS.map((m) => PROVIDER + '/' + m.id).join(', ')}`,
+        message: `unknown model: ${rawModel}. GET /v1/models lists the models this relay serves.`,
         type: 'invalid_request_error',
       },
     })
@@ -1473,7 +1474,8 @@ export function createServer () {
 
       if (path === '/' || path === '/health' || path === '/healthz') {
         return json(res, 200, {
-          ok: true, provider: PROVIDER, models: MODELS.length,
+          ok: true, provider: PROVIDER, models: catalogue.count(),
+          catalogue: catalogue.status(),
           build: `${config.BUILD_ID} (${config.BUILD_BUILT})`,
           laneCode: laneCodeStats(),
           direct: directStats(),
@@ -1508,11 +1510,11 @@ export function createServer () {
       if (method === 'POST' && path === '/lane/delta') return laneDelta(req, res)
 
       if (method === 'GET' && (path === '/v1/models' || path === '/models')) {
-        return json(res, 200, listModelsPayload(`${config.BUILD_ID} (${config.BUILD_BUILT})`))
+        return json(res, 200, catalogue.payload(`${config.BUILD_ID} (${config.BUILD_BUILT})`))
       }
       const m = path.match(/^\/v1\/models\/(.+)$/)
       if (method === 'GET' && m) {
-        const found = findModel(decodeURIComponent(m[1]))
+        const found = catalogue.find(decodeURIComponent(m[1]))
         if (!found) return json(res, 404, { error: { message: 'unknown model' } })
         return json(res, 200, {
           id: `${PROVIDER}/${found.id}`, object: 'model', created: 0,
@@ -1534,10 +1536,11 @@ export function createServer () {
 
 export function start () {
   const server = createServer()
+  catalogue.start()
   server.listen(PORT, HOST, () => {
     console.log(`[relay] build ${config.BUILD_ID} built ${config.BUILD_BUILT}`)
     console.log(`[relay] listening on http://${HOST}:${PORT}`)
-    console.log(`[relay] client API: /v1/models, /v1/chat/completions  (models: ${MODELS.length})`)
+    console.log(`[relay] client API: /v1/models, /v1/chat/completions  (models: ${catalogue.count()} seed until the gateway list loads)`)
     console.log(`[relay] dashboard:  /dashboard`)
     console.log(`[relay] max lanes ${MAX_LANES}, retry limit ${RETRY_LIMIT}, max hold ${MAX_HOLD_MS}ms`)
   })
