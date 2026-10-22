@@ -145,6 +145,24 @@ const body = (extra) => buildForTest({ model: 'big-pickle', messages: [{ role: '
 check('an explicit effort is sent upstream', body({ reasoningEffort: 'low' }).reasoning_effort === 'low')
 check('no effort is sent when none is set, so the request is unchanged', body({}).reasoning_effort === undefined)
 
+console.log('12. an effort probe that is rate-limited is retried, not read as a refusal')
+const attempts = new Map()
+const flakyPing = async (id, effort) => {
+  if (id !== 'flaky-new') return verdict(id, effort)
+  if (effort === null) return 'ok'
+  const n = (attempts.get(effort) || 0) + 1
+  attempts.set(effort, n)
+  if (effort !== 'low') return 'provider_error'
+  return n === 1 ? 'limited' : 'ok'
+}
+list([...ids(1, 100), 'flaky-new'])
+r = await cat.refresh({ ping: flakyPing, retryMs: 10 })
+check('flaky-new is listed with the effort that succeeded on retry',
+  JSON.stringify(cat.find('flaky-new')?.efforts) === '["low"]')
+check('the retry is counted', cat.status().lastPing?.efforts?.retried === 1, JSON.stringify(cat.status().lastPing?.efforts))
+check('the outcome of every effort probe is reported by kind',
+  cat.status().lastPing?.efforts?.byKind?.ok > 0 && cat.status().lastPing?.efforts?.byKind?.limited === undefined)
+
 gateway.close()
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CATALOGUE CHECKS PASSED')
 process.exit(failures ? 1 : 0)

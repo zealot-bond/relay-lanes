@@ -35,6 +35,7 @@ const DEFAULT_CONTEXT = 200000
 const PING_CONCURRENCY = 6
 const PING_TIMEOUT_MS = 60000
 const RETRY_MS = 60000
+const EFFORT_RETRY_MS = 30000
 const PING_PROMPT = 'Reply with the single word: pong'
 
 const seedContext = new Map(SEED.map((m) => [m.id, m.contextWindow]))
@@ -163,7 +164,7 @@ async function pool (items, fn) {
  * replace the catalogue with the result. Returns { ok, count, added, removed }. On failure the
  * previous list is kept.
  */
-export async function refresh ({ ping = defaultPing } = {}) {
+export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS } = {}) {
   state.refreshes++
   state.lastRefreshAt = new Date().toISOString()
   const fail = (message) => {
@@ -205,7 +206,16 @@ export async function refresh ({ ping = defaultPing } = {}) {
   // the efforts it had.
   const probes = answering.flatMap((id) => EFFORT_ORDER.map((effort) => ({ key: `${id}|${effort}`, id, effort })))
   const effortKinds = await pool(probes, ({ id, effort }) => ping(id, effort))
-  const effortTally = { probed: probes.length, accepted: 0 }
+  // A probe that was rate-limited or failed says nothing about the effort. It is retried once
+  // after a pause, and counted, rather than being read as "this model refuses that effort".
+  const unsure = probes.filter((p) => ['limited', 'throw', 'timeout'].includes(effortKinds.get(p.key)))
+  if (unsure.length) {
+    await new Promise((resolve) => setTimeout(resolve, retryMs))
+    for (const [key, kind] of await pool(unsure, ({ id, effort }) => ping(id, effort))) effortKinds.set(key, kind)
+  }
+  const effortByKind = {}
+  for (const kind of effortKinds.values()) effortByKind[kind] = (effortByKind[kind] || 0) + 1
+  const effortTally = { probed: probes.length, retried: unsure.length, accepted: 0, byKind: effortByKind }
 
   const next = new Map()
   for (const id of [...answering, ...kept]) {
