@@ -499,7 +499,7 @@ function toResponsesTools (tools) {
   return tools.filter(usableTool).map(toResponsesTool)
 }
 
-function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls }) {
+function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls, reasoningEffort }) {
   const protocol = protocolFor(model)
 
   // Client tool specs are normalised into the target dialect's shape and unioned
@@ -590,6 +590,9 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
   if (parallelToolCalls !== undefined) body.parallel_tool_calls = parallelToolCalls
   if (temperature !== undefined) body.temperature = temperature
   if (topP !== undefined) body.top_p = topP
+  // The gateway accepts this per model and rejects the rest with 400 unsupported_value, so the
+  // catalogue measures the set. Sent only when set, so a request without one is unchanged.
+  if (reasoningEffort) body.reasoning_effort = reasoningEffort
   return body
 }
 
@@ -607,7 +610,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
 async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta, onReasoning } = {}) {
   const { model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls } = job || {}
   const protocol = protocolFor(model)
-  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls }))
+  const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls, reasoningEffort: job.reasoningEffort }))
   const url = new URL(zenBase() + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
 
   const started = Date.now()

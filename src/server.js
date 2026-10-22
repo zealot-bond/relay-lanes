@@ -830,10 +830,12 @@ async function handleChat (req, res) {
   const {
     model: rawModel, messages, system, max_tokens: maxTokens, max_completion_tokens: maxCompletion,
     temperature, top_p: topP, stream, tools, tool_choice: toolChoice, parallel_tool_calls: parallelToolCalls,
+    reasoning_effort: clientEffort,
   } = payload || {}
 
-  const { model } = splitModelId(rawModel || '')
-  if (!catalogue.find(model)) {
+  const resolved = catalogue.resolve(rawModel || '')
+  const model = resolved?.id
+  if (!resolved) {
     return json(res, 404, {
       error: {
         message: `unknown model: ${rawModel}. GET /v1/models lists the models this relay serves.`,
@@ -869,6 +871,12 @@ async function handleChat (req, res) {
       toolChoice,
       parallelToolCalls,
       maxTokens: maxCompletion || maxTokens,
+      // A variant id (github/x:high) wins, then the client's own reasoning_effort if this model
+      // accepts it, then the model's measured default. A client effort the model rejects falls back
+      // to the default rather than failing, so a harness that always sends one value still works.
+      reasoningEffort: resolved.effort ||
+        (typeof clientEffort === 'string' && resolved.entry.efforts.includes(clientEffort) ? clientEffort : undefined) ||
+        resolved.entry.defaultEffort || undefined,
       temperature,
       topP,
       stream: Boolean(stream),
