@@ -1,0 +1,83 @@
+name: relay
+
+# The relay itself, running on a GitHub runner behind a named Cloudflare Tunnel.
+#
+# One job is one relay generation. It serves for RUN_FOR_S (3h50m), dispatches the next
+# generation HANDOVER_LEAD_S before it ends, and exits. The concurrency group means that
+# successor starts only after this job has finished, so two relays never hold the tunnel.
+#
+# The lanes are lane.yml, topped up by this relay's orchestrator to LANES_TARGET (19).
+# 19 lanes + 1 relay = 20, the concurrent-job limit of a free account.
+#
+# Repository configuration, never committed:
+#   secret CF_TUNNEL_TOKEN   token of the existing tunnel "latency-api". Its ingress already
+#                            sends api.latency.cyou to http://127.0.0.1:25072, which is PORT.
+#   secret RELAY_TOKEN       shared lane token, at least 16 characters
+#   var    RELAY_PUBLIC_URL  https://api.latency.cyou
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   # Safety net for an early death (runner preempted, crash). Enable it once a manual
+  #   # generation has been verified end to end.
+  #   - cron: '*/10 * * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    name: relay-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PORT: '25072'
+      HOST: '127.0.0.1'
+      LANES_ENABLED: '1'
+      DIRECT_MODE: '0'
+      LANES_TARGET: '19'
+      GH_REPO: ${{ github.repository }}
+      GH_WORKFLOW: lane.yml
+      GH_REF: main
+      RUN_FOR_S: '13800'
+      HANDOVER_LEAD_S: '180'
+      CLOUDFLARED_VERSION: '2026.10.3'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without its permanent address and tokens
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          RELAY_PUBLIC_URL: ${{ vars.RELAY_PUBLIC_URL }}
+        run: |
+          status=0
+          [ -n "$CF_TUNNEL_TOKEN" ] || { echo "::error::secret CF_TUNNEL_TOKEN is not set"; status=1; }
+          [ "${#RELAY_TOKEN}" -ge 16 ] || { echo "::error::secret RELAY_TOKEN must be at least 16 characters"; status=1; }
+          case "$RELAY_PUBLIC_URL" in
+            https://*) ;;
+            *) echo "::error::variable RELAY_PUBLIC_URL must be an https:// URL"; status=1 ;;
+          esac
+          exit $status
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: Serve this generation
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          RELAY_PUBLIC_URL: ${{ vars.RELAY_PUBLIC_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_WORKFLOW: relay.yml
+        run: |
+          TUNNEL_CMD="$RUNNER_TEMP/cloudflared tunnel --no-autoupdate run" bash scripts/relay-supervisor.sh

@@ -30,8 +30,8 @@ on:
         description: 'Override the lane lifetime, for testing self-replenishment'
         required: false
         default: ''
-  schedule:
-    - cron: '*/15 * * * *'
+  # No schedule. Lanes are supplied by the relay's orchestrator (relay.yml). A schedule here
+  # would add runs that nothing dispatches to and that register with whatever RELAY_URL holds.
 
 permissions:
   contents: read
