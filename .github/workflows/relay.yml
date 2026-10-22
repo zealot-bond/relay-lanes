@@ -10,17 +10,18 @@ name: relay
 # 19 lanes + 1 relay = 20, the concurrent-job limit of a free account.
 #
 # Repository configuration, never committed:
-#   secret CF_TUNNEL_TOKEN   token of the existing tunnel "latency-api". Its ingress already
-#                            sends api.latency.cyou to http://127.0.0.1:25072, which is PORT.
+#   secret CF_TUNNEL_TOKEN   token of the tunnel "latency-api". Its ingress sends
+#                            free.latency.cyou to http://127.0.0.1:25072, which is PORT.
 #   secret RELAY_TOKEN       shared lane token, at least 16 characters
-#   var    RELAY_PUBLIC_URL  https://api.latency.cyou
+#   var    RELAY_PUBLIC_URL  https://free.latency.cyou
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   # Safety net for an early death (runner preempted, crash). Enable it once a manual
-  #   # generation has been verified end to end.
-  #   - cron: '*/10 * * * *'
+  schedule:
+    # Restarts the relay after an early death (runner preempted, crash) and starts it from
+    # nothing. While a generation is healthy, a scheduled run queues behind it and becomes
+    # its successor.
+    - cron: '*/10 * * * *'
 
 permissions:
   actions: write

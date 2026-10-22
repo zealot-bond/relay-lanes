@@ -214,7 +214,6 @@ export const MODELS = [
   //   model                             plain    tools    median
   //   cat-jam-free                      5/5      5/5      2.3s
   //   beam-free                         5/5      5/5      2.3s
-  //   exo-free                          3/3      3/3      2.4s
   //   deepseek-v4.1-flash-free          3/3      3/3      2.4s
   //   minimax-m3.1-flash-free           5/5      5/5      2.4s
   //   nemotron-3-ultra-free             5/5      5/5      2.5s
@@ -230,9 +229,12 @@ export const MODELS = [
   // direct call for the same model, so a 16-second answer is the model thinking, not the
   // architecture. They stay because a working model is not deleted for being slow; pick
   // one of the first six unless you need what they do.
+  //
+  // exo-free was REMOVED on 2026-10-22. It had answered 3/3 on 10-20, then the provider
+  // withdrew it: three consecutive attempts through the public relay returned 410/404, and
+  // the relay quarantined it. A withdrawn model is cut; an outage is not (see glm-5.3 above).
   { id: 'cat-jam-free', contextWindow: 200000 },
   { id: 'beam-free', contextWindow: 200000 },
-  { id: 'exo-free', contextWindow: 200000 },
   { id: 'deepseek-v4.1-flash-free', contextWindow: 200000 },
   { id: 'minimax-m3.1-flash-free', contextWindow: 200000 },
   { id: 'nemotron-3-ultra-free', contextWindow: 200000 },
