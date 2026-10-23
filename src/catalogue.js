@@ -32,13 +32,35 @@ import { MODELS as SEED, PROVIDER, splitModelId } from './models.js'
 export const EFFORT_ORDER = ['xhigh', 'max', 'high', 'medium', 'low', 'minimal', 'none']
 
 const DEFAULT_CONTEXT = 200000
+
+// Context window and output limit per model, as the DeepSeek harness's plugin
+// (dsh-our-free-model, src/catalog.js, MIT) vets them. The gateway publishes neither, and the
+// harness reads them from the listing, so a model this table does not know keeps the declared
+// default and no output limit. Exact ids win over the family patterns.
+const CAPABILITIES_BY_ID = {
+  'big-pickle': { contextWindow: 262144, maxOutput: 131072 },
+  'deepseek-v4.1-flash-free': { contextWindow: 1048576, maxOutput: 384000 },
+  'glm-5.3-flash-free': { contextWindow: 1048576, maxOutput: 131072 },
+  'nemotron-3.5-super-vl-free': { contextWindow: 1048576, maxOutput: 131072 },
+  'space-bunny-free': { contextWindow: 1048576, maxOutput: 524288 },
+  'longcat-2.5-preview-free': { contextWindow: 1048576, maxOutput: 131072 },
+}
+const CAPABILITIES_BY_PATTERN = [
+  { match: /^mimo.*v2\.6/, contextWindow: 1048576, maxOutput: 131072 },
+  { match: /^mimo/, contextWindow: 262144, maxOutput: 131072 },
+  { match: /^nemotron/, contextWindow: 128000, maxOutput: 32768 },
+  { match: /^deepseek/, contextWindow: 128000, maxOutput: 64000 },
+]
+export function capabilityOf (id) {
+  if (CAPABILITIES_BY_ID[id]) return CAPABILITIES_BY_ID[id]
+  return CAPABILITIES_BY_PATTERN.find((c) => c.match.test(id)) ?? null
+}
 const PING_CONCURRENCY = 6
 const PING_TIMEOUT_MS = 60000
 const RETRY_MS = 60000
 const EFFORT_RETRY_MS = 30000
 const PING_PROMPT = 'Reply with the single word: pong'
 
-const seedContext = new Map(SEED.map((m) => [m.id, m.contextWindow]))
 let entries = new Map(SEED.map((m) => [m.id, { contextWindow: m.contextWindow, efforts: [], defaultEffort: null }]))
 let state = {
   source: 'seed',
@@ -82,12 +104,15 @@ export function payload (build) {
   const data = []
   for (const [id, e] of entries) {
     const base = `${PROVIDER}/${id}`
+    const limits = e.maxOutput ? { max_output_tokens: e.maxOutput } : {}
     data.push({
       id: base,
       object: 'model',
+      name: id,
       created: 0,
       owned_by: PROVIDER,
       context_window: e.contextWindow,
+      ...limits,
       default_reasoning_effort: e.defaultEffort,
       reasoning_efforts: e.efforts,
     })
@@ -95,9 +120,11 @@ export function payload (build) {
       data.push({
         id: `${base}:${effort}`,
         object: 'model',
+        name: `${id} · ${effort}`,
         created: 0,
         owned_by: PROVIDER,
         context_window: e.contextWindow,
+        ...limits,
         reasoning_effort: effort,
       })
     }
@@ -224,8 +251,10 @@ export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS }
       ? previous?.efforts || []
       : EFFORT_ORDER.filter((effort) => effortKinds.get(`${id}|${effort}`) === 'ok')
     effortTally.accepted += efforts.length
+    const capability = capabilityOf(id)
     next.set(id, {
-      contextWindow: seedContext.get(id) ?? previous?.contextWindow ?? DEFAULT_CONTEXT,
+      contextWindow: capability?.contextWindow ?? previous?.contextWindow ?? DEFAULT_CONTEXT,
+      maxOutput: capability?.maxOutput ?? previous?.maxOutput ?? null,
       efforts,
       defaultEffort: efforts[0] ?? null,
     })

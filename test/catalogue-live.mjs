@@ -163,6 +163,22 @@ check('the retry is counted', cat.status().lastPing?.efforts?.retried === 1, JSO
 check('the outcome of every effort probe is reported by kind',
   cat.status().lastPing?.efforts?.byKind?.ok > 0 && cat.status().lastPing?.efforts?.byKind?.limited === undefined)
 
+console.log('13. the harness sees each model\'s context window and output limit')
+const known = new Set(['big-pickle', 'mimo-v2.6-flash-free', 'deepseek-v4.1-flash-free', 'beam-free', 'mystery-free'])
+verdict = (id, effort) => (known.has(id) ? (effort === null ? 'ok' : 'provider_error') : verdict0(id, effort))
+list([...known])
+r = await cat.refresh({ ping })
+const byId = Object.fromEntries(cat.payload('t').data.map((m) => [m.id, m]))
+check('big-pickle: 262144 context, 131072 output',
+  byId['github/big-pickle']?.context_window === 262144 && byId['github/big-pickle']?.max_output_tokens === 131072)
+check('mimo v2.6: 1M context', byId['github/mimo-v2.6-flash-free']?.context_window === 1048576)
+check('deepseek v4.1: 1M context, 384000 output',
+  byId['github/deepseek-v4.1-flash-free']?.context_window === 1048576 &&
+  byId['github/deepseek-v4.1-flash-free']?.max_output_tokens === 384000)
+check('a model the table does not know keeps the declared default and no output limit',
+  byId['github/beam-free']?.context_window === 200000 && !('max_output_tokens' in byId['github/beam-free']))
+check('every entry carries a name', Object.values(byId).every((m) => typeof m.name === 'string' && m.name.length > 0))
+
 gateway.close()
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CATALOGUE CHECKS PASSED')
 process.exit(failures ? 1 : 0)
