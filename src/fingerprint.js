@@ -209,6 +209,13 @@ export function classifyUpstream (status, raw) {
   // runner exit, churning the pool for a fault no egress IP can fix. An outage
   // message is a model fault, so it is reported as provider_error, which is retried
   // once and counted toward quarantining the MODEL rather than burning lanes.
+  // The prompt is longer than the model's context window. Every lane refuses the same request, so
+  // it is not retried, and it says nothing about the model. It gets its own kind so the client is
+  // told to compact the conversation, which is what the harness does on this wording.
+  if (status >= 400 && status < 500 && /maximum context length|context[ _-]?length[ _-]?exceeded|more tokens than this model|context window (?:exceeded|is too)/i.test(text)) {
+    return { kind: 'context' }
+  }
+
   const modelOutage = /endpoint is unavailable|upstream request failed|model is unavailable|temporarily unavailable/i.test(text) &&
     !text.includes('FreeUsageLimitError') && !text.includes('rate_limit_error')
   if (modelOutage) return { kind: 'provider_error', outage: true }

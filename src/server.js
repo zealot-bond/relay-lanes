@@ -205,7 +205,16 @@ function upstreamDetail (result, model) {
 // request from every client for as long as it stayed advertised.
 const GONE_QUARANTINE_MS = 60 * 60 * 1000
 
+// A prompt longer than the model's window. The wording is kept because the harness recognises
+// it and compacts the conversation before retrying; the model itself is healthy.
+export function contextMessage (result, model) {
+  const detail = upstreamDetail(result, model)
+  return `${PROVIDER}/${model}: this request is longer than the model's maximum context length. ` +
+    'Compact the conversation and send it again.' + (detail ? ` Upstream: ${detail}` : '')
+}
+
 export function noteModelResult (model, result, { log = true } = {}) {
+  if (result.kind === 'context') return
   const h = modelHealth.get(model) || { fails: 0, lastKind: null, note: '', until: 0 }
   if (result.kind === 'gone') {
     // Count it up to the threshold so the refusal kicks in immediately, rather than
@@ -1088,7 +1097,7 @@ async function handleChat (req, res) {
           // "Missing required parameter: tools[4].type", and for a 500 reading
           // "provider exploded". The kind alone cannot distinguish a provider outage
           // from a schema the gateway rejected.
-          message: (result.kind === 'gone'
+          message: (result.kind === 'context' ? contextMessage(result, model) : result.kind === 'gone'
             // Nothing to retry and nothing to wait for: say so instead of
             // reporting an opaque upstream refusal.
             ? `the provider withdrew ${PROVIDER}/${model}; it is no longer available`
@@ -1106,7 +1115,8 @@ async function handleChat (req, res) {
               : `no lane could serve this request (${result.kind}); ` +
               `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}` +
               `${upstreamDetail(result, model) ? `; upstream: ${upstreamDetail(result, model)}` : ''}`),
-          type: 'upstream_unavailable',
+          type: result.kind === 'context' ? 'invalid_request_error' : 'upstream_unavailable',
+          ...(result.kind === 'context' ? { code: 'context_length_exceeded' } : {}),
         },
       }
       if (!res.writableEnded && !res.destroyed) {
@@ -1150,6 +1160,12 @@ async function handleChat (req, res) {
           type: 'rate_limit_exceeded',
         },
       }, { 'Retry-After': String(retryAfter) })
+    }
+
+    if (result.kind === 'context') {
+      return json(res, 400, {
+        error: { message: contextMessage(result, model), type: 'invalid_request_error', code: 'context_length_exceeded' },
+      })
     }
 
     return json(res, 502, {
