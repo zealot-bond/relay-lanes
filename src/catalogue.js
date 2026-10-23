@@ -39,10 +39,11 @@ const DEFAULT_CONTEXT = 200000
 // default and no output limit. Exact ids win over the family patterns.
 const CAPABILITIES_BY_ID = {
   'big-pickle': { contextWindow: 262144, maxOutput: 131072 },
-  'deepseek-v4.1-flash-free': { contextWindow: 1048576, maxOutput: 384000 },
-  // 1M in the plugin's table, but the gateway refuses prompts far below that ("maximum context
-  // length", 2026-10-23), so the harness was never compacting. 128k is a conservative estimate.
-  'glm-5.3-flash-free': { contextWindow: 128000, maxOutput: 131072 },
+  // The plugin's table says 1M, but the gateway refuses prompts far below that ("maximum context
+  // length"). Measured 2026-10-23: glm accepted 255,805 tokens and refused 500k; deepseek accepted
+  // 255,322.
+  'deepseek-v4.1-flash-free': { contextWindow: 262144, maxOutput: 384000 },
+  'glm-5.3-flash-free': { contextWindow: 262144, maxOutput: 131072 },
   'nemotron-3.5-super-vl-free': { contextWindow: 1048576, maxOutput: 131072 },
   'space-bunny-free': { contextWindow: 1048576, maxOutput: 524288 },
   'longcat-2.5-preview-free': { contextWindow: 1048576, maxOutput: 131072 },

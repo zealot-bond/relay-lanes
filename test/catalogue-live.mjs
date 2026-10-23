@@ -172,8 +172,8 @@ const byId = Object.fromEntries(cat.payload('t').data.map((m) => [m.id, m]))
 check('big-pickle: 262144 context, 131072 output',
   byId['github/big-pickle']?.context_window === 262144 && byId['github/big-pickle']?.max_output_tokens === 131072)
 check('mimo v2.6: 1M context', byId['github/mimo-v2.6-flash-free']?.context_window === 1048576)
-check('deepseek v4.1: 1M context, 384000 output',
-  byId['github/deepseek-v4.1-flash-free']?.context_window === 1048576 &&
+check('deepseek v4.1: 262144 context, 384000 output',
+  byId['github/deepseek-v4.1-flash-free']?.context_window === 262144 &&
   byId['github/deepseek-v4.1-flash-free']?.max_output_tokens === 384000)
 check('a model the table does not know keeps the declared default and no output limit',
   byId['github/beam-free']?.context_window === 200000 && !('max_output_tokens' in byId['github/beam-free']))
