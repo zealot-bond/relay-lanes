@@ -1136,9 +1136,16 @@ async function handleChat (req, res) {
               // quota, not a lane problem.
               ? `${PROVIDER}/${model}: ${limitHeadline(result)}` +
                 `${upstreamDetail(result, model) ? ` (${upstreamDetail(result, model)})` : ''}. ` +
-                `In DIRECT_MODE every model shares one egress IP, so the whole catalogue ` +
-                `goes quiet together and retrying cannot help. Wait for the window to reset, ` +
-                `or set DIRECT_MODE=0 to rotate across runner IPs.`
+                (directEnabled()
+                  ? 'DIRECT_MODE shares this one egress IP across every model, so the whole ' +
+                    'catalogue goes quiet together -- and retrying cannot help, there is no ' +
+                    'second bucket. Wait for the window to reset, set DIRECT_MODE=0 to rotate ' +
+                    'across runner IPs, or reduce request volume.'
+                  : 'Every egress IP sees the same free-tier window, so another lane cannot ' +
+                    'answer it either. Wait for the window to reset.') +
+                (Number(result.retryAfter) >= 600
+                  ? ` The window reopens at ${new Date(Date.now() + Number(result.retryAfter) * 1000).toISOString().slice(11, 16)} UTC.`
+                  : '')
               : `no lane could serve this request (${result.kind}); ` +
               `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}` +
               `${upstreamDetail(result, model) ? `; upstream: ${upstreamDetail(result, model)}` : ''}`),
@@ -1429,6 +1436,15 @@ async function laneClaim (req, res) {
   const me = lanes.lanes.get(laneId)
   if (me && me.codeVersion !== CODE_VERSION && config.ALLOW_STALE_LANES !== '1' &&
       lanes.liveLanes(LANE_STALE_MS).some((l) => l.codeVersion === CODE_VERSION && l.status !== 'exhausted')) {
+    await sleep(Math.min(safeWait, 5000))
+    lanes.heartbeat(laneId)
+    return json(res, 204, {})
+  }
+
+  // A closed upstream window cannot be served by any lane, so do not hand out work that
+  // would spend an upstream call only to report the same reset. The lane keeps its poll
+  // (the heartbeat above keeps it in the pool) and is told there is nothing to do.
+  if (exhaustion.active()) {
     await sleep(Math.min(safeWait, 5000))
     lanes.heartbeat(laneId)
     return json(res, 204, {})

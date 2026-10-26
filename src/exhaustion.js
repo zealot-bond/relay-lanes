@@ -67,7 +67,7 @@ export function result (model) {
     data: null,
     laneId: null,
     retryAfter: state.retryAfterS,
-    raw: `Free usage limit reached for ${state.model || model}; the window reopens at ` +
+    raw: `Free usage limit reached; the free-tier window reopens at ` +
       `${new Date(state.until).toISOString()} (${state.retryAfterS}s).`,
   }
 }

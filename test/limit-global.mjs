@@ -37,25 +37,42 @@ const waitFor = async (fn, ms = 30000) => {
 
 const health = () => fetch(BASE + '/health', { signal: AbortSignal.timeout(3000) }).then((r) => r.json())
 
+const request = (stream) => fetch(BASE + '/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    model: 'github/big-pickle',
+    stream,
+    messages: [{ role: 'user', content: '[[S:free_usage_limit_daily]] go' }],
+  }),
+  signal: AbortSignal.timeout(60000),
+})
+
 const ask = async () => {
   const t0 = Date.now()
-  const res = await fetch(BASE + '/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'github/big-pickle',
-      stream: false,
-      messages: [{ role: 'user', content: '[[S:free_usage_limit_daily]] go' }],
-    }),
-    signal: AbortSignal.timeout(60000),
-  })
+  const res = await request(false)
   const body = await res.text()
   let err = null
   try { err = JSON.parse(body)?.error?.message || null } catch { /* not json */ }
   return { status: res.status, retryAfter: res.headers.get('retry-after'), ms: Date.now() - t0, err }
 }
 
+// A harness streams, so the truth has to arrive as an event: the status is already 200.
+const askStream = async () => {
+  const res = await request(true)
+  const body = await res.text()
+  let err = null
+  for (const line of body.split('\n')) {
+    if (!line.startsWith('data: ')) continue
+    try { err = JSON.parse(line.slice(6))?.error?.message || err } catch { /* not json */ }
+  }
+  return { status: res.status, retryAfter: res.headers.get('retry-after'), err }
+}
+
 const mockPort = await startMock()
+// Only the chat path matters here: the catalogue refresh also hits the mock (/v1/models)
+// and would make an "upstream was not called" assertion pass or fail by timing.
+const chatCalls = () => seen.filter((e) => /chat\/completions/.test(e.path)).length
 const env = {
   ...process.env,
   NODE_TLS_REJECT_UNAUTHORIZED: '0',
@@ -111,9 +128,9 @@ try {
     JSON.stringify(afterFirst.exhaustion))
 
   console.log('3. no upstream call is made while the window is closed')
-  const callsBefore = seen.length
+  const callsBefore = chatCalls()
   const second = await ask()
-  const callsAfter = seen.length
+  const callsAfter = chatCalls()
   check('the second request still answers 429 with the same window',
     second.status === 429 && second.retryAfter === '7200', `${second.status} ${second.retryAfter}`)
   check('it never reached the upstream', callsAfter === callsBefore, `${callsBefore} -> ${callsAfter}`)
@@ -121,6 +138,13 @@ try {
   const afterSecond = await health()
   check('the lane survived a second request too', afterSecond.lanes >= 1 && afterSecond.retired === 0,
     `lanes=${afterSecond.lanes} retired=${afterSecond.retired}`)
+
+  console.log('4. a streaming harness is told the same thing')
+  const stream = await askStream()
+  check('the stream is accepted, because the response has already started', stream.status === 200, String(stream.status))
+  check('the error event names the reopen time', /reopens at \d\d:\d\d UTC/.test(stream.err || ''), String(stream.err).slice(0, 160))
+  check('and does not blame DIRECT_MODE when lanes are primary', !/DIRECT_MODE/.test(stream.err || ''))
+  check('the stream made no upstream call either', chatCalls() === callsAfter, `${callsAfter} -> ${chatCalls()}`)
 } finally {
   killKids()
   stopMock()
