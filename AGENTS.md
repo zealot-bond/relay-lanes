@@ -608,7 +608,9 @@ Two places made the first version of this a no-op, and both are easy to reintrod
 - **`worker.js` exits 75 on `limited`** to ask for a replacement runner. For a global
   window that is exactly the wrong move; it now stays registered when the reset is long.
 
-## The catalogue rots silently -- and NO list predicts anythingRun `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
+## The catalogue rots silently -- and NO list predicts anything
+
+Run `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
 gap of a few days and before trusting any model list. It measures plain generation AND
 tool calls, treats HTTP 200 as failure unless text or a valid call actually arrived, and
 prints which models to remove.
