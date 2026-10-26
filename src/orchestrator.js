@@ -13,6 +13,7 @@
 import https from 'node:https'
 import { config } from './config.js'
 import { queue, lanes } from './server.js'
+import * as exhaustion from './exhaustion.js'
 
 const TOKEN = config.GH_TOKEN
 const REPO = config.GH_REPO
@@ -198,6 +199,8 @@ async function main () {
 // A dispatch that produced NO lanes must not be repeated on the next tick.
 let lastDispatchAt = 0
 let lanesAtLastDispatch = 0
+// Logged once per exhausted window rather than every tick.
+let exhaustedLogged = false
 
   const budgetLeft = () => {
     const hourAgo = Date.now() - 3600000
@@ -207,6 +210,20 @@ let lanesAtLastDispatch = 0
 
   for (;;) {
     try {
+      // A closed upstream window cannot be answered by any lane, so topping the pool up
+      // only spends runner minutes on work nothing can serve. Existing lanes expire
+      // naturally and the pool refills on the first request after the window reopens.
+      if (exhaustion.active()) {
+        const st = exhaustion.status()
+        if (!exhaustedLogged) {
+          exhaustedLogged = true
+          console.log(`${stamp()} [orch] upstream window exhausted until ${st.until} -- ` +
+            'not dispatching lanes (they could not serve)')
+        }
+        await sleep(TICK_MS)
+        continue
+      }
+      exhaustedLogged = false
       const { active, queued, known } = await counts()
 
       // The orchestrator shares a process with the relay, so it reads the real

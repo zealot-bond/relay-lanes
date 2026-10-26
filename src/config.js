@@ -120,6 +120,11 @@ export const config = {
   // A "maximum context length" refusal halves the advertised window for that model (it is
   // learned, not assumed), down to this floor.
   MIN_CONTEXT_WINDOW: num('MIN_CONTEXT_WINDOW', 32768),
+  // A `limited` result whose Retry-After is at least this long is treated as global
+  // exhaustion: the same window applies to every egress IP, so the lane is kept and no
+  // upstream call is made until it passes. Shorter windows keep the per-IP behaviour
+  // (retire the lane, retry elsewhere), because another IP can genuinely answer there.
+  EXHAUSTION_GLOBAL_S: num('EXHAUSTION_GLOBAL_S', 1800),
   ORCH_TICK_MS: num('ORCH_TICK_MS', 20000),
   // Everything below is read by a module that used to fall back to its own
   // `process.env.X || default` at import time. Because ES imports are hoisted,

@@ -310,6 +310,7 @@ node test/catalogue-live.mjs # live listing, efforts, learned window lowering
 node test/catalogue-allow.mjs    # CATALOGUE_ALLOW filtering, seed included
 node test/catalogue-published.mjs # published limits, measured override, Retry-After
 node test/context-overflow.mjs    # overflow classification/health/message
+node test/exhaustion.mjs          # long Retry-After is global: keep lanes, stop calling
 node test/regressions.mjs    # 38 checks over 14 loopback scenarios
 node test/adversarial.mjs   # 48 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
@@ -571,14 +572,31 @@ generation (`catalogue.noteContextRefusal`), floored at `MIN_CONTEXT_WINDOW`. Th
 oversized prompt costs one refusal instead of being repeated at every lane and every
 reconnect.
 
-## Exhaustion carries the provider's own reset window
+## Exhaustion carries the provider's own reset window -- and closes the relay
 
 The gateway answers a spent bucket with `Retry-After` in the header. The relay used to read
 only the body and fall back to a guessed 900s, so clients retried long before the window
 reopened. `lane.js` now copies the header into the verdict and the client-facing 429 uses
-it, naming the reset time when the wait is an hour or more.
+it, naming the reset time when the wait is ten minutes or more.
 
 Measured 2026-10-26: `Retry-After: 37551` at 13:33 UTC -- the daily reset at 00:00 UTC.
+
+A Retry-After at or above `EXHAUSTION_GLOBAL_S` (1800s) is treated as **global**: every
+egress IP sees the same window, so
+
+- the lane is **kept**, not retired -- replacing its IP would buy another copy of the same
+  429, and one request per retired lane emptied a 20-lane pool;
+- the request is answered immediately, with the provider's reset time, instead of being
+  retried across lanes;
+- no upstream call is made at all while the breaker is armed (`src/exhaustion.js`);
+- the **orchestrator stops dispatching**, because a lane cannot serve a closed window and
+  runner minutes spent on it are wasted. Existing lanes expire; the pool refills on the
+  first request after the window passes.
+
+A short Retry-After keeps the per-IP behaviour (retire the lane, retry on another egress),
+because another IP genuinely can answer there. `/health` -> `exhaustion` reports
+`active`, `until`, `retryAfterS`, `model` and `hits`, and `test/exhaustion.mjs` pins the
+classification boundary.
 
 ## The catalogue rots silently -- and NO list predicts anythingRun `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
 gap of a few days and before trusting any model list. It measures plain generation AND

@@ -23,6 +23,7 @@ import { config } from './config.js'
 import { CODE_VERSION } from './codeversion.js'
 import { directEnabled, directStats, serveDirect } from './direct.js'
 import { zenBase } from './fingerprint.js'
+import * as exhaustion from './exhaustion.js'
 import {
   escalate, stats as escalateStats, onEscalate,
   directAvailable, directBlocked, noteDirectLimited, noteDirectOk, noteDirectProbed,
@@ -514,6 +515,16 @@ async function dispatch (entry) {
     if (!entry.committed && held > MAX_HOLD_MS) return last
     if (held > MAX_HOLD_MS * 2) return entry.committed ? { ...last, kind: 'partial' } : last
 
+    // The upstream told us the window reopens hours from now. Every egress IP sees the
+    // same window, so neither another lane nor the direct path can answer: do not call
+    // either. The client gets the provider's own reset time immediately instead of
+    // waiting out a lane round trip to be told the same thing.
+    if (exhaustion.active()) {
+      const spent = exhaustion.result(entry.job.model)
+      entry.outcome = spent
+      return entry.committed ? { ...spent, kind: 'partial' } : spent
+    }
+
     // DIRECT_MODE: call the upstream here, in-process, and skip the lane pool entirely.
     // Placed before lane selection so nothing touches the queue, a claim, or a heartbeat.
     // DIRECT: either primary (DIRECT_MODE=1) or the backup used when no lane can serve
@@ -579,6 +590,12 @@ async function dispatch (entry) {
       noteRateLimit(entry.job.model, result)
       // Switch the direct path off, so the NEXT request goes straight to a lane.
       noteDirectLimited()
+      // A reset hours away is the same on every egress IP, so escalating to runners
+      // cannot answer this and would spend CI minutes proving it. Answer with the reset.
+      if (exhaustion.isGlobal(result)) {
+        exhaustion.note(result.retryAfter, entry.job.model)
+        return result
+      }
       const laneReady = () => lanes.liveLanes(LANE_STALE_MS)
         .some((l) => l.status !== 'exhausted')
       if (!(await escalate(laneReady))) {
@@ -696,6 +713,13 @@ async function dispatch (entry) {
       lanes.record(served, 'limited', result.ms || 0)
       // Make it visible: the count, which model, and the provider's own words.
       noteRateLimit(entry.job.model, result)
+      // The window reopens hours from now: this lane's egress was not the variable, so
+      // keep it. Retiring it would spend a runner to replace an IP that would report the
+      // same reset, and a retry across lanes would report it again.
+      if (exhaustion.isGlobal(result)) {
+        exhaustion.note(result.retryAfter, entry.job.model)
+        return entry.committed ? { ...result, kind: 'partial' } : result
+      }
       lanes.retire(served, result.kind === 'ip_blocked'
         ? 'egress IP blacklisted for abusive traffic'
         : 'egress bucket exhausted')
@@ -1151,7 +1175,7 @@ async function handleChat (req, res) {
       const retryAfter = result.retryAfter ?? rateLimitRetryAfter(result)
       // A daily exhaustion is not "retry in a moment": name the reset so the message is
       // actionable instead of inviting the client to hammer a spent bucket.
-      const resetNote = retryAfter >= 3600
+      const resetNote = retryAfter >= 600
         ? ` The window reopens at ${new Date(Date.now() + retryAfter * 1000).toISOString().slice(11, 16)} UTC.`
         : ''
       return json(res, 429, {
@@ -1516,6 +1540,7 @@ export function createServer () {
           laneCode: laneCodeStats(),
           direct: directStats(),
           escalate: escalateStats(),
+          exhaustion: exhaustion.status(),
           rateLimits,
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is
