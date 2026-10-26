@@ -311,6 +311,7 @@ node test/catalogue-allow.mjs    # CATALOGUE_ALLOW filtering, seed included
 node test/catalogue-published.mjs # published limits, measured override, Retry-After
 node test/context-overflow.mjs    # overflow classification/health/message
 node test/exhaustion.mjs          # long Retry-After is global: keep lanes, stop calling
+node test/limit-global.mjs        # end to end: lane kept, client told, no second upstream call
 node test/regressions.mjs    # 38 checks over 14 loopback scenarios
 node test/adversarial.mjs   # 48 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
@@ -597,6 +598,15 @@ A short Retry-After keeps the per-IP behaviour (retire the lane, retry on anothe
 because another IP genuinely can answer there. `/health` -> `exhaustion` reports
 `active`, `until`, `retryAfterS`, `model` and `hits`, and `test/exhaustion.mjs` pins the
 classification boundary.
+
+Two places made the first version of this a no-op, and both are easy to reintroduce:
+
+- **`worker.js` builds the result it POSTs to `/lane/result` field by field.** It omitted
+  `retryAfter`, so the relay received the 429 without the provider's window and armed
+  nothing (the client kept seeing the guessed 900). `test/limit-global.mjs` asserts what a
+  client actually receives, which is the only place that shows up.
+- **`worker.js` exits 75 on `limited`** to ask for a replacement runner. For a global
+  window that is exactly the wrong move; it now stays registered when the reset is long.
 
 ## The catalogue rots silently -- and NO list predicts anythingRun `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
 gap of a few days and before trusting any model list. It measures plain generation AND

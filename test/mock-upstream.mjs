@@ -135,6 +135,13 @@ const scenarios = {
   // This IP's bucket is spent. A client behind a rate-limited relay sees this as the whole
   // catalogue going quiet at once, and the only real remedy is a different egress IP.
   free_usage_limit: (res) => { res.writeHead(429, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' } })) },
+  // The daily free-tier reset: the same 429, but the provider names a window hours away
+  // in the header. Every egress IP sees this one, so the relay must keep the lane (its IP
+  // was never the variable) and answer without calling upstream again.
+  free_usage_limit_daily: (res) => {
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '7200' })
+    res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached. The free model quota resets soon.' } }))
+  },
   empty_200: (res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }] })) },
   error_after_text: (res) => { res.write(chunk({ content: 'committed text ' })); setTimeout(() => { res.write(sse({ error: { message: 'died mid answer' } })); res.end() }, 20) },
   json_not_sse: (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'json body' }, finish_reason: 'stop' }] })) },

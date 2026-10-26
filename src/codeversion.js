@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 export const LANE_FILES = [
   'codeversion.js',
   'config.js',
+  'exhaustion.js',
   'fingerprint.js',
   'lane.js',
   'models.js',

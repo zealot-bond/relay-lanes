@@ -5,6 +5,7 @@ import { callUpstream, destroyKeepalive } from './lane.js'
 import { mergeToolDeltas } from './toolmerge.js'
 import { CODE_VERSION } from './codeversion.js'
 import { config } from './config.js'
+import { isGlobal as isGlobalExhaustion } from './exhaustion.js'
 
 const RELAY = (process.env.RELAY_URL || 'http://127.0.0.1:8791').replace(/\/$/, '')
 // The relay token is the one value the lane cannot get from baked config: the
@@ -267,11 +268,17 @@ busyHeartbeat.unref?.()
         streamedTools,
         streamedTextLen: streamedTextChars,
         raw: result.kind === 'ok' ? '' : String(result.raw || '').slice(0, 400),
+        // The provider's own reset window. Without this the relay could only guess, so a
+        // daily exhaustion was reported as "retry in 15 minutes" and every lane kept
+        // being retired for an IP that was never the variable.
+        retryAfter: Number.isFinite(Number(result.retryAfter)) && result.retryAfter !== null
+          ? Math.ceil(Number(result.retryAfter))
+          : null,
         data: result.data,
       },
     })
 
-    if (result.kind === 'limited') {
+    if (result.kind === 'limited' && !isGlobalExhaustion(result)) {
       // This egress IP is spent. Exit so the orchestrator starts a replacement
       // runner, which gets a fresh bucket.
       console.log(`[lane] bucket exhausted after ${served} served; retiring this lane`)
@@ -279,6 +286,12 @@ busyHeartbeat.unref?.()
       await replenishPool('bucket exhausted')
       destroyKeepalive()
       process.exit(75)   // distinctive: burned IP, not a crash
+    }
+    if (result.kind === 'limited') {
+      // The relay keeps this lane: every egress IP shares the same closed window, so
+      // replacing the runner buys nothing. Stay registered and idle until it reopens.
+      console.log(`[lane] upstream window closed for ${result.retryAfter}s; ` +
+        'staying registered instead of burning a replacement runner')
     }
   }
 
