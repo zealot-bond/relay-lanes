@@ -31,6 +31,10 @@ const bootRelay = async (port, env = {}) => {
   // and would bypass it entirely, making them vacuous.
   process.env.DIRECT_MODE = '0'
   process.env.DIRECT_FALLBACK = '0'   // lanes-only: the backup must not mask a lane bug
+  // Catalogue policy is deployment config. These scenarios use mock model ids that are not
+  // in the production allowlist, and must never fetch the real published catalogue.
+  process.env.CATALOGUE_ALLOW = '*'
+  process.env.MODELS_CATALOGUE_URL = 'off'
   Object.assign(process.env, env)
   const S = await imp('server.js')
   S.start()

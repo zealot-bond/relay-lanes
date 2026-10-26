@@ -183,6 +183,9 @@ function isRateLimitBody (result) {
  * the free tier is hourly-ish, so say so rather than inviting an immediate retry.
  */
 function rateLimitRetryAfter (result) {
+  // The upstream's own header wins: it is the only value that reflects the real window.
+  const explicit = Number(result && result.retryAfter)
+  if (Number.isFinite(explicit) && explicit > 0) return Math.ceil(explicit)
   const raw = result && result.raw
   const m = /retry[-_ ]?after["':\s]*(\d+)/i.exec(String(raw || ''))
   if (m) return Math.max(1, Number(m[1]))
@@ -1146,6 +1149,11 @@ async function handleChat (req, res) {
     // lets a client back off on its own. Everything else keeps 502.
     if (result.kind === 'limited' || result.kind === 'ip_blocked' || isRateLimitBody(result)) {
       const retryAfter = result.retryAfter ?? rateLimitRetryAfter(result)
+      // A daily exhaustion is not "retry in a moment": name the reset so the message is
+      // actionable instead of inviting the client to hammer a spent bucket.
+      const resetNote = retryAfter >= 3600
+        ? ` The window reopens at ${new Date(Date.now() + retryAfter * 1000).toISOString().slice(11, 16)} UTC.`
+        : ''
       return json(res, 429, {
         error: {
           message: `${PROVIDER}/${model}: free-tier rate limit reached` +
@@ -1156,13 +1164,17 @@ async function handleChat (req, res) {
                 'second bucket. Wait for the window to reset, set DIRECT_MODE=0 to rotate ' +
                 'across runner IPs, or reduce request volume.'
               : 'Every lane shares the relay\'s own egress IP once the pool is out, so the ' +
-                'catalogue goes quiet together. Wait for the window to reset.'),
+                'catalogue goes quiet together. Wait for the window to reset.') +
+            resetNote,
           type: 'rate_limit_exceeded',
         },
       }, { 'Retry-After': String(retryAfter) })
     }
 
     if (result.kind === 'context') {
+      // A refusal is evidence about the real window. Lower what we advertise rather than
+      // repeating the same over-long prompt at every lane and every reconnection.
+      catalogue.noteContextRefusal(model)
       return json(res, 400, {
         error: { message: contextMessage(result, model), type: 'invalid_request_error', code: 'context_length_exceeded' },
       })

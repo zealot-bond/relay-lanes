@@ -24,7 +24,7 @@
 // while the pings run. Seed models carry no effort data, so they are served without variants.
 
 import { config } from './config.js'
-import { zenBase, headers, newSessionId, newRequestId } from './fingerprint.js'
+import { zenBase, headers, newSessionId, newRequestId, OPENCODE_UA } from './fingerprint.js'
 import { callUpstream } from './lane.js'
 import { MODELS as SEED, PROVIDER, splitModelId } from './models.js'
 
@@ -33,38 +33,116 @@ export const EFFORT_ORDER = ['xhigh', 'max', 'high', 'medium', 'low', 'minimal',
 
 const DEFAULT_CONTEXT = 200000
 
-// Context window and output limit per model, as the DeepSeek harness's plugin
-// (dsh-our-free-model, src/catalog.js, MIT) vets them. The gateway publishes neither, and the
-// harness reads them from the listing, so a model this table does not know keeps the declared
-// default and no output limit. Exact ids win over the family patterns.
-const CAPABILITIES_BY_ID = {
-  'big-pickle': { contextWindow: 262144, maxOutput: 131072 },
-  // The plugin's table says 1M, but the gateway refuses prompts far below that ("maximum context
-  // length"). Measured 2026-10-23: glm accepted 255,805 tokens and refused 500k; deepseek accepted
-  // 255,322.
-  'deepseek-v4.1-flash-free': { contextWindow: 262144, maxOutput: 384000 },
-  'glm-5.3-flash-free': { contextWindow: 262144, maxOutput: 131072 },
-  'nemotron-3.5-super-vl-free': { contextWindow: 1048576, maxOutput: 131072 },
-  'space-bunny-free': { contextWindow: 1048576, maxOutput: 524288 },
-  'longcat-2.5-preview-free': { contextWindow: 1048576, maxOutput: 131072 },
+// Which models are served at all. The gateway lists dozens of free-suffixed models that
+// this deployment has no reason to expose; the operator's choice lives in config, not in a
+// hardcoded list here. Empty means "serve every model that answers".
+const allow = (() => {
+  const raw = String(config.CATALOGUE_ALLOW || '').trim()
+  // '*' means no filter. An empty env value cannot express that: config.js ignores empty
+  // values so a property can never blank a baked secret.
+  if (raw === '*' || raw === '') return new Set()
+  return new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))
+})()
+const allowed = (id) => allow.size === 0 || allow.has(id)
+
+// Measured windows, "id=window,id=window": the operator's own measurement, used when the
+// published limit lags reality. Parsed once; anything malformed is ignored.
+const windowOverrides = (() => {
+  const out = new Map()
+  for (const part of String(config.MODEL_CONTEXT_WINDOWS || '').split(',')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const id = part.slice(0, eq).trim()
+    const n = Number.parseInt(part.slice(eq + 1), 10)
+    if (id && Number.isFinite(n) && n > 0) out.set(id, n)
+  }
+  return out
+})()
+
+// Published limits from the catalogue the first-party client itself loads
+// (models.opencode.ai, falling back to models.dev). The gateway's own list publishes
+// neither a context window nor an output limit, so these used to be a hardcoded table --
+// which meant a stale claim outlived every provider change and a model could be advertised
+// with a window it refuses. The upstream catalogue is the source of truth; the override
+// above covers models measured to accept more than they publish.
+let published = new Map() // id -> { context, output }
+let publishedAt = null
+// Windows learned DOWNWARD from a "maximum context length" refusal. A declared window this
+// relay has seen refused is never advertised again in this generation: the refusal is
+// evidence, the published number is not.
+const learnedCeiling = new Map() // id -> advertised window after the refusal
+
+function declaredWindow (id, previous) {
+  const base = windowOverrides.get(id) ?? published.get(id)?.context ?? previous?.contextWindow ?? DEFAULT_CONTEXT
+  const cap = learnedCeiling.get(id)
+  const value = cap ? Math.min(base, cap) : base
+  return Math.max(config.MIN_CONTEXT_WINDOW, value)
 }
-const CAPABILITIES_BY_PATTERN = [
-  { match: /^mimo.*v2\.6/, contextWindow: 1048576, maxOutput: 131072 },
-  { match: /^mimo/, contextWindow: 262144, maxOutput: 131072 },
-  { match: /^nemotron/, contextWindow: 128000, maxOutput: 32768 },
-  { match: /^deepseek/, contextWindow: 128000, maxOutput: 64000 },
-]
+
+function declaredOutput (id, previous) {
+  return published.get(id)?.output ?? previous?.maxOutput ?? null
+}
+
 export function capabilityOf (id) {
-  if (CAPABILITIES_BY_ID[id]) return CAPABILITIES_BY_ID[id]
-  return CAPABILITIES_BY_PATTERN.find((c) => c.match.test(id)) ?? null
+  return { contextWindow: declaredWindow(id), maxOutput: declaredOutput(id) }
 }
+
+/**
+ * Record that a model refused a prompt for being too long. The window is halved rather
+ * than set to a guess, and it stays lowered for the rest of this generation. Halving
+ * converges in a couple of refusals even when the published limit is wrong by 4x, and the
+ * client is told to compact on the first one instead of repeating it.
+ */
+export function noteContextRefusal (id) {
+  const entry = entries.get(id)
+  if (!entry) return null
+  const next = Math.max(config.MIN_CONTEXT_WINDOW, Math.floor(entry.contextWindow / 2))
+  if (next >= entry.contextWindow) return entry.contextWindow
+  learnedCeiling.set(id, next)
+  entries.set(id, { ...entry, contextWindow: next })
+  console.log(`[catalogue] ${id}: context window lowered to ${next} after a context-length refusal`)
+  return next
+}
+
+/** Read the published limits once per refresh. Failure keeps the previous values. */
+async function loadPublished () {
+  const url = config.MODELS_CATALOGUE_URL
+  if (!url || url === 'off' || url === 'none') return
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': OPENCODE_UA, Accept: 'application/json' },
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const body = await res.json()
+    const provider = body?.providers?.opencode ?? body?.opencode
+    const models = provider?.models
+    if (!models || typeof models !== 'object') throw new Error('no opencode provider in the catalogue')
+    const next = new Map()
+    for (const [id, m] of Object.entries(models)) {
+      const context = Number(m?.limit?.context)
+      const output = Number(m?.limit?.output)
+      if (Number.isFinite(context) && context > 0) {
+        next.set(id, { context, output: Number.isFinite(output) && output > 0 ? output : null })
+      }
+    }
+    if (!next.size) throw new Error('catalogue published no limits')
+    published = next
+    publishedAt = new Date().toISOString()
+  } catch (e) {
+    console.error(`[catalogue] published limits unavailable (${e.message}); keeping ${published.size} known windows`)
+  }
+}
+
 const PING_CONCURRENCY = 6
 const PING_TIMEOUT_MS = 60000
 const RETRY_MS = 60000
 const EFFORT_RETRY_MS = 30000
 const PING_PROMPT = 'Reply with the single word: pong'
 
-let entries = new Map(SEED.map((m) => [m.id, { contextWindow: m.contextWindow, efforts: [], defaultEffort: null }]))
+let entries = new Map(SEED
+  .filter((m) => allowed(m.id))
+  .map((m) => [m.id, { contextWindow: m.contextWindow, maxOutput: null, efforts: [], defaultEffort: null }]))
 let state = {
   source: 'seed',
   lastRefreshAt: null,
@@ -139,6 +217,9 @@ export function status () {
   return {
     source: state.source,
     models: entries.size,
+    allow: [...allow],
+    publishedAt,
+    learnedWindows: Object.fromEntries(learnedCeiling),
     lastRefreshAt: state.lastRefreshAt,
     lastSuccessAt: state.lastSuccessAt,
     lastError: state.lastError,
@@ -204,6 +285,7 @@ export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS }
   }
 
   let ids
+  let listed = 0
   try {
     const res = await fetch(listUrl(), {
       headers: headers({ sessionId: newSessionId(), requestId: newRequestId(), protocol: 'chat' }),
@@ -212,13 +294,25 @@ export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS }
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const body = await res.json()
     if (!Array.isArray(body?.data)) throw new Error('response has no data array')
+    listed = new Set(body.data
+      .map((m) => (typeof m?.id === 'string' ? m.id.trim() : ''))
+      .filter(Boolean)).size
     ids = [...new Set(body.data
       .map((m) => (typeof m?.id === 'string' ? m.id.trim() : ''))
       .filter(Boolean))]
-    if (!ids.length) throw new Error('gateway listed no models')
+      .filter(allowed)
+    if (!ids.length) {
+      throw new Error(allow.size
+        ? `gateway listed ${listed} models, none of them in CATALOGUE_ALLOW (${[...allow].join(', ')})`
+        : 'gateway listed no models')
+    }
   } catch (e) {
     return fail(e.message)
   }
+
+  // The advertised window comes from the catalogue the client itself loads, not from a
+  // table in this repository. A failed fetch keeps whatever was known before.
+  await loadPublished()
 
   const base = await pool(ids.map((id) => ({ key: id, id })), ({ id }) => ping(id, null))
   const tally = {}
@@ -254,10 +348,9 @@ export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS }
       ? previous?.efforts || []
       : EFFORT_ORDER.filter((effort) => effortKinds.get(`${id}|${effort}`) === 'ok')
     effortTally.accepted += efforts.length
-    const capability = capabilityOf(id)
     next.set(id, {
-      contextWindow: capability?.contextWindow ?? previous?.contextWindow ?? DEFAULT_CONTEXT,
-      maxOutput: capability?.maxOutput ?? previous?.maxOutput ?? null,
+      contextWindow: declaredWindow(id, previous),
+      maxOutput: declaredOutput(id, previous),
       efforts,
       defaultEffort: efforts[0] ?? null,
     })
@@ -275,10 +368,18 @@ export async function refresh ({ ping = defaultPing, retryMs = EFFORT_RETRY_MS }
     lastSuccessAt: state.lastRefreshAt,
     lastError: null,
     lastChange: { added, removed },
-    lastPing: { tested: ids.length, answering: answering.length, byKind: tally, efforts: effortTally },
+    lastPing: {
+      tested: ids.length,
+      listed,
+      skipped: Math.max(0, listed - ids.length),
+      answering: answering.length,
+      byKind: tally,
+      efforts: effortTally,
+    },
   }
   const refused = Object.entries(tally).filter(([k]) => k !== 'ok').map(([k, n]) => `${k} ${n}`).join(', ')
-  console.log(`[catalogue] ${first ? 'loaded' : 'refreshed'}: ${ordered.size} of ${ids.length} listed models answered a ping` +
+  console.log(`[catalogue] ${first ? 'loaded' : 'refreshed'}: ${ordered.size} of ${ids.length} probeable models answered a ping` +
+    (listed > ids.length ? ` (${listed - ids.length} filtered out by CATALOGUE_ALLOW)` : '') +
     (refused ? ` (not answering: ${refused})` : '') +
     `; ${effortTally.accepted} effort variants across ${ordered.size} models` +
     (added.length ? `; added ${added.join(', ')}` : '') +

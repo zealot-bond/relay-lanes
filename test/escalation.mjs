@@ -18,6 +18,9 @@ process.env.GH_REPO = 'no-such-owner/no-such-repo'
 // trust them exactly as a lane does.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 process.env.LANES_ENABLED = '0'
+// Deployment catalogue policy; mock ids only, and no real catalogue fetch.
+process.env.CATALOGUE_ALLOW = '*'
+process.env.MODELS_CATALOGUE_URL = 'off'
 process.env.ZEN_BASE = 'https://127.0.0.1:0'   // replaced below; direct calls must fail
 
 const { execFileSync, spawn } = await import('node:child_process')

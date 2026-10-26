@@ -54,7 +54,14 @@ const waitFor = async (check, ms = 25000) => {
 // it would be a second, unused upstream.
 const mockPort = NO_BOOT_EARLY ? 0 : await startMock()
 const ZEN = mockPort ? `https://127.0.0.1:${mockPort}` : ''
-const env = { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' }
+const env = {
+  ...process.env,
+  NODE_TLS_REJECT_UNAUTHORIZED: '0',
+  // Deployment catalogue policy: the scenarios use mock ids, and no test may fetch the
+  // real published catalogue.
+  CATALOGUE_ALLOW: '*',
+  MODELS_CATALOGUE_URL: 'off',
+}
 const spawnNode = (script, extra) => {
   const k = spawn(process.execPath, [path.join(SRC, script)], { env: { ...env, ...extra }, stdio: 'ignore' })
   kids.push(k)

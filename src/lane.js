@@ -20,7 +20,7 @@ import { StringDecoder } from 'node:string_decoder'
 import {
   zenBase, CHAT_PATH, RESPONSES_PATH,
   fingerprintToolSpecs, fingerprintToolSpecsResponses,
-  newSessionId, newRequestId, headers, classifyUpstream,
+  newSessionId, newRequestId, headers, classifyUpstream, retryAfterSeconds,
 } from './fingerprint.js'
 import { protocolFor } from './models.js'
 import { config } from './config.js'
@@ -780,6 +780,9 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString()
         const verdict = classifyUpstream(res.statusCode, raw)
+        // The provider puts its reset window in a header, not the body. Without this the
+        // relay fell back to a guessed 900s and clients retried a spent bucket for hours.
+        if (verdict.kind === 'limited') verdict.retryAfter = retryAfterSeconds(res.headers)
         const data = verdict.kind === 'ok' ? parseUpstream(raw, model) : null
         const msg = data?.choices?.[0]?.message
         // A 200 that carries neither text nor tool calls is upstream flakiness,

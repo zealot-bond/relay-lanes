@@ -11,6 +11,10 @@ const gateway = http.createServer((req, res) => {
 })
 await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
 process.env.CATALOGUE_URL = `http://127.0.0.1:${gateway.address().port}/v1/models`
+// Deployment policy and the published-limit catalogue are both disabled here: this test
+// uses synthetic model ids and must not touch the network.
+process.env.CATALOGUE_ALLOW = '*'
+process.env.MODELS_CATALOGUE_URL = 'off'
 const cat = await import('../src/catalogue.js')
 const { buildForTest } = await import('../src/lane.js')
 
@@ -163,21 +167,32 @@ check('the retry is counted', cat.status().lastPing?.efforts?.retried === 1, JSO
 check('the outcome of every effort probe is reported by kind',
   cat.status().lastPing?.efforts?.byKind?.ok > 0 && cat.status().lastPing?.efforts?.byKind?.limited === undefined)
 
-console.log('13. the harness sees each model\'s context window and output limit')
+console.log('13. the advertised window is not a hardcoded per-model claim')
 const known = new Set(['big-pickle', 'mimo-v2.6-flash-free', 'deepseek-v4.1-flash-free', 'beam-free', 'mystery-free'])
 verdict = (id, effort) => (known.has(id) ? (effort === null ? 'ok' : 'provider_error') : verdict0(id, effort))
 list([...known])
 r = await cat.refresh({ ping })
 const byId = Object.fromEntries(cat.payload('t').data.map((m) => [m.id, m]))
-check('big-pickle: 262144 context, 131072 output',
-  byId['github/big-pickle']?.context_window === 262144 && byId['github/big-pickle']?.max_output_tokens === 131072)
-check('mimo v2.6: 1M context', byId['github/mimo-v2.6-flash-free']?.context_window === 1048576)
-check('deepseek v4.1: 262144 context, 384000 output',
-  byId['github/deepseek-v4.1-flash-free']?.context_window === 262144 &&
-  byId['github/deepseek-v4.1-flash-free']?.max_output_tokens === 384000)
-check('a model the table does not know keeps the declared default and no output limit',
-  byId['github/beam-free']?.context_window === 200000 && !('max_output_tokens' in byId['github/beam-free']))
+check('with no published limit and no measurement, every model keeps the declared default',
+  byId['github/big-pickle']?.context_window === 200000 &&
+  byId['github/mimo-v2.6-flash-free']?.context_window === 200000 &&
+  byId['github/mystery-free']?.context_window === 200000)
+check('no output limit is invented when the catalogue publishes none',
+  !('max_output_tokens' in byId['github/big-pickle']) && !('max_output_tokens' in byId['github/beam-free']))
 check('every entry carries a name', Object.values(byId).every((m) => typeof m.name === 'string' && m.name.length > 0))
+
+console.log('14. a context refusal lowers what is advertised, for the rest of the generation')
+const before = cat.find('beam-free').contextWindow
+const lowered = cat.noteContextRefusal('beam-free')
+check('the refusal halves the window', lowered === before / 2 && cat.find('beam-free').contextWindow === before / 2,
+  `${before} -> ${lowered}`)
+check('the lowering is visible to a client listing', cat.payload('t').data.find((m) => m.id === 'github/beam-free')?.context_window === before / 2)
+check('the lowering survives a refresh', await (async () => { await cat.refresh({ ping }); return cat.find('beam-free').contextWindow === before / 2 })())
+check('an unknown model is not invented by a refusal', cat.noteContextRefusal('not-a-model') === null)
+check('the floor is respected', (() => {
+  for (let i = 0; i < 40; i++) cat.noteContextRefusal('beam-free')
+  return cat.find('beam-free').contextWindow >= 32768
+})())
 
 gateway.close()
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CATALOGUE CHECKS PASSED')

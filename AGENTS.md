@@ -306,6 +306,10 @@ node test/wire-toolcalls.mjs # serialised bytes a client reassembles
 node test/stream-safety.mjs  # keepalive, ordering, backpressure model
 node test/tool-shapes.mjs    # tool spec normalisation + gate-safe dedupe
 node test/codeversion.mjs    # the lane-code fingerprint
+node test/catalogue-live.mjs # live listing, efforts, learned window lowering
+node test/catalogue-allow.mjs    # CATALOGUE_ALLOW filtering, seed included
+node test/catalogue-published.mjs # published limits, measured override, Retry-After
+node test/context-overflow.mjs    # overflow classification/health/message
 node test/regressions.mjs    # 38 checks over 14 loopback scenarios
 node test/adversarial.mjs   # 48 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
@@ -547,9 +551,36 @@ What is genuinely established, by measurement:
   as *sole* causes by a request that succeeded through the relay.
 - The gate is not a hard IP block: this host reaches the free tier reliably in direct mode.
 
-## The catalogue rots silently -- and NO list predicts anything
+## Only the chosen models are served, and the window is published, not hardcoded
 
-Run `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
+`CATALOGUE_ALLOW` (comma-separated; `*` means no filter) is deployment policy. The seed
+list is filtered before the first refresh and the gateway's list is filtered before any
+ping, so a model the operator did not choose is neither advertised nor measured. A refresh
+that matches nothing keeps the previous list and says so.
+
+The context window and output limit come from the catalogue the first-party client itself
+loads (`MODELS_CATALOGUE_URL`, default `https://models.opencode.ai/api.json`, provider
+`opencode`), because the gateway's own `/v1/models` publishes neither. A table in this
+repository used to claim them; it outlived the provider and advertised windows the gateway
+refuses. `MODEL_CONTEXT_WINDOWS` (`id=window,...`) carries an operator's measured value for
+a model whose published limit lags reality -- glm and deepseek were measured accepting
+255,805 and 255,322 tokens while publishing 200,000, so the deployment sets 262144 for both.
+
+A `context` refusal also **lowers** what is advertised by half for the rest of the
+generation (`catalogue.noteContextRefusal`), floored at `MIN_CONTEXT_WINDOW`. The first
+oversized prompt costs one refusal instead of being repeated at every lane and every
+reconnect.
+
+## Exhaustion carries the provider's own reset window
+
+The gateway answers a spent bucket with `Retry-After` in the header. The relay used to read
+only the body and fall back to a guessed 900s, so clients retried long before the window
+reopened. `lane.js` now copies the header into the verdict and the client-facing 429 uses
+it, naming the reset time when the wait is an hour or more.
+
+Measured 2026-10-26: `Retry-After: 37551` at 13:33 UTC -- the daily reset at 00:00 UTC.
+
+## The catalogue rots silently -- and NO list predicts anythingRun `scripts/probe-catalogue.mjs` (against the panel, or `BASE=` a local relay) after any
 gap of a few days and before trusting any model list. It measures plain generation AND
 tool calls, treats HTTP 200 as failure unless text or a valid call actually arrived, and
 prints which models to remove.
@@ -678,6 +709,16 @@ passing on nothing).
    A gated egress cannot verify them (every request returns 403 `FreeTierError`, which
    hides the model's actual state -- that is exactly how `nemotron-3-ultra-free` slipped
    through). Run `scripts/probe-catalogue.mjs` once the panel is up.
+10. **The free tier now gives the first-party client a separate allowance
+    (measured 2026-10-26).** The relay's egress answered
+    `429 FreeUsageLimitError` with `Retry-After: 37551` (until 00:00 UTC) on every call,
+    while the installed `opencode` v2.1.2 client, on the same host and IP and with the same
+    account token, kept answering 200. Replaying the client's captured request -- same URL,
+    headers, `b3`/`traceparent`, session and project ids, token -- from Node, Bun, curl, raw
+    TLS and HTTP/2 all returned 429, and so did forwarding the client's own request through
+    the relay's logger. The gateway is therefore distinguishing the client at a layer the
+    request bytes do not carry, and a relay-side replay cannot recover it. Treat a long
+    `Retry-After` as a daily reset rather than a bug; the relay reports it and backs off.
 
 ## A note on `src/fingerprint.js`
 

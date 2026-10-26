@@ -13,9 +13,12 @@ import crypto from 'node:crypto'
 const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
 export const LITERAL_KEY = 'public'
-export const OPENCODE_UA = 'opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
+// The shape the installed v2 client actually sends (captured 2026-10-26, v2.1.2): the
+// user-agent names the client and version, and the project id is a 40-hex SHA-1 rather
+// than the literal "global" the older client used.
+export const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/2.1.2/cli'
 export const OPENCODE_CLIENT = 'cli'
-export const OPENCODE_PROJECT = 'global'
+export const OPENCODE_PROJECT = crypto.createHash('sha1').update('relay-lanes').digest('hex')
 
 // The upstream moved. models.dev -- the catalogue OpenCode v2 itself loads -- declares
 // the `opencode` provider as `@ai-sdk/openai-compatible` at
@@ -150,19 +153,49 @@ export function newSessionId () { return opencodeId('ses') }
 export function newRequestId () { return opencodeId('msg') }
 
 export function headers ({ sessionId, requestId, protocol }) {
+  // The client sends b3/traceparent on every call; they are correlation ids, not auth, but
+  // a request without them is one more way to look unlike the client.
+  const trace = crypto.randomBytes(16).toString('hex')
+  const span = crypto.randomBytes(8).toString('hex')
   return {
     'Content-Type': 'application/json',
     'User-Agent': OPENCODE_UA,
     Authorization: `Bearer ${LITERAL_KEY}`,
+    b3: `${trace}-${span}-1-${crypto.randomBytes(8).toString('hex')}`,
+    traceparent: `00-${trace}-${span}-01`,
     'x-opencode-client': OPENCODE_CLIENT,
     'x-opencode-project': OPENCODE_PROJECT,
     'x-opencode-session': sessionId,
-    'x-opencode-request': requestId,
-    // Observed in real client traffic; harmless when absent, so it is sent to
-    // stay as close to a genuine client as possible.
+    // The session id is sent under four names by the current client.
     'x-opencode-session-id': sessionId,
+    'x-session-affinity': sessionId,
+    'x-session-id': sessionId,
     ...(protocol === 'responses' ? { Accept: 'text/event-stream' } : {}),
   }
+}
+
+/**
+ * Seconds the upstream asked us to wait, from the response headers.
+ *
+ * The gateway answers exhaustion with `Retry-After` (measured: 37551 at 13:33 UTC, i.e. the
+ * daily reset at midnight UTC) but the relay only ever looked at the body, so it reported a
+ * guessed 900s and clients retried long before the window reopened.
+ */
+export function retryAfterSeconds (headers) {
+  if (!headers || typeof headers !== 'object') return null
+  const raw = headers['retry-after']
+  if (raw !== undefined) {
+    const n = Number(raw)
+    if (Number.isFinite(n) && n > 0) return Math.ceil(n)
+    const t = Date.parse(String(raw))
+    if (Number.isFinite(t)) return Math.max(1, Math.ceil((t - Date.now()) / 1000))
+  }
+  const reset = Number(headers['x-ratelimit-reset'])
+  if (Number.isFinite(reset) && reset > 0) {
+    // Some providers send an epoch, some a delta. Anything past 1e9 is an epoch.
+    return reset > 1e9 ? Math.max(1, Math.ceil(reset - Date.now() / 1000)) : Math.ceil(reset)
+  }
+  return null
 }
 
 // Classify an upstream reply. This is the single place that decides whether a

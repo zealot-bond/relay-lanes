@@ -36,6 +36,9 @@ const relay = spawn(process.execPath, [path.join(ROOT, 'src/main.js')], {
     MAX_LANES: '40',
     MODEL_QUARANTINE_MS: '800',
     MODEL_HEALTH_THRESHOLD: '3',
+    // Deployment catalogue policy; the smoke test uses mock model ids and no network.
+    CATALOGUE_ALLOW: '*',
+    MODELS_CATALOGUE_URL: 'off',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 })

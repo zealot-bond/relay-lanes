@@ -48,6 +48,12 @@ jobs:
       RUN_FOR_S: '13800'
       HANDOVER_LEAD_S: '180'
       CLOUDFLARED_VERSION: '2026.10.3'
+      # Only these three models are served, whatever else the gateway advertises.
+      CATALOGUE_ALLOW: deepseek-v4.1-flash-free,glm-5.3-flash-free,mimo-v2.6-flash-free
+      # The published limit lags the real one for these two (measured accepting 255,805 and
+      # 255,322 tokens while publishing 200,000). Measured values live here, in deployment
+      # config, not in a table in the source.
+      MODEL_CONTEXT_WINDOWS: deepseek-v4.1-flash-free=262144,glm-5.3-flash-free=262144
     steps:
       - uses: actions/checkout@v4
 

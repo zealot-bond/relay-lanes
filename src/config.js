@@ -104,6 +104,22 @@ export const config = {
   RELAY_PUBLIC_URL: str('RELAY_PUBLIC_URL', ''),
   // The gateway's model list, pinged at relay start. Empty URL = <zenBase>/v1/models.
   CATALOGUE_URL: str('CATALOGUE_URL', ''),
+  // Which upstream models may be served, comma-separated. Empty means "serve whatever the
+  // gateway lists and answers". Deployment policy belongs here, not in code: the previous
+  // behaviour listed every free-suffixed model the gateway advertised, which put models in
+  // front of a harness that the operator never chose.
+  CATALOGUE_ALLOW: str('CATALOGUE_ALLOW', 'deepseek-v4.1-flash-free,glm-5.3-flash-free,mimo-v2.6-flash-free'),
+  // The catalogue the first-party client itself loads. It publishes each model's
+  // `limit.context` / `limit.output`, which the gateway's own list does not. Used as the
+  // source of the advertised window instead of a table hardcoded here. Empty disables it.
+  MODELS_CATALOGUE_URL: str('MODELS_CATALOGUE_URL', 'https://models.opencode.ai/api.json'),
+  // Measured windows, "id=window,id=window". Empty = use the published limit. Exists
+  // because the published limit can lag the real one: glm/deepseek were measured accepting
+  // 255,805 and 255,322 tokens while still publishing 200,000.
+  MODEL_CONTEXT_WINDOWS: str('MODEL_CONTEXT_WINDOWS', ''),
+  // A "maximum context length" refusal halves the advertised window for that model (it is
+  // learned, not assumed), down to this floor.
+  MIN_CONTEXT_WINDOW: num('MIN_CONTEXT_WINDOW', 32768),
   ORCH_TICK_MS: num('ORCH_TICK_MS', 20000),
   // Everything below is read by a module that used to fall back to its own
   // `process.env.X || default` at import time. Because ES imports are hoisted,
