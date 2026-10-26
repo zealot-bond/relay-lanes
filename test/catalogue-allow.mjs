@@ -16,6 +16,7 @@ await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
 process.env.CATALOGUE_URL = `http://127.0.0.1:${gateway.address().port}/v1/models`
 process.env.CATALOGUE_ALLOW = 'deepseek-v4.1-flash-free,alpha-001,alpha-003'
 process.env.MODELS_CATALOGUE_URL = 'off'
+process.env.MODEL_CONTEXT_WINDOWS = 'deepseek-v4.1-flash-free=262144'
 
 const cat = await import('../src/catalogue.js')
 
@@ -28,6 +29,8 @@ const check = (name, ok, detail = '') => {
 console.log('1. the seed list is filtered before the first refresh')
 check('an allowed seed model is served', cat.find('deepseek-v4.1-flash-free') !== null)
 check('a seed model outside the allowlist is not', cat.find('big-pickle') === null)
+check('the seed inherits the deployment window override',
+  cat.find('deepseek-v4.1-flash-free').contextWindow === 262144)
 check('the allowlist is reported by status', JSON.stringify(cat.status().allow) === '["deepseek-v4.1-flash-free","alpha-001","alpha-003"]')
 
 console.log('2. a refresh keeps only allowed models')

@@ -142,7 +142,12 @@ const PING_PROMPT = 'Reply with the single word: pong'
 
 let entries = new Map(SEED
   .filter((m) => allowed(m.id))
-  .map((m) => [m.id, { contextWindow: m.contextWindow, maxOutput: null, efforts: [], defaultEffort: null }]))
+  .map((m) => [m.id, {
+    contextWindow: declaredWindow(m.id),
+    maxOutput: declaredOutput(m.id),
+    efforts: [],
+    defaultEffort: null,
+  }]))
 let state = {
   source: 'seed',
   lastRefreshAt: null,
