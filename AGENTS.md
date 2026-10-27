@@ -223,6 +223,26 @@ This serves OpenCode-style agent harnesses, so tool use must survive intact:
   failures a model is refused for `MODEL_QUARANTINE_MS`, then one probe is allowed
   through. Without the expiry a transient burst killed a model until restart.
 
+## The panel counts what the CLIENT saw, not only what the lanes did
+
+`/health` → `clients` reports `streams`, `gone`, `partial` and `uptimeS`, and the
+dashboard shows them as cards. `gone` is a request whose eyeball hung up before its
+answer finished; `partial` is an upstream failure after text had already reached the
+client. Neither is a lane failure, and before these counters a client could see
+`terminated` / `request timed out` all afternoon while `/health` reported
+`failed: 0, timeouts: 0` — the relay genuinely did not know.
+
+That distinction is the first thing to read when a report says "connection errors":
+`clients.gone` rising with `failed`/`timeouts` flat means the client's own connection
+through the edge died (lossy Wi-Fi, a mobile hotspot, a carrier NAT), not the relay.
+A failure before the request reaches the relay (connect timeout, TLS stall) is
+invisible here by definition and has to be measured from the client.
+
+`server.keepAliveTimeout` is raised to 120s (with `headersTimeout` 125s) because
+cloudflared pools its origin connections and holds an idle one for about 90s. Node's
+5s default let the connector reuse a socket the relay had just closed: the request
+never reached the handler and the client got a 502 no counter could explain.
+
 ## Timeout model — do not simplify this back
 
 Upstream timeouts are split by phase:

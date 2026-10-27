@@ -137,6 +137,37 @@ const UNCOUNTED_KINDS = new Set(['ok', 'limited', 'ip_blocked', 'empty', 'transp
 // and still not counted.
 const rateLimits = { count: 0, lastAt: null, lastModel: null, lastDetail: '' }
 
+/**
+ * What the CLIENT experienced, which is not the same question as what the lanes did.
+ *
+ * `failed`/`timeouts` are lane outcomes. A client can see "terminated" or a read
+ * timeout while every lane accepted its work and answered it: the eyeball's own
+ * connection through the edge died (lossy Wi-Fi, a mobile hotspot, a carrier NAT),
+ * and the relay only ever saw its socket close. Those requests were counted nowhere,
+ * so /health reported a perfect relay through an incident the user could see. These
+ * counters make the difference visible instead of arguing about it.
+ */
+const clientStats = {
+  streams: 0,        // streaming responses begun
+  gone: 0,           // client hung up before its answer finished
+  partial: 0,        // upstream failed after text had already reached the client
+  lastGoneAt: null,
+  lastPartialAt: null,
+  lastPartialKind: null,
+}
+const processStartedAt = Date.now()
+
+function noteClientGone () {
+  clientStats.gone++
+  clientStats.lastGoneAt = new Date().toISOString().slice(11, 19)
+}
+
+function notePartial (kind) {
+  clientStats.partial++
+  clientStats.lastPartialAt = new Date().toISOString().slice(11, 19)
+  clientStats.lastPartialKind = kind || 'unknown'
+}
+
 function noteRateLimit (model, result) {
   rateLimits.count++
   rateLimits.lastAt = new Date().toISOString().slice(11, 19)
@@ -981,6 +1012,7 @@ async function handleChat (req, res) {
   }
 
   if (stream) {
+    clientStats.streams++
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -1120,7 +1152,7 @@ async function handleChat (req, res) {
   // If the client hangs up mid-flight, stop caring immediately. Otherwise the
   // work stays queued and a lane burns a full upstream call on a response nobody
   // will read.
-  const onClientGone = () => { if (!entry.done) queue.abandon(entry) }
+  const onClientGone = () => { if (!entry.done) { noteClientGone(); queue.abandon(entry) } }
   res.on('close', onClientGone)
 
   ensureDispatched(entry)
@@ -1145,6 +1177,10 @@ async function handleChat (req, res) {
     // fault, not a rate limit" on a body reading "FreeUsageLimitError: Rate limit exceeded".
     // A client can only back off correctly if it is told the truth about which it is.
     if (stream) {
+      // Text already on the wire means this was a partial answer, not a failure the
+      // client could retry invisibly. Counted so the panel stops claiming a clean
+      // run while a harness shows a truncated reply.
+      if (entry.committed) notePartial(result.kind)
       // Headers are long gone, so the failure is reported in-band.
       const err = {
         error: {
@@ -1378,6 +1414,9 @@ h2{font-size:13px;color:#8b96a5;margin-top:18px}</style>
 <div class=c><b>${l.served}</b><span>served</span></div>
 <div class=c><b>${l.retired}</b><span>burned buckets</span></div>
 <div class=c><b>${l.timeouts}</b><span>timeouts</span></div>
+<div class=c><b>${clientStats.gone}</b><span>client gone</span></div>
+<div class=c><b>${clientStats.partial}</b><span>partial streams</span></div>
+<div class=c><b>${Math.round((Date.now() - processStartedAt) / 1000)}s</b><span>uptime</span></div>
 <div class=c><b>${l.avgMs}ms</b><span>avg upstream</span></div>
 </div>
 <h2>live lanes</h2>
@@ -1583,6 +1622,10 @@ export function createServer () {
           escalate: escalateStats(),
           exhaustion: exhaustion.status(),
           rateLimits,
+          // Client-side outcomes: a request the eyeball abandoned and a stream that
+          // died after commit are invisible in the lane counters, and they are what a
+          // harness actually reports as "terminated" / "request timed out".
+          clients: { ...clientStats, uptimeS: Math.round((Date.now() - processStartedAt) / 1000) },
           ...lanes.stats(), queue: queue.stats(),
           // Upstream rejections are the fastest way to see what the provider is
           // doing wrong, so they are in the health payload rather than only in
@@ -1638,6 +1681,13 @@ export function createServer () {
 
 export function start () {
   const server = createServer()
+  // cloudflared pools its origin connections and holds an idle one for about 90s.
+  // Node's default keepAliveTimeout is 5s, so the connector can pick a socket the
+  // relay has just closed: the request never reaches the handler and the client gets
+  // a 502 that no relay counter can explain. Keep the origin socket open past the
+  // connector's idle window. headersTimeout must stay above it.
+  server.keepAliveTimeout = 120000
+  server.headersTimeout = 125000
   catalogue.start()
   server.listen(PORT, HOST, () => {
     console.log(`[relay] build ${config.BUILD_ID} built ${config.BUILD_BUILT}`)
