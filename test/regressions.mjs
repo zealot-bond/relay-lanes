@@ -356,6 +356,43 @@ const scenarios = {
     ]
   },
 
+  // The free tier's GATE dressed as quota exhaustion: `429 FreeUsageLimitError ... Free
+  // models work in OpenCode`, with a midnight-UTC Retry-After, returned to any request it
+  // does not recognise as the first-party client. It looks exactly like a spent bucket, so
+  // for two days it WAS treated as one -- the operator was told to wait for a reset that
+  // would change nothing. If one reaches a client now, the message must name the gate.
+  async 'client: the gate\'s fake quota is named as a gate, not a reset' () {
+    const { B, post } = await bootRelay(18931, {})
+    for (const id of ['A', 'B', 'C']) await post('/lane/register', { laneId: id })
+    for (const id of ['A', 'B', 'C']) {
+      ;(async () => {
+        for (;;) {
+          const r = await fetch(B + `/lane/claim?laneId=${id}&wait=1000`, { headers: H }).catch(() => null)
+          if (!r) return
+          if (r.status !== 200) continue
+          const c = await r.json()
+          await post('/lane/result', { laneId: id, entryId: c.entryId, result: { kind: 'limited', status: 429, ms: 5,
+            retryAfter: 37551,
+            raw: '{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai)"}}',
+            data: null } })
+        }
+      })()
+    }
+    const res = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }) })
+    const body = await res.json().catch(() => ({}))
+    const msg = String(body?.error?.message || '')
+    return [
+      { name: 'still reported as 429 with Retry-After',
+        ok: res.status === 429 && Boolean(res.headers.get('retry-after')), detail: `${res.status} ${res.headers.get('retry-after')}` },
+      { name: 'the message names the fingerprint gate', ok: /fingerprint gate/i.test(msg), detail: msg.slice(0, 160) },
+      { name: 'and says how to fix it (Bun egress / env / tools)',
+        ok: /Bun egress/i.test(msg) && /<env>/.test(msg) && /tool names/i.test(msg), detail: msg.slice(0, 220) },
+      { name: 'it does NOT promise a reset that would change nothing',
+        ok: !/reopens at/.test(msg), detail: msg.slice(0, 160) },
+    ]
+  },
+
   // /health went through an entire rate-limit storm reporting recentFailures: [] because
   // `limited` was excluded from logging along with the kinds that must not count toward
   // model health. The operator had served=0 and nothing else to go on.

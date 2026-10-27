@@ -7,7 +7,7 @@
 // duplication/interleaving symptoms, so a regression fails here in milliseconds
 // instead of needing a live runner.
 
-import { parseForTest, buildForTest } from '../src/lane.js'
+import { parseForTest, buildForTest, ensureEnvBlock } from '../src/lane.js'
 
 let failures = 0
 const check = (name, cond, detail = '') => {
@@ -273,6 +273,79 @@ console.log('\ntoResponsesInput: parallel id-less calls get distinct call ids')
   const ids = body.input.filter((i) => i.type === 'function_call').map((i) => i.call_id)
   check('two function_call items', ids.length === 2, JSON.stringify(body.input))
   check('call ids are distinct', new Set(ids).size === 2, JSON.stringify(ids))
+}
+
+// ------------------------------------------------ the gate's <env> requirement
+//
+// Measured 2026-10-26 by bisection: the free tier answers 200 only when the system
+// prompt contains an `<env>` block with a `Working directory:` line inside it. A
+// `<env>` block without one, the line outside a tag, or an otherwise perfect prompt
+// with no env block all answer a fake `429 FreeUsageLimitError`. These checks pin the
+// injection, and just as importantly that a client's own block is left alone.
+console.log('\nensureEnvBlock: the free tier\'s prompt requirement')
+{
+  check('a client block with a working directory is untouched',
+    ensureEnvBlock('x\n<env>\n  Working directory: /home/me/proj\n  Platform: linux\n</env>')
+      === 'x\n<env>\n  Working directory: /home/me/proj\n  Platform: linux\n</env>')
+  check('a missing working directory is added INSIDE the client block', (() => {
+    const out = ensureEnvBlock('<env>\n  Platform: linux\n</env>')
+    return /<env>[\s\S]*Working directory:[\s\S]*<\/env>/.test(out) &&
+      (out.match(/<env>/g) || []).length === 1
+  })())
+  check('a prompt with no env block gets one', /<env>[\s\S]*Working directory:[\s\S]*<\/env>/.test(ensureEnvBlock('be terse')))
+  check('the appended block is not glued onto the last word', /terse\n\n<env>/.test(ensureEnvBlock('be terse')))
+  check('empty text still yields a usable block', /<env>[\s\S]*Working directory:/.test(ensureEnvBlock('')))
+  check('a working directory outside a tag is not mistaken for one', (() => {
+    const out = ensureEnvBlock('Working directory: /x')
+    return /<env>[\s\S]*Working directory:[\s\S]*<\/env>/.test(out)
+  })())
+  check('an unmatched <env> is not treated as a block', (() => {
+    const out = ensureEnvBlock('notes about <env> tags')
+    return /<env>[\s\S]*Working directory:[\s\S]*<\/env>/.test(out)
+  })())
+}
+
+console.log('\nbuildUpstreamBody: every request reaches upstream gate-shaped')
+{
+  const user = { role: 'user', content: 'hi' }
+  const chat = buildForTest({ model: 'big-pickle', messages: [user] })
+  check('chat: a system message is added when there is none',
+    chat.messages[0]?.role === 'system' && /Working directory:/.test(chat.messages[0].content),
+    JSON.stringify(chat.messages.slice(0, 2)))
+  check('chat: the user message is not rewritten',
+    chat.messages[1]?.role === 'user' && chat.messages[1].content === 'hi')
+
+  const chatOwn = buildForTest({
+    model: 'big-pickle',
+    messages: [{ role: 'system', content: 'you are a client\n<env>\n  Working directory: /repo\n</env>' }, user],
+  })
+  check('chat: a client env block survives byte for byte',
+    chatOwn.messages[0].content === 'you are a client\n<env>\n  Working directory: /repo\n</env>',
+    JSON.stringify(chatOwn.messages[0].content))
+
+  const chatDev = buildForTest({
+    model: 'big-pickle',
+    messages: [{ role: 'developer', content: 'rules' }, user],
+  })
+  check('chat: a developer message is treated as the system prompt',
+    /Working directory:/.test(chatDev.messages[0].content) && chatDev.messages.length === 2,
+    JSON.stringify(chatDev.messages))
+
+  // The responses dialect renders content as input_text parts, so flatten before
+  // matching: the block is inside the text, not a part of its own.
+  const textOf = (item) => Array.isArray(item?.content)
+    ? item.content.map((p) => p.text || '').join('')
+    : String(item?.content || '')
+
+  const resp = buildForTest({ model: 'muse-spark-1.2-contributor-free', system: 'be terse', messages: [user] })
+  check('responses: the system input carries the block',
+    resp.input.some((i) => i.role === 'system' && /Working directory:/.test(textOf(i))),
+    JSON.stringify(resp.input))
+
+  const respNoSys = buildForTest({ model: 'muse-spark-1.2-contributor-free', messages: [user] })
+  check('responses: a block is added even without a system prompt',
+    respNoSys.input.some((i) => i.role === 'system' && /Working directory:/.test(textOf(i))),
+    JSON.stringify(respNoSys.input))
 }
 
 console.log(`\n${failures === 0 ? 'ALL UNIT CHECKS PASSED' : `${failures} UNIT CHECK(S) FAILED`}\n`)

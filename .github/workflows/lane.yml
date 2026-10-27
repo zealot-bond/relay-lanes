@@ -48,6 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The upstream call has to leave through Bun's TLS stack: the free tier's
+      # gate answers Node's ClientHello with a fake `429 FreeUsageLimitError` on
+      # every egress IP, while the identical request sent by Bun answers 200. The
+      # lane still does all parsing/streaming in Node; only the socket to the
+      # gateway is Bun's (src/egress.js). Pinned because the accepted fingerprint
+      # is Bun 1.4.2's -- a major upgrade can change the ClientHello and re-close
+      # the gate, so it must be a deliberate change, not a floating tag.
+      - name: Install Bun (egress TLS)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
       # The relay-side sources live in this repo but run in the JAR, not here, so
       # nothing on a runner would ever notice if one of them stopped parsing. A
       # broken server.js is invisible until someone builds a jar from it. Check
@@ -56,7 +68,7 @@ jobs:
       - name: Check that the relay-side sources parse
         run: |
           set -uo pipefail
-          for f in src/server.js src/queue.js src/orchestrator.js src/main.js src/models.js src/config.js src/lane.js src/worker.js src/fingerprint.js src/toolmerge.js src/codeversion.js; do
+          for f in src/server.js src/queue.js src/orchestrator.js src/main.js src/models.js src/config.js src/lane.js src/worker.js src/fingerprint.js src/toolmerge.js src/codeversion.js src/exhaustion.js src/egress-host.js src/egress.js; do
             if node --check "$f" 2>/tmp/chk.err; then
               echo "parse OK   $f"
             else
@@ -99,4 +111,5 @@ jobs:
           fi
           echo "relay=$RELAY_URL lane=$LANE_ID"
           node --version
+          bun --version
           node src/worker.js

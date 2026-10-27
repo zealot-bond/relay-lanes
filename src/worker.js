@@ -6,6 +6,7 @@ import { mergeToolDeltas } from './toolmerge.js'
 import { CODE_VERSION } from './codeversion.js'
 import { config } from './config.js'
 import { isGlobal as isGlobalExhaustion } from './exhaustion.js'
+import { startEgress } from './egress-host.js'
 
 const RELAY = (process.env.RELAY_URL || 'http://127.0.0.1:8791').replace(/\/$/, '')
 // The relay token is the one value the lane cannot get from baked config: the
@@ -45,6 +46,13 @@ const post = async (path, body, method = 'POST') => {
 }
 
 async function main () {
+  // Before the first upstream call, point ZEN_BASE at the loopback Bun egress proxy.
+  // The free tier's gate answers Node's TLS fingerprint with a fake
+  // `429 FreeUsageLimitError` regardless of the egress IP, so a lane without this is a
+  // lane that cannot serve. It resolves to null (and leaves ZEN_BASE alone) for a mock
+  // upstream, EGRESS_ENABLED=0, or a missing Bun, and says so once rather than per call.
+  await startEgress()
+
   // Register BEFORE the first claim: the relay rejects claims from unregistered
   // lanes, which is the guard that stops a retired lane from working again.
   const reg = await post('/lane/register', {

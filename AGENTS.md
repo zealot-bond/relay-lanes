@@ -14,6 +14,12 @@ independent rate-limit buckets. Measured on this account:
 That is the entire reason this architecture exists. There is no proxy pool, no
 public proxy list, no WARP farm.
 
+One correction to the framing, measured 2026-10-26: a 429 from this gateway is usually
+**not** a spent bucket. It is a gate that refuses any request not shaped like the
+first-party client, on every IP at once. Per-IP bucketing is real, but the gate is what
+made a 20-lane pool answer "Free usage limit reached" with `served: 0`. Read the gate
+section below before concluding that an IP is rate limited.
+
 Clients get a normal OpenAI API. The upstream vendor is never named in the public
 surface: models are `github/<model>`, and `/v1/models`, `/health` and `/dashboard`
 contain no vendor string.
@@ -30,6 +36,62 @@ client ──HTTP──▶ relay (server.jar) ──queue──▶ lane (GitHub 
 Only the **upstream call** goes through a runner. The client-facing path is the jar,
 which is why relay overhead is ~76ms.
 
+## The gate keys on the REQUEST, not the egress IP (2026-10-26)
+
+The 429 that looked like a spent bucket is not a quota at all. The free tier answers
+
+```
+429 {"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit
+    reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode
+    Go to keep going: https://opencode.ai/go"}}
+Retry-After: <seconds until 00:00 UTC>
+```
+
+to any request it does not recognise as the first-party client, and 200 to the same
+body when it does. Every egress IP gets it, at any hour, so "N runners = N buckets"
+answers nothing here: all N buckets were shut because all N requests looked wrong. That
+is why the relay answered 429 with `served: 0` and `retired: 0` while the installed
+client on the same machine answered 200.
+
+Found by bisecting a captured client request (23,085 bytes of body, headers included)
+against the live upstream. Three independent discriminators, each verified by sending
+the identical request with one thing changed:
+
+| discriminator | passes (200) | fails (429) |
+|---|---|---|
+| TLS ClientHello | Bun 1.4.2 — JA3 `19d4af7f3a46e687da19563bc297b55a`; this is what the client is built with | Node 22 `978f4a0de175a6b5ba61b6e468768fbc`, curl `6485bc9ddc87435b7dfc8e7148e76c4f` |
+| system prompt | an `<env>` block containing a `Working directory:` line | a block without it, the line outside a tag, a different prompt, no block |
+| tools | `bash,glob,grep,read` present (any superset) | no tools, or a set missing the gateway's names (`[shell]` alone fails) |
+
+Not discriminators, each tested alone with the client body: `Authorization: Bearer public`
+vs the account token, a missing `x-opencode-org-id`, the relay's own project id, no
+`b3`/`traceparent`, `max_tokens` vs `max_completion_tokens`. Session ids must be `ses_` +
+26 chars, which `opencodeId()` already produced.
+
+So the relay **guarantees the shape** instead of trying to classify the answer:
+
+- `src/egress.js` is a **Bun** loopback proxy; `lane.js` opens plain HTTP to it and Bun
+  opens the TLS socket to opencode.ai. Everything else — parsing, tool-call merge,
+  streaming, classification — stays in Node, so the two transports cannot diverge.
+  `src/egress-host.js` starts and supervises it, rewrites `ZEN_BASE` to
+  `http://127.0.0.1:<port><prefix>`, and is called by `worker.js` before it registers and
+  by `main.js` before the server starts (DIRECT_MODE and DIRECT_FALLBACK need it too).
+- `ensureEnvBlock()` puts the block in the first system/developer message in **both**
+  dialects, and when a client sends an `<env>` block without a working directory it adds
+  the line *inside* that block rather than appending a second, contradicting one.
+- the four gateway tools are still unioned with the client's, as before.
+
+Measured through the real path (Node lane → Bun proxy → upstream, no relay in between):
+all three served models answer 200 (`deepseek` 2.1s, `glm` 1.8s, `mimo` 5.9s) and a
+streamed `bash` call arrives as one call with an id, a name and parseable arguments. The
+same body sent with Node's TLS answers the fake 429 above.
+
+Cost: the lane needs `bun` on PATH (`BUN_BIN`; `EGRESS_ENABLED=0` disables the proxy).
+Both workflows install it with `oven-sh/setup-bun`, **pinned to 1.4.2** — the accepted
+fingerprint belongs to that ClientHello, so an upgrade must be deliberate. A missing Bun
+is logged once and upstream calls fall back to Node TLS: the lane still serves, it just
+gets 429s.
+
 ## TWO deployment surfaces — read this before debugging anything
 
 The code is split across two places that are deployed by **different mechanisms**:
@@ -37,10 +99,16 @@ The code is split across two places that are deployed by **different mechanisms*
 | runs in | files | deployed by |
 |---|---|---|
 | the **jar** (the panel) | `server.js` `queue.js` `orchestrator.js` `main.js` | uploading `server.jar` |
-| the **runners** (GitHub) | `lane.js` `fingerprint.js` `worker.js` `toolmerge.js` `config.js` `models.js` `codeversion.js` | **`git push` to the runner repo** (`GH_REPO`) |
+| the **runners** (GitHub) | `lane.js` `fingerprint.js` `worker.js` `toolmerge.js` `config.js` `models.js` `codeversion.js` `egress.js` `egress-host.js` | **`git push` to the runner repo** (`GH_REPO`) |
 
 The jar contains copies of the lane files, but it never executes them for upstream
 calls. **Rebuilding and uploading the jar does not change what the runners do.**
+
+`egress.js`/`egress-host.js` are the exception to that split: they run in **both** places
+(the relay starts the proxy in `main.js` for DIRECT_MODE/DIRECT_FALLBACK, a lane starts it
+in `worker.js`), so they ship through both mechanisms and are part of `LANE_FILES` — a
+lane whose proxy differs from the jar's is reported as stale code, which is right, because
+a different proxy is a different transport fingerprint.
 
 This was the cause of a long run of "fixed but still broken" reports: lane-side fixes
 were built into the jar for many rounds while the runners kept executing code from
@@ -74,7 +142,9 @@ To deploy lane changes: `git push` `src/` to the runner repo, cancel runs, then 
 | `src/config.js` | Resolves config: **env → `start.properties` → `baked-credentials.json`**. |
 | `src/server.js` | Client API (`/v1/*`), lane endpoints (`/lane/*`), dispatch + retry, model health/quarantine. |
 | `src/queue.js` | `WorkQueue` (FIFO, claim leases, single-exit `finish`) and `LaneRegistry`. |
-| `src/lane.js` | Runs **inside a runner**. Upstream call, tool-call extraction, protocol dialects. |
+| `src/lane.js` | Runs **inside a runner**. Upstream call, tool-call extraction, protocol dialects, `<env>` injection. |
+| `src/egress.js` | **Bun** loopback proxy. The only thing that talks TLS to the gateway; see the gate section. |
+| `src/egress-host.js` | Node supervisor for `egress.js`: picks a port, spawns/restarts it, rewrites `ZEN_BASE`. |
 | `src/worker.js` | The lane loop: register → claim → serve → report. |
 | `src/orchestrator.js` | Keeps `workflow_dispatch` runs topped up so the lane pool stays full. |
 | `src/models.js` | Model catalogue and which upstream protocol each model speaks. |
@@ -293,6 +363,13 @@ and **fails loudly** if it cannot find them (a missing toolchain once produced a
 empty build with no message). Each build stamps `build-info.json`; the id appears in
 the startup banner, `/health` and `/v1/models`.
 
+The jar bundles **Node, not Bun.** The lane-side egress proxy is a Bun script, so the
+process that runs the lane needs `bun` on PATH — both workflows install it with
+`oven-sh/setup-bun` pinned to `1.4.2`. A jar run without Bun still starts and serves; it
+just gets the fake 429 on every upstream call (one clear log line says so). If that is
+ever going to be packaging work rather than a workflow step, bundle Bun next to the
+Node runtime in `pack-jar.sh` and set `BUN_BIN` to it.
+
 `baked-credentials.json` is bundled into the jar and contains live credentials.
 An operator's override file is `start.properties` in **`.relay/app-payload/`** (the
 launcher preserves it across re-extraction), not next to `server.jar`. Empty values
@@ -301,7 +378,7 @@ are ignored at every layer, so a property cannot be used to *blank* a baked secr
 ## Tests
 
 ```bash
-node test/units.mjs          # converters, SSE fold, dialect shapes
+node test/units.mjs          # converters, SSE fold, dialect shapes, <env> injection
 node test/wire-toolcalls.mjs # serialised bytes a client reassembles
 node test/stream-safety.mjs  # keepalive, ordering, backpressure model
 node test/tool-shapes.mjs    # tool spec normalisation + gate-safe dedupe
@@ -310,10 +387,11 @@ node test/catalogue-live.mjs # live listing, efforts, learned window lowering
 node test/catalogue-allow.mjs    # CATALOGUE_ALLOW filtering, seed included
 node test/catalogue-published.mjs # published limits, measured override, Retry-After
 node test/context-overflow.mjs    # overflow classification/health/message
-node test/exhaustion.mjs          # long Retry-After is global: keep lanes, stop calling
-node test/limit-global.mjs        # end to end: lane kept, client told, no second upstream call
-node test/regressions.mjs    # 38 checks over 14 loopback scenarios
-node test/adversarial.mjs   # 48 checks, end to end: real relay + real lanes + mock upstream
+node test/exhaustion.mjs          # default OFF; an explicit threshold still classifies
+node test/limit-global.mjs        # both configs end to end: default retires the lane,
+                                  # EXHAUSTION_GLOBAL_S=7200 keeps it and stops calling
+node test/regressions.mjs    # 59 checks over 15 loopback scenarios
+node test/adversarial.mjs   # 54 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
 SRC_DIR=/older/src node test/adversarial.mjs   # negative control
 NO_BOOT=1 PORT=26002 node test/adversarial.mjs # test an ALREADY-RUNNING relay (the packed jar)
@@ -329,6 +407,13 @@ other suite because each was correct in isolation and wrong only in composition.
 **Never point `adversarial.mjs` at a port another relay already owns.** Its own relay
 cannot bind, its lanes then register against the squatter, and the run reports a mass
 upstream failure instead of a port clash. It now refuses to start if the port answers.
+
+The gate itself is **not** covered by an automated test, because it needs the live
+upstream and a real Bun: `test/units.mjs` pins the `<env>` injection (including that a
+client's block survives byte for byte), and a manual check is
+`node /tmp/.../verify-egress.mjs`-style — start `egress-host.js`, call `callUpstream`, and
+expect `kind: ok`. The negative control is the same call with `EGRESS_ENABLED=0`, which
+must answer `limited` / 429. Both were run on 2026-10-26: Bun 200 `pong`, Node 429.
 
 `regressions.mjs` runs the real modules over loopback (real HTTP server, raw sockets,
 a TLS mock for the upstream), one process per scenario. **Point it at the pre-fix tree
@@ -532,8 +617,15 @@ The relay called `https://opencode.ai/zen/v1`. The installed client (OpenCode **
 does not: the models.dev catalogue it loads declares the `opencode` provider as
 `@ai-sdk/openai-compatible` at **`https://opencode.ai/inference/v1`**, and the binary's
 request headers (`x-opencode-client`, `x-opencode-session`, `x-session-affinity`,
-`X-Session-Id`, `x-opencode-project`) were read straight out of it. `ZEN_BASE` now defaults
-to `https://opencode.ai/inference`.
+`X-Session-Id`, `x-opencode-project`) were read straight out of it.
+
+As of 2026-10-26 the catalogue declares the chat base as
+**`https://opencode.ai/inference/openai/v1`** (`/chat/completions`, `/responses`) while the
+model list stays at **`https://opencode.ai/inference/v1/models`** — the listing is one
+level up from the chat path; `<chat base>/models` answers 404. `ZEN_BASE` defaults to the
+chat base and `modelsUrl()` derives the listing, and `canonicalBase()` rewrites the older
+prefixes (`/zen/v1`, `/inference`, `/inference/v1`) so a stale value in an operator's
+baked config cannot become a 404 on every request.
 
 The reference proxy `Steve3184/OpenCodeProxyHub` hardcodes `/zen/v1` too. Useful as a
 cross-check on architecture -- it classifies this gate as an egress problem and fixes it
@@ -549,9 +641,12 @@ does not, and none of them advertised the gateway's four tools.
 What is genuinely established, by measurement:
 - OpenCode runs **anonymously** here -- `account`, `control_account` and `credential` are
   all empty and `OPENCODE_API_KEY` is unset -- so no credential is involved.
-- Headers, HTTP/1.1 vs HTTP/2, Node vs Bun TLS, and the endpoint path were each ruled out
-  as *sole* causes by a request that succeeded through the relay.
-- The gate is not a hard IP block: this host reaches the free tier reliably in direct mode.
+- The gate is not a hard IP block, and not headers: the request's *shape* is what it
+  checks, and the same host/body answers 200 or 429 depending only on that. The three
+  discriminators are listed in the gate section above. An earlier version of this list
+  said "Node vs Bun TLS was ruled out" — that was wrong: it was ruled out only for
+  requests that already failed the other two checks, and the transport turned out to be
+  the one a gateway-side stack could not be changed, hence the Bun proxy.
 
 ## Only the chosen models are served, and the window is published, not hardcoded
 
@@ -573,40 +668,40 @@ generation (`catalogue.noteContextRefusal`), floored at `MIN_CONTEXT_WINDOW`. Th
 oversized prompt costs one refusal instead of being repeated at every lane and every
 reconnect.
 
-## Exhaustion carries the provider's own reset window -- and closes the relay
+## Exhaustion: the long-Retry-After breaker is OFF, because that window was fake
 
-The gateway answers a spent bucket with `Retry-After` in the header. The relay used to read
-only the body and fall back to a guessed 900s, so clients retried long before the window
-reopened. `lane.js` now copies the header into the verdict and the client-facing 429 uses
-it, naming the reset time when the wait is ten minutes or more.
+The gateway answers a spent bucket with `Retry-After` in the header, and the relay copies
+it into the verdict so a client-facing 429 names the provider's own reset. That part
+stands.
 
-Measured 2026-10-26: `Retry-After: 37551` at 13:33 UTC -- the daily reset at 00:00 UTC.
+What did **not** stand is the conclusion drawn from `Retry-After: 37551` at 13:33 UTC on
+2026-10-26. It looked like one daily window shared by every egress IP, so a breaker was
+added that kept the lane, answered immediately, and stopped all upstream calls and
+dispatching until it passed. It was measuring the gate: the long Retry-After is the fake
+quota described in the section above, returned to *any* request not shaped like the
+first-party client, on *any* IP. A real client on the same IP answered 200 the whole time.
+So the breaker **defaults to `EXHAUSTION_GLOBAL_S=0`, which disables it**, and
+`isGlobal()` returns false at a non-positive threshold instead of treating every
+`limited` as global.
 
-A Retry-After at or above `EXHAUSTION_GLOBAL_S` (1800s) is treated as **global**: every
-egress IP sees the same window, so
+With the default, a long Retry-After behaves like any other per-IP limit: the lane is
+retired and the client gets the 429 with the upstream's own `Retry-After`. That is
+correct — retiring a lane whose egress really is spent is how the pool replaces a spent
+IP. `test/limit-global.mjs` runs **both** configurations end to end: the default must not
+arm the breaker (and must still retire the lane and pass the 429 through), and an explicit
+`EXHAUSTION_GLOBAL_S=7200` must keep the lane and make no second upstream call.
+`/health` -> `exhaustion` reports `active`, `until`, `retryAfterS`, `model`, `hits` and
+`thresholdS`, so "is this deployment running the breaker?" is one field.
 
-- the lane is **kept**, not retired -- replacing its IP would buy another copy of the same
-  429, and one request per retired lane emptied a 20-lane pool;
-- the request is answered immediately, with the provider's reset time, instead of being
-  retried across lanes;
-- no upstream call is made at all while the breaker is armed (`src/exhaustion.js`);
-- the **orchestrator stops dispatching**, because a lane cannot serve a closed window and
-  runner minutes spent on it are wasted. Existing lanes expire; the pool refills on the
-  first request after the window passes.
-
-A short Retry-After keeps the per-IP behaviour (retire the lane, retry on another egress),
-because another IP genuinely can answer there. `/health` -> `exhaustion` reports
-`active`, `until`, `retryAfterS`, `model` and `hits`, and `test/exhaustion.mjs` pins the
-classification boundary.
-
-Two places made the first version of this a no-op, and both are easy to reintroduce:
+The mechanism is kept, because a genuinely global window may exist one day and the
+classification is cheap. Two details that made its first version a no-op are still worth
+knowing if you re-enable it:
 
 - **`worker.js` builds the result it POSTs to `/lane/result` field by field.** It omitted
   `retryAfter`, so the relay received the 429 without the provider's window and armed
-  nothing (the client kept seeing the guessed 900). `test/limit-global.mjs` asserts what a
-  client actually receives, which is the only place that shows up.
+  nothing (the client kept seeing the guessed 900).
 - **`worker.js` exits 75 on `limited`** to ask for a replacement runner. For a global
-  window that is exactly the wrong move; it now stays registered when the reset is long.
+  window that is exactly the wrong move; it stays registered when the reset is long.
 
 ## The catalogue rots silently -- and NO list predicts anything
 

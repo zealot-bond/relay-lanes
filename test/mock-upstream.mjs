@@ -135,9 +135,11 @@ const scenarios = {
   // This IP's bucket is spent. A client behind a rate-limited relay sees this as the whole
   // catalogue going quiet at once, and the only real remedy is a different egress IP.
   free_usage_limit: (res) => { res.writeHead(429, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' } })) },
-  // The daily free-tier reset: the same 429, but the provider names a window hours away
-  // in the header. Every egress IP sees this one, so the relay must keep the lane (its IP
-  // was never the variable) and answer without calling upstream again.
+  // A long Retry-After. This is the shape the free tier's GATE uses (see the gate section
+  // in AGENTS.md), which is why the default EXHAUSTION_GLOBAL_S is 0: the window is fake,
+  // so the relay retires the lane like any per-IP limit. test/limit-global.mjs also runs
+  // it with an explicit EXHAUSTION_GLOBAL_S=7200, where the lane must be KEPT and no
+  // further upstream call made.
   free_usage_limit_daily: (res) => {
     res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '7200' })
     res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached. The free model quota resets soon.' } }))

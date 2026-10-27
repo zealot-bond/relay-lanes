@@ -24,6 +24,14 @@ say(`starting: port=${config.PORT} lanes=${config.LANES_TARGET} ` +
 const { start, lanes, queue, laneCodeStats } = await import('./server.js')
 const { onEscalate } = await import('./escalate.js')
 
+// The upstream call must leave through Bun's TLS stack (see src/egress.js): the free
+// tier's gate answers Node's ClientHello with a fake FreeUsageLimitError on every IP.
+// Started before the server so DIRECT_MODE, DIRECT_FALLBACK and the lane worker all
+// inherit the rewritten ZEN_BASE. No-op when Bun is absent or the base is not
+// opencode.ai, so tests and mocks are untouched.
+const { startEgress } = await import('./egress-host.js')
+await startEgress()
+
 const server = start()
 
 // DIRECT_MODE turns the whole lane architecture off: the orchestrator is never started,

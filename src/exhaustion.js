@@ -1,20 +1,25 @@
 // A spent free-tier window that reopens hours later is not a lane fault.
 //
 // The relay retires a lane on `limited` because the next runner has a different egress
-// IP and therefore a different bucket. That is right for a short window, and measured
-// wrong for the daily one: on 2026-10-26 the upstream answered every request with
+// IP and therefore a different bucket. That is right for a short window.
+//
+// This breaker existed because on 2026-10-26 the upstream answered every request from
+// this host and from every runner at once with
 //
 //   429 FreeUsageLimitError, Retry-After: 37551   (the reset at 00:00 UTC)
 //
-// from this host and from every runner at once. Retiring the lane then spends a runner
-// to replace an IP that was never the variable, and retrying across lanes burns attempts
-// (and CI minutes) to learn the same sentence each time.
+// which looked like one window shared by all IPs. It was not: measured the same day by
+// bisection, that 429 is the free-tier GATE's fake quota, returned to any request that
+// is not shaped like the first-party client (Bun's TLS fingerprint, an `<env>` block with
+// a working directory, the four gateway tool names). A real client on the same IP answered
+// 200 while every lane was "exhausted". So the premise is invalid and the breaker defaults
+// OFF (EXHAUSTION_GLOBAL_S=0); the gate is prevented, not classified -- see
+// src/egress.js and ensureEnvBlock() in lane.js.
 //
-// So a `limited` result whose Retry-After is at least EXHAUSTION_GLOBAL_S is treated as
-// GLOBAL: the lane is kept, the request is answered with the provider's own reset time,
-// and no upstream call is made at all until the window passes. When it passes, traffic
-// flows again -- that pass is the probe. A short Retry-After keeps the old behaviour,
-// because another IP genuinely can answer there.
+// The mechanism is kept for a deployment that has measured a genuinely global window: a
+// `limited` result whose Retry-After is at least EXHAUSTION_GLOBAL_S keeps the lane and
+// stops upstream calls until it passes. A short Retry-After always keeps the per-IP
+// behaviour, because another IP genuinely can answer there.
 import { config } from './config.js'
 
 const state = {
@@ -32,9 +37,14 @@ const state = {
  * carrying a Retry-After is still about the request, not the bucket.
  */
 export function isGlobal (result, thresholdS = config.EXHAUSTION_GLOBAL_S) {
+  const threshold = Number(thresholdS) || 0
+  // 0 (or a non-positive value) means the concept is disabled: no Retry-After is long
+  // enough to close the relay. Without this guard every `limited` at threshold 0 would
+  // be "global", including the ordinary per-IP ones the lane retry exists for.
+  if (threshold <= 0) return false
   if (!result || result.kind !== 'limited') return false
   const s = Number(result.retryAfter)
-  return Number.isFinite(s) && s >= thresholdS
+  return Number.isFinite(s) && s >= threshold
 }
 
 /** Arm the breaker from a limited result's own Retry-After. */

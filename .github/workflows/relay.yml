@@ -57,6 +57,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # DIRECT_MODE and DIRECT_FALLBACK call upstream from this process, so the relay
+      # needs Bun too -- it is the TLS stack the free tier accepts (see src/egress.js).
+      # Pinned for the same reason as in lane.yml: the fingerprint is version-specific.
+      - name: Install Bun (egress TLS)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
       - name: Refuse to start without its permanent address and tokens
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}

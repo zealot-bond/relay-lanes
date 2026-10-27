@@ -24,7 +24,7 @@
 // while the pings run. Seed models carry no effort data, so they are served without variants.
 
 import { config } from './config.js'
-import { zenBase, headers, newSessionId, newRequestId, OPENCODE_UA } from './fingerprint.js'
+import { modelsUrl, headers, newSessionId, newRequestId, OPENCODE_UA } from './fingerprint.js'
 import { callUpstream } from './lane.js'
 import { MODELS as SEED, PROVIDER, splitModelId } from './models.js'
 
@@ -158,7 +158,7 @@ let state = {
   lastPing: null,
 }
 
-const listUrl = () => config.CATALOGUE_URL || `${zenBase()}/v1/models`
+const listUrl = () => config.CATALOGUE_URL || modelsUrl()
 
 export function count () { return entries.size }
 

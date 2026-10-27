@@ -3,10 +3,19 @@
 //
 // Two failure modes must be kept distinct:
 //   403 FreeTierError  -> our fingerprint is wrong (client gate). Never a 429.
-//   429 FreeUsageLimitError -> genuine quota exhaustion for this egress IP.
+//   429 FreeUsageLimitError -> quota exhaustion for this egress IP ... or the GATE
+//                              (see below): the same body, on any IP, whenever the
+//                              request is not shaped like the first-party client.
 //
 // Treating the first as the second wastes buckets; treating the second as the
 // first hides real exhaustion. So they are separate codes everywhere.
+//
+// But a 429 is not reliably a quota: measured 2026-10-26, the same 429 (with a
+// midnight-UTC Retry-After) is what the free tier returns to any request it does not
+// recognise as the first-party client -- wrong TLS stack, no <env> block, or a tool set
+// missing bash/glob/grep/read. `classifyUpstream` still reports that as `limited`, so the
+// shape is guaranteed instead: Bun's TLS via src/egress.js, ensureEnvBlock() in lane.js,
+// and the four gateway tools unioned with the client's. See the gate section in AGENTS.md.
 
 import crypto from 'node:crypto'
 
@@ -20,21 +29,29 @@ export const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/2.1.2/cli
 export const OPENCODE_CLIENT = 'cli'
 export const OPENCODE_PROJECT = crypto.createHash('sha1').update('relay-lanes').digest('hex')
 
-// The upstream moved. models.dev -- the catalogue OpenCode v2 itself loads -- declares
-// the `opencode` provider as `@ai-sdk/openai-compatible` at
-//   https://opencode.ai/inference/v1
-// and the installed client (v2.0.22) calls exactly that. This relay was still calling the
-// older `https://opencode.ai/zen`, which is the path the reference proxy
-// (Steve3184/OpenCodeProxyHub) also hardcodes and which now answers
+// The upstream moved twice. It was `https://opencode.ai/zen`, then
+// `https://opencode.ai/inference`, and the catalogue the current client (v2.1.2) loads
+// declares the `opencode` provider as `@ai-sdk/openai-compatible` at
+//   https://opencode.ai/inference/openai/v1
+// which is what this base is. The model LIST stayed at /inference/v1/models -- one level
+// up -- so it is derived by modelsUrl() rather than appended to this base; that mismatch
+// is exactly why the catalogue refresh answered 404 while chat worked.
+//
+// The chat base is also the one the reference proxy (Steve3184/OpenCodeProxyHub) does not
+// use: it hardcodes `/zen/v1`, which now answers
 //   HTTP 403 {"error":{"type":"FreeTierError",
 //     "message":"OpenCode's free tier can only be used from within OpenCode."}}
-// for every request. Both paths return that here, so switching is not by itself proven to
-// fix it -- but calling a path the current client does not use is wrong regardless, and
-// /zen/v1/models (the only list reachable without that 403) has shrunk to 86 entries and
-// omits models the real catalogue still carries, so it cannot be trusted either.
-export const ZEN_BASE = process.env.ZEN_BASE || 'https://opencode.ai/inference'
-export const RESPONSES_PATH = '/v1/responses'
-export const CHAT_PATH = '/v1/chat/completions'
+// for every request. Calling a path the current client does not use is wrong regardless
+// of what it returns, so canonicalBase() rewrites the older prefixes instead of trusting
+// whatever a three-layer config resolution produced.
+export const ZEN_BASE = process.env.ZEN_BASE || 'https://opencode.ai/inference/openai/v1'
+export const RESPONSES_PATH = '/responses'
+export const CHAT_PATH = '/chat/completions'
+// The gateway publishes its model list under /inference/v1, NOT under the
+// openai-compatible prefix the chat dialect lives on (/inference/openai/v1):
+// measured 2026-10-26, /inference/openai/v1/models answers 404 while
+// /inference/v1/models answers 200.
+export const MODELS_PATH = '/inference/v1/models'
 
 /**
  * Resolve ZEN_BASE at CALL time, not import time.
@@ -45,7 +62,64 @@ export const CHAT_PATH = '/v1/chat/completions'
  * constant above is kept because it is exported, but every request path uses
  * this function.
  */
-export const zenBase = () => process.env.ZEN_BASE || ZEN_BASE
+export const zenBase = () => canonicalBase(process.env.ZEN_BASE || ZEN_BASE)
+
+/**
+ * The chat dialect and the model listing do NOT live under the same prefix.
+ *
+ * Chat:    https://opencode.ai/inference/openai/v1/chat/completions
+ * Listing: https://opencode.ai/inference/v1/models
+ *
+ * and the prefix changed twice before (`/zen/v1`, then `/inference`), each time
+ * leaving a stale value in an operator's baked config. Since ZEN_BASE is resolved
+ * from three layers and the relay ships as a jar, a base pointing at any of the
+ * older prefixes is rewritten here rather than producing a 404 per request. Any
+ * other host is left exactly as configured, which is what makes a mock usable.
+ */
+export const CANONICAL_PREFIX = '/inference/openai/v1'
+const OLD_PREFIX = /^\/(?:zen|inference|inference\/openai|inference\/v1|inference\/openai\/v1)\/?$/
+
+export function canonicalBase (raw) {
+  try {
+    const u = new URL(raw)
+    if (u.hostname === 'opencode.ai' && OLD_PREFIX.test(u.pathname)) {
+      return u.origin + CANONICAL_PREFIX
+    }
+  } catch { /* not a URL: return it untouched and let the caller fail loudly */ }
+  return raw
+}
+
+/**
+ * The real upstream base, even while ZEN_BASE points at the loopback egress proxy.
+ *
+ * `modelsUrl()` cannot derive the listing from `ZEN_BASE` once it is
+ * `http://127.0.0.1:<port>/inference/openai/v1`: the local origin is not opencode.ai, so
+ * the `if` below falls through to `<base>/models` and the proxy forwards it to
+ * `/inference/openai/v1/models`, which is the 404 this whole distinction exists to avoid.
+ * egress-host.js records the real base here. A mock sets both or neither, so tests are
+ * unaffected.
+ */
+export const upstreamBase = () => process.env.ZEN_UPSTREAM_BASE || zenBase()
+
+/**
+ * Where the model list lives, derived from the configured base.
+ *
+ * The current client declares the provider at `https://opencode.ai/inference/openai/v1`
+ * and its models endpoint is `https://opencode.ai/inference/v1/models` -- the listing
+ * path is one level up from the chat path, and guessing `<base>/models` returns 404.
+ * Any other host (a mock, a test upstream, a different deployment) keeps the plain
+ * OpenAI shape so a local server still only needs one route.
+ */
+export function modelsUrl (base = upstreamBase()) {
+  try {
+    const u = new URL(base)
+    if (u.origin === 'https://opencode.ai') return u.origin + MODELS_PATH
+    const b = base.endsWith('/') ? base : base + '/'
+    return new URL('models', b).toString()
+  } catch {
+    return base + '/v1/models'
+  }
+}
 
 // The gateway rejects a request that does not advertise these four tools, so the
 // relay declares them itself and executes them server-side. The calling agent

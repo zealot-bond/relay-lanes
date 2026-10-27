@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url'
 export const LANE_FILES = [
   'codeversion.js',
   'config.js',
+  'egress-host.js',
+  'egress.js',
   'exhaustion.js',
   'fingerprint.js',
   'lane.js',

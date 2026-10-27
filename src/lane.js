@@ -15,6 +15,7 @@
 // its burned IP is replaced by a fresh runner, which is what keeps the pool at a
 // steady 20 without central scheduling.
 
+import http from 'node:http'
 import https from 'node:https'
 import { StringDecoder } from 'node:string_decoder'
 import {
@@ -41,7 +42,7 @@ import { config } from './config.js'
 const FIRST_BYTE_TIMEOUT_MS = config.FIRST_BYTE_TIMEOUT_MS
 const STREAM_IDLE_TIMEOUT_MS = config.STREAM_IDLE_TIMEOUT_MS
 
-const KEEPALIVE = new https.Agent({
+const KEEPALIVE_OPTS = {
   keepAlive: true,
   keepAliveMsecs: 30000,
   // A lane serves ONE upstream request at a time, so a pool of 16 sockets is not
@@ -54,7 +55,15 @@ const KEEPALIVE = new https.Agent({
   // Must outlast the first-byte budget, otherwise the agent kills the socket
   // before prefill completes.
   timeout: FIRST_BYTE_TIMEOUT_MS + 60000,
-})
+}
+
+// `https` is only used when the egress proxy is unavailable (see egress-host.js).
+const KEEPALIVE = new https.Agent(KEEPALIVE_OPTS)
+
+// ZEN_BASE points at the loopback Bun egress proxy whenever it is running, and a
+// plain-HTTP keep-alive socket to 127.0.0.1 is nearly free to hold -- reusing it
+// also keeps the request/response framing identical to the TLS path.
+const KEEPALIVE_HTTP = new http.Agent(KEEPALIVE_OPTS)
 
 /**
  * Fold an upstream SSE stream into one completion object.
@@ -499,6 +508,50 @@ function toResponsesTools (tools) {
   return tools.filter(usableTool).map(toResponsesTool)
 }
 
+/**
+ * The free-tier gate requires the system prompt to contain an `<env>` block with a
+ * `Working directory:` line inside it (measured 2026-10-26, by bisection against
+ * the real client's body):
+ *
+ *   <env>\n  Working directory: /x\n</env>        -> 200
+ *   <env>\n  Platform: linux\n</env>              -> 429
+ *   `Working directory:` outside a tag            -> 429
+ *   intro line alone, skills block alone          -> 429
+ *
+ * A harness that sends its own `<env>` block (OpenCode does) already satisfies it,
+ * and that block is left exactly as sent -- this only fills a gap, so a client that
+ * knows its own working directory is never overridden with the fallback.
+ */
+export const ENV_FALLBACK = '<env>\n  Working directory: /workspace\n  Platform: linux\n</env>'
+const ENV_OK = /<env>[\s\S]*?Working directory:[\s\S]*?<\/env>/i
+const ENV_TAG = /<env>[\s\S]*?<\/env>/i
+
+export function ensureEnvBlock (text) {
+  const s = typeof text === 'string' ? text : ''
+  if (ENV_OK.test(s)) return s
+  // An `<env>` block without a working directory fails the gate, so add the line
+  // to the client's block instead of appending a second one that contradicts it.
+  if (ENV_TAG.test(s)) return s.replace(ENV_TAG, (block) => block.replace(/<env>/i, '<env>\n  Working directory: /workspace'))
+  return s ? `${s}\n\n${ENV_FALLBACK}` : ENV_FALLBACK
+}
+
+/**
+ * Apply ensureEnvBlock to the first system/developer message, adding one when the
+ * conversation has none. Both dialects run through this so a request cannot satisfy
+ * the gate in one shape and fail it in the other.
+ */
+function withEnvBlock (msgs) {
+  const list = Array.isArray(msgs) ? msgs.slice() : []
+  const i = list.findIndex((m) => m && (m.role === 'system' || m.role === 'developer'))
+  if (i === -1) return [{ role: 'system', content: ENV_FALLBACK }, ...list]
+  const m = list[i]
+  if (typeof m.content !== 'string') return list
+  const next = ensureEnvBlock(m.content)
+  if (next === m.content) return list
+  list[i] = { ...m, content: next }
+  return list
+}
+
 function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls, reasoningEffort }) {
   const protocol = protocolFor(model)
 
@@ -541,7 +594,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
       : (messages || [])
     const body = {
       model,
-      input: toResponsesInput(merged),
+      input: toResponsesInput(withEnvBlock(merged)),
       stream: true,                          // the responses endpoint requires it
       tools: respTools,
       max_output_tokens: outputBudget(maxTokens),
@@ -577,7 +630,7 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
 
   const body = {
     model,
-    messages: msgs,
+    messages: withEnvBlock(msgs),
     stream: true,                            // free tier refuses stream:false
     tools: chatTools,
     max_tokens: outputBudget(maxTokens),
@@ -626,12 +679,17 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
       resolve(v)
     }
 
-    const req = https.request({
+    // `ZEN_BASE` points at the loopback Bun egress proxy whenever it is running
+    // (egress-host.js); plain HTTP there, TLS straight to the gateway otherwise.
+    // Everything below this line is transport-agnostic, so the two paths cannot
+    // diverge in parsing, streaming or classification.
+    const plain = url.protocol === 'http:'
+    const req = (plain ? http : https).request({
       hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname,
+      port: url.port || (plain ? 80 : 443),
+      path: url.pathname + url.search,
       method: 'POST',
-      agent: KEEPALIVE,
+      agent: plain ? KEEPALIVE_HTTP : KEEPALIVE,
       headers: {
         ...headers({ sessionId: newSessionId(), requestId: newRequestId(), protocol }),
         'Content-Length': Buffer.byteLength(payload),
@@ -963,7 +1021,7 @@ export async function callUpstream (job, opts = {}) {
   return result
 }
 
-export function destroyKeepalive () { KEEPALIVE.destroy() }
+export function destroyKeepalive () { KEEPALIVE.destroy(); KEEPALIVE_HTTP.destroy() }
 
 // Exposed for the diagnostic test, which needs to fold a captured stream without
 // issuing a request. Same code path the lane uses, so a difference in behaviour

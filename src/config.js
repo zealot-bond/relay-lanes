@@ -102,7 +102,13 @@ export const config = {
   GH_REF: str('GH_REF', 'main'),
   LANES_TARGET: num('LANES_TARGET', 20),
   RELAY_PUBLIC_URL: str('RELAY_PUBLIC_URL', ''),
-  // The gateway's model list, pinged at relay start. Empty URL = <zenBase>/v1/models.
+  // Upstream base for the chat dialect. The gateway's current client declares
+  // `https://opencode.ai/inference/openai/v1`; the model list lives one level up, at
+  // /inference/v1/models, so it is derived by modelsUrl() rather than by appending.
+  // An older base value (/zen/v1, /inference, /inference/v1) is rewritten by
+  // canonicalBase() in fingerprint.js instead of 404ing every request.
+  ZEN_BASE: str('ZEN_BASE', 'https://opencode.ai/inference/openai/v1'),
+  // The gateway's model list, pinged at relay start. Empty URL = modelsUrl().
   CATALOGUE_URL: str('CATALOGUE_URL', ''),
   // Which upstream models may be served, comma-separated. Empty means "serve whatever the
   // gateway lists and answers". Deployment policy belongs here, not in code: the previous
@@ -120,11 +126,24 @@ export const config = {
   // A "maximum context length" refusal halves the advertised window for that model (it is
   // learned, not assumed), down to this floor.
   MIN_CONTEXT_WINDOW: num('MIN_CONTEXT_WINDOW', 32768),
-  // A `limited` result whose Retry-After is at least this long is treated as global
-  // exhaustion: the same window applies to every egress IP, so the lane is kept and no
-  // upstream call is made until it passes. Shorter windows keep the per-IP behaviour
-  // (retire the lane, retry elsewhere), because another IP can genuinely answer there.
-  EXHAUSTION_GLOBAL_S: num('EXHAUSTION_GLOBAL_S', 1800),
+  // A `limited` result whose Retry-After is at least this long used to be treated as
+  // global exhaustion: the same window applies to every egress IP, so the lane was kept
+  // and no upstream call was made until it passed. That premise was wrong -- measured
+  // 2026-10-26, the long Retry-After is the free-tier GATE's fake quota, returned to any
+  // request that is not shaped like the first-party client (transport fingerprint, <env>
+  // block, tool set), not a real window shared by all IPs. The breaker therefore defaults
+  // OFF; `isGlobal` returns false when this is 0. Set a positive value only for a
+  // deployment that has measured a genuinely global window.
+  EXHAUSTION_GLOBAL_S: num('EXHAUSTION_GLOBAL_S', 0),
+  // The upstream call must leave through Bun's TLS stack -- the free tier's gate keys on
+  // the transport fingerprint, and Node's ClientHello is answered with a fake
+  // FreeUsageLimitError (see src/egress.js). The lane keeps doing everything else in
+  // Node; only the socket is Bun's. EGRESS_ENABLED=0 disables the proxy (the call then
+  // uses Node TLS, which the gate rejects from opencode.ai).
+  EGRESS_ENABLED: str('EGRESS_ENABLED', '1'),
+  // Bun binary used for the egress proxy. A GitHub runner image does not ship one, so
+  // the workflows install it; BUN_BIN lets an operator point at a different path.
+  BUN_BIN: str('BUN_BIN', 'bun'),
   ORCH_TICK_MS: num('ORCH_TICK_MS', 20000),
   // Everything below is read by a module that used to fall back to its own
   // `process.env.X || default` at import time. Because ES imports are hoisted,

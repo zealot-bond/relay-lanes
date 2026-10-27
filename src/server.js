@@ -177,6 +177,46 @@ function isRateLimitBody (result) {
 }
 
 /**
+ * The gate's 429 is not a quota.
+ *
+ * Measured 2026-10-26 by bisection: the free tier returns
+ * `429 FreeUsageLimitError ... Free models work in OpenCode` -- with a midnight-UTC
+ * Retry-After -- to any request it does not recognise as the first-party client, and
+ * 200 to the same body sent by Bun with an `<env>` block and the four tool names. It is
+ * dressed exactly like exhaustion, which is why it was misread as a spent bucket for two
+ * days while a real client on the same IP kept working.
+ *
+ * When one reaches a client, the relay's own request shape is wrong. Telling the operator
+ * to wait for the reset would send them to the wrong problem, so say what it is.
+ */
+function isGateBody (result) {
+  return /Free models work in OpenCode/i.test(String((result && result.raw) || ''))
+}
+
+/** Advice that matches the actual cause, shared by the streaming and JSON error paths. */
+function limitAdvice (result) {
+  if (isGateBody(result)) {
+    return 'This is the free tier\'s fingerprint gate, not a quota: the provider did not ' +
+      'recognise the request as the first-party client. Check that the Bun egress proxy is ' +
+      'running (EGRESS_ENABLED=1 and a working BUN_BIN) and that the request carries an ' +
+      '<env> block with a working directory and the four gateway tool names. Retrying will ' +
+      'not help until that is fixed.'
+  }
+  return directEnabled()
+    ? 'DIRECT_MODE sends every model through this one egress IP, so the whole catalogue ' +
+      'goes quiet together and retrying cannot help. Set DIRECT_MODE=0 to rotate across ' +
+      'runner IPs, or reduce request volume.'
+    : 'This lane\'s egress IP is exhausted and the relay retires it, so a client should ' +
+      'not normally see this; if it repeats, every egress IP is being refused.'
+}
+
+/** A gate 429 carries a fake Retry-After, so naming a reset time would be a lie. */
+function limitResetNote (result, retryAfter) {
+  if (isGateBody(result) || !(retryAfter >= 600)) return ''
+  return ` The window reopens at ${new Date(Date.now() + retryAfter * 1000).toISOString().slice(11, 16)} UTC.`
+}
+
+/**
  * Seconds to suggest before retrying.
  *
  * Honoured from the upstream when it tells us (Retry-After, x-ratelimit-reset), because
@@ -1136,16 +1176,8 @@ async function handleChat (req, res) {
               // quota, not a lane problem.
               ? `${PROVIDER}/${model}: ${limitHeadline(result)}` +
                 `${upstreamDetail(result, model) ? ` (${upstreamDetail(result, model)})` : ''}. ` +
-                (directEnabled()
-                  ? 'DIRECT_MODE shares this one egress IP across every model, so the whole ' +
-                    'catalogue goes quiet together -- and retrying cannot help, there is no ' +
-                    'second bucket. Wait for the window to reset, set DIRECT_MODE=0 to rotate ' +
-                    'across runner IPs, or reduce request volume.'
-                  : 'Every egress IP sees the same free-tier window, so another lane cannot ' +
-                    'answer it either. Wait for the window to reset.') +
-                (Number(result.retryAfter) >= 600
-                  ? ` The window reopens at ${new Date(Date.now() + Number(result.retryAfter) * 1000).toISOString().slice(11, 16)} UTC.`
-                  : '')
+                limitAdvice(result) +
+                limitResetNote(result, Number(result.retryAfter))
               : `no lane could serve this request (${result.kind}); ` +
               `tried ${entry.attempts || 1} time(s) across ${result.kind === 'empty' ? 'fresh lanes' : 'lanes'}` +
               `${upstreamDetail(result, model) ? `; upstream: ${upstreamDetail(result, model)}` : ''}`),
@@ -1180,22 +1212,15 @@ async function handleChat (req, res) {
     // lets a client back off on its own. Everything else keeps 502.
     if (result.kind === 'limited' || result.kind === 'ip_blocked' || isRateLimitBody(result)) {
       const retryAfter = result.retryAfter ?? rateLimitRetryAfter(result)
-      // A daily exhaustion is not "retry in a moment": name the reset so the message is
-      // actionable instead of inviting the client to hammer a spent bucket.
-      const resetNote = retryAfter >= 600
-        ? ` The window reopens at ${new Date(Date.now() + retryAfter * 1000).toISOString().slice(11, 16)} UTC.`
-        : ''
+      // A real daily exhaustion is not "retry in a moment": name the reset so the message
+      // is actionable instead of inviting the client to hammer a spent bucket. A gate 429
+      // carries the same Retry-After but no window, so it names no time.
+      const resetNote = limitResetNote(result, retryAfter)
       return json(res, 429, {
         error: {
-          message: `${PROVIDER}/${model}: free-tier rate limit reached` +
+          message: `${PROVIDER}/${model}: ${limitHeadline(result)}` +
             `${detail ? ` (${detail})` : ''}. ` +
-            (directEnabled()
-              ? 'DIRECT_MODE shares this one egress IP across every model, so the whole ' +
-                'catalogue goes quiet together -- and retrying cannot help, there is no ' +
-                'second bucket. Wait for the window to reset, set DIRECT_MODE=0 to rotate ' +
-                'across runner IPs, or reduce request volume.'
-              : 'Every lane shares the relay\'s own egress IP once the pool is out, so the ' +
-                'catalogue goes quiet together. Wait for the window to reset.') +
+            limitAdvice(result) +
             resetNote,
           type: 'rate_limit_exceeded',
         },
