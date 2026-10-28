@@ -48,6 +48,8 @@ const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
 const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
 // How long a finished stream may wait for a slow client to read its tail.
 const END_DRAIN_TIMEOUT_MS = config.END_DRAIN_TIMEOUT_MS
+const MAX_REQUEST_BYTES = config.MAX_REQUEST_BYTES
+const BODY_DRAIN_TIMEOUT_MS = config.BODY_DRAIN_TIMEOUT_MS
 
 export const queue = new WorkQueue({ claimLeaseMs: 120000, avoidTtlMs: 60000 })
 export const lanes = new LaneRegistry({ maxLanes: MAX_LANES })
@@ -58,21 +60,76 @@ const json = (res, status, obj, headers = {}) => {
   res.end(body)
 }
 
-function readBody (req, limitBytes = 16 * 1024 * 1024) {
+const BODY_TOO_LARGE = 'BODY_TOO_LARGE'
+
+/** A request body the relay refuses, carrying the status the client should see. */
+function bodyTooLarge (size, limit) {
+  const err = new Error(
+    `request body too large: ${size} bytes exceeds the ${limit}-byte limit. ` +
+    'Compact the session (or shorten the conversation) and retry.'
+  )
+  err.code = BODY_TOO_LARGE
+  err.statusCode = 413
+  return err
+}
+
+/**
+ * Read a JSON request body without ever destroying the socket mid-upload.
+ *
+ * This used to reject on overflow and immediately req.destroy(). The relay sits
+ * behind cloudflared, and an origin that closes before sending a response becomes a
+ * bodiless 502 at the client -- not a 413 and not a connection error. A long agent
+ * session that crossed the old 16 MB cap therefore failed every retry with
+ * `502 status code (no body)` while smaller sessions worked (98 in 22 minutes,
+ * measured 2026-10-28).
+ *
+ * So an oversized body is DRAINED (the data handler keeps the stream flowing but
+ * stops buffering) and rejected only once the request has ended. The handler can
+ * then write a real 413 that survives the trip back through the tunnel. A client
+ * that keeps uploading forever is bounded by BODY_DRAIN_TIMEOUT_MS.
+ */
+function readBody (req, limitBytes = MAX_REQUEST_BYTES) {
   return new Promise((resolve, reject) => {
-    const chunks = []
+    const declared = Number(req.headers['content-length'])
     let size = 0
+    let overflow = Number.isFinite(declared) && declared > limitBytes ? declared : 0
+    const chunks = []
+    let timer = null
+
+    const armDrainTimer = () => {
+      if (timer) return
+      timer = setTimeout(() => {
+        try { req.destroy() } catch { /* already gone */ }
+        reject(bodyTooLarge(size || overflow, limitBytes))
+      }, BODY_DRAIN_TIMEOUT_MS)
+      timer.unref?.()
+    }
+
     req.on('data', (c) => {
       size += c.length
-      if (size > limitBytes) { reject(new Error('payload too large')); req.destroy(); return }
+      if (!overflow && size > limitBytes) overflow = size
+      if (overflow) {
+        // Stop holding the bytes, but keep consuming them so the response is not
+        // lost to a TCP reset.
+        chunks.length = 0
+        armDrainTimer()
+        return
+      }
       chunks.push(c)
     })
     req.on('end', () => {
+      if (timer) clearTimeout(timer)
+      if (overflow) return reject(bodyTooLarge(overflow, limitBytes))
       const raw = Buffer.concat(chunks).toString()
       if (!raw) return resolve({})
       try { resolve(JSON.parse(raw)) } catch { reject(new Error('invalid JSON')) }
     })
-    req.on('error', reject)
+    req.on('error', (e) => {
+      if (timer) clearTimeout(timer)
+      reject(e)
+    })
+
+    if (overflow) armDrainTimer()
   })
 }
 
@@ -931,7 +988,12 @@ async function handleChat (req, res) {
   let payload
   try { payload = await readBody(req) }
   catch (e) {
-    return json(res, 400, { error: { message: String(e.message), type: 'invalid_request_error' } })
+    return json(res, e.statusCode || 400, {
+      error: {
+        message: String(e.message),
+        type: e.code === BODY_TOO_LARGE ? 'request_too_large' : 'invalid_request_error',
+      },
+    })
   }
 
   const {

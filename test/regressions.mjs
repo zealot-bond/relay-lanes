@@ -538,6 +538,34 @@ const scenarios = {
       { name: 'the answer still arrives in full', ok: answer.replace(/[^\x20-\x7e]/g, '').trim() === 'the answer', detail: JSON.stringify(answer) },
     ]
   },
+
+  // The relay used to destroy the socket the moment a request body crossed its cap.
+  // Behind cloudflared an origin that dies mid-upload becomes a bodiless 502, so a
+  // long session saw `502 status code (no body)` on every retry instead of a 413
+  // (measured 2026-10-28: 98 in 22 minutes, while smaller sessions were fine).
+  // An oversized body must be drained and ANSWERED, and a body under the cap must
+  // still reach the handler.
+  async 'body: oversized request is a 413, not a dead socket' () {
+    const LIMIT = 200000
+    await bootRelay(18902, { MAX_REQUEST_BYTES: String(LIMIT), BODY_DRAIN_TIMEOUT_MS: '20000' })
+    const send = (body) => new Promise((resolve, reject) => {
+      const sock = net.connect(18902, '127.0.0.1')
+      const chunks = []
+      sock.setTimeout(30000, () => sock.destroy(new Error('response timeout')))
+      sock.on('data', (d) => chunks.push(d))
+      sock.on('error', reject)
+      sock.on('close', () => resolve(Buffer.concat(chunks).toString()))
+      sock.write(`POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n` +
+        `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`)
+    })
+    const over = await send(JSON.stringify({ model: 'github/big-pickle', messages: [{ role: 'user', content: 'x'.repeat(LIMIT * 2) }] }))
+    const under = await send(JSON.stringify({ model: 'github/does-not-exist', messages: [{ role: 'user', content: 'x'.repeat(Math.floor(LIMIT / 2)) }] }))
+    return [
+      { name: 'oversized body is answered with a 413', ok: /^HTTP\/1\.1 413/.test(over) && /request body too large/.test(over), detail: over.slice(0, 200).replace(/\r?\n/g, ' | ') },
+      { name: 'the 413 is a complete JSON error, not a reset', ok: /"type":"request_too_large"/.test(over) && /"message":/.test(over), detail: over.slice(-220).replace(/\r?\n/g, ' | ') },
+      { name: 'a body under the cap still reaches the handler', ok: /^HTTP\/1\.1 404/.test(under) && /unknown model/.test(under), detail: under.slice(0, 180).replace(/\r?\n/g, ' | ') },
+    ]
+  },
 }
 
 // A TLS mock standing in for the upstream gateway.

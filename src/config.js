@@ -178,6 +178,25 @@ export const config = {
   // Ceiling on SSE data held for a client that is not reading. Past this the client
   // is treated as gone. Bounds memory at MAX_BACKLOG_BYTES per in-flight stream.
   MAX_BACKLOG_BYTES: num('MAX_BACKLOG_BYTES', 4 * 1024 * 1024),
+  // Largest client request body this relay accepts.
+  //
+  // 16 MB was too small for a long agent session: an OpenCode-style harness replays
+  // the whole conversation, including the model's thinking, and a session that had
+  // accumulated ~14 MB of transcript since its last compaction crossed the cap. The
+  // old code called req.destroy() on overflow, mid-upload; cloudflared turns an origin
+  // that dies before answering into a bodiless 502, so the client saw
+  // `502 status code (no body)` for every retry while other sessions were fine
+  // (measured 2026-10-28: 98 consecutive 502s, each attempt ending after ~9 s).
+  //
+  // 64 MB leaves room for a session that has not compacted yet, while Cloudflare's
+  // own free-plan request-body ceiling is higher than this. Memory: a body of this
+  // size is buffered, then stringified and parsed, so one request can briefly hold a
+  // few hundred MB. Raise it only with that in mind.
+  MAX_REQUEST_BYTES: num('MAX_REQUEST_BYTES', 64 * 1024 * 1024),
+  // How long an oversized upload may keep draining before the relay gives up on it.
+  // An honest 413 is only useful if it arrives; this bounds the wait for a client
+  // that keeps sending after it has already exceeded the cap.
+  BODY_DRAIN_TIMEOUT_MS: num('BODY_DRAIN_TIMEOUT_MS', 120000),
   // Reasoning tokens are drawn from the same budget as the answer. Measured on
   // muse-spark-1.3: 800/1200/2000 all produced an EMPTY completion for a ~200-word
   // prompt, while 4000 produced 215 words. A floor below that does not shorten an

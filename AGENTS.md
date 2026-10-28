@@ -243,6 +243,28 @@ cloudflared pools its origin connections and holds an idle one for about 90s. No
 5s default let the connector reuse a socket the relay had just closed: the request
 never reached the handler and the client got a 502 no counter could explain.
 
+## A long session's 502 was the body cap, not the tunnel (2026-10-28)
+
+`readBody` rejected at 16 MB and called `req.destroy()` in the middle of the upload. The
+relay is not the client's peer -- cloudflared is -- and an origin that closes before
+sending a response becomes a **bodiless 502**, not a 413 and not a connection error. A
+long agent session that replayed its whole transcript therefore saw
+`502 status code (no body)` on every retry while smaller sessions were fine. Measured:
+98 of them in 22 minutes, each attempt ending ~9 s after it started -- the time it takes
+to push 16 MB over that client's uplink. A 20 MB replay against the live relay reproduced
+it in 9.2 s with the body `error code: 502`.
+
+`MAX_REQUEST_BYTES` (64 MB) is the cap now, because a harness replays the conversation
+including the model's thinking and a session that has not compacted can be larger than
+16 MB. More importantly, an oversized body is **drained and answered with a real 413**
+(`BODY_DRAIN_TIMEOUT_MS`, 120 s, bounds a client that keeps uploading), so the tunnel
+always has a response to forward. The negative control is the old tree: the same 20 MB
+body fails the fetch there, while the current code parses it and answers normally.
+
+This is the first thing to check when a report says "502 (no body)" from one session
+while others work: `clients.gone` and the lane counters stay clean because the request
+never reached a handler.
+
 ## Timeout model — do not simplify this back
 
 Upstream timeouts are split by phase:
@@ -410,7 +432,7 @@ node test/context-overflow.mjs    # overflow classification/health/message
 node test/exhaustion.mjs          # default OFF; an explicit threshold still classifies
 node test/limit-global.mjs        # both configs end to end: default retires the lane,
                                   # EXHAUSTION_GLOBAL_S=7200 keeps it and stops calling
-node test/regressions.mjs    # 59 checks over 15 loopback scenarios
+node test/regressions.mjs    # 62 checks over 16 loopback scenarios
 node test/adversarial.mjs   # 54 checks, end to end: real relay + real lanes + mock upstream
 SRC_DIR=/older/src node test/regressions.mjs   # negative control
 SRC_DIR=/older/src node test/adversarial.mjs   # negative control
