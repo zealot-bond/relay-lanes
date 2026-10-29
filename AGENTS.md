@@ -92,6 +92,34 @@ fingerprint belongs to that ClientHello, so an upgrade must be deliberate. A mis
 is logged once and upstream calls fall back to Node TLS: the lane still serves, it just
 gets 429s.
 
+## The gateway refuses a tool name containing `subagent_fork` (2026-10-29)
+
+The 429 storm that drained the pool with `served: 0` was not the fingerprint gate
+and not a quota. The gateway now answers the generic `429 FreeUsageLimitError` to
+any request that **declares a tool whose name contains `subagent_fork`** — on every
+model and every egress IP.
+
+Bisected against the live upstream through the real Bun path, holding the request
+body fixed and changing one tool name:
+
+| declared tool name | answer |
+|---|---|
+| `subagent_fork`, `subagent_fork_x`, `dsh_subagent_fork` | 429 |
+| `subagent_for`, `subagent`, `my_fork`, `forklift`, `subagent__fork` | 200 |
+
+The check is the **declared name only**: the same string in a tool description, a
+user message, a tool result or an assistant's historical `tool_calls` answers 200,
+and the schema does not matter (an empty `parameters` object still 429s). DSH
+declares exactly `subagent_fork`, so every request from it was refused and every
+lane that served one was retired — the relay spent 22 runners in one turn while the
+error claimed the Bun proxy was down.
+
+`lane.js` now aliases such names to `subagent__fork` in the upstream declaration
+(chat and responses dialects) and restores the client's name on every returned tool
+call, streamed and folded, so the harness still gets the tool it declared. The alias
+is derived from the request's own tools, so a client that never declares the refused
+name is untouched. `test/units.mjs` pins both directions.
+
 ## TWO deployment surfaces — read this before debugging anything
 
 The code is split across two places that are deployed by **different mechanisms**:

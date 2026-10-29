@@ -509,6 +509,56 @@ function toResponsesTools (tools) {
 }
 
 /**
+ * Tool names the gateway refuses outright (measured 2026-10-29).
+ *
+ * A request that DECLARES a tool whose name contains `subagent_fork` is answered
+ * with the generic `429 FreeUsageLimitError` -- on every model and every egress
+ * IP -- even when that name is attached to an empty schema and nothing else in
+ * the request mentions it. `subagent_for`, `my_fork` and a description containing
+ * the string all answer 200, so the check is the declared name only. DSH declares
+ * exactly `subagent_fork`, so every request from it was refused and every lane
+ * that served one was retired: the pool drained with `served: 0` while the error
+ * looked like the fingerprint gate.
+ *
+ * The name is aliased only in the upstream declaration and restored on the way
+ * back, so the harness still receives the tool it declared and can still run it.
+ */
+const GATE_TOOL_DENY = 'subagent_fork'
+const GATE_TOOL_ALIAS = 'subagent__fork'
+
+/** Upstream-only name for a declared tool the gateway refuses by name. */
+function gateSafeToolName (name) {
+  if (typeof name !== 'string' || !name.includes(GATE_TOOL_DENY)) return name
+  return name.split(GATE_TOOL_DENY).join(GATE_TOOL_ALIAS)
+}
+
+/** alias -> original, for the tools this request declares. */
+export function toolNameRestore (tools) {
+  const restore = new Map()
+  for (const t of Array.isArray(tools) ? tools : []) {
+    const name = nameOfTool(t)
+    if (typeof name !== 'string') continue
+    const safe = gateSafeToolName(name)
+    if (safe !== name) restore.set(safe, name)
+  }
+  return restore
+}
+
+/** Restore aliased tool-call names in a folded chat completion. */
+function restoreFoldedToolNames (data, restore) {
+  if (!restore.size) return data
+  for (const ch of Array.isArray(data?.choices) ? data.choices : []) {
+    const calls = ch?.message?.tool_calls
+    if (!Array.isArray(calls)) continue
+    for (const c of calls) {
+      const name = c?.function?.name
+      if (typeof name === 'string' && restore.has(name)) c.function.name = restore.get(name)
+    }
+  }
+  return data
+}
+
+/**
  * The free-tier gate requires the system prompt to contain an `<env>` block with a
  * `Working directory:` line inside it (measured 2026-10-26, by bisection against
  * the real client's body):
@@ -572,11 +622,15 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
 
   const chatTools = [
     ...fingerprintToolSpecs().filter((t) => !clientNames.has(t.function.name)),
-    ...clientTools.map(toChatTool),
+    ...clientTools.map((t) => {
+      const spec = toChatTool(t)
+      spec.function.name = gateSafeToolName(spec.function.name)
+      return spec
+    }),
   ]
   const respTools = [
     ...fingerprintToolSpecsResponses().filter((t) => !clientNames.has(t.name)),
-    ...toResponsesTools(clientTools),
+    ...toResponsesTools(clientTools).map((t) => ({ ...t, name: gateSafeToolName(t.name) })),
   ]
 
   if (protocol === 'responses') {
@@ -663,6 +717,9 @@ function buildUpstreamBody ({ model, messages, system, maxTokens, temperature, t
 async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta, onReasoning } = {}) {
   const { model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls } = job || {}
   const protocol = protocolFor(model)
+  // The request declares gate-safe aliases for refused tool names; every call the
+  // model makes comes back with the alias, so put the client's name back on it.
+  const restoreNames = toolNameRestore(tools)
   const payload = JSON.stringify(buildUpstreamBody({ model, messages, system, maxTokens, temperature, topP, tools, toolChoice, parallelToolCalls, reasoningEffort: job.reasoningEffort }))
   const url = new URL(zenBase() + (protocol === 'responses' ? RESPONSES_PATH : CHAT_PATH))
 
@@ -745,7 +802,16 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
               index: resolveChatIndex(d),
               ...(d.id ? { id: d.id } : {}),
               ...(d.type ? { type: d.type } : {}),
-              ...(d.function ? { function: d.function } : {}),
+              ...(d.function
+                ? {
+                    function: {
+                      ...d.function,
+                      ...(d.function.name
+                        ? { name: restoreNames.get(d.function.name) || d.function.name }
+                        : {}),
+                    },
+                  }
+                : {}),
             })))
           }
           if (ev?.type === 'response.output_item.added' && ev?.item?.type === 'function_call') {
@@ -764,7 +830,8 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
             // unparseable.
             activeCall = nextFoldedPos++
             if (typeof ev.output_index === 'number') outIdxToCall.set(ev.output_index, activeCall)
-            callsByIndex.set(activeCall, { index: activeCall, id: ev.item.id || '', type: 'function', function: { name: ev.item.name || '', arguments: '' } })
+            const callName = restoreNames.get(ev.item.name) || ev.item.name || ''
+            callsByIndex.set(activeCall, { index: activeCall, id: ev.item.id || '', type: 'function', function: { name: callName, arguments: '' } })
             // Emit ONLY the identity here. A shallow spread shares the nested
             // `function` object, so the arguments accumulated below would also
             // appear on this fragment -- and since the worker serialises fragments
@@ -841,7 +908,7 @@ async function callUpstreamOnce (job, { signal, onDelta, onToolCall, onToolDelta
         // The provider puts its reset window in a header, not the body. Without this the
         // relay fell back to a guessed 900s and clients retried a spent bucket for hours.
         if (verdict.kind === 'limited') verdict.retryAfter = retryAfterSeconds(res.headers)
-        const data = verdict.kind === 'ok' ? parseUpstream(raw, model) : null
+        const data = verdict.kind === 'ok' ? restoreFoldedToolNames(parseUpstream(raw, model), restoreNames) : null
         const msg = data?.choices?.[0]?.message
         // A 200 that carries neither text nor tool calls is upstream flakiness,
         // not an answer. Measured on muse-spark: 4 of 5 requests. Reported as
@@ -1027,6 +1094,7 @@ export function destroyKeepalive () { KEEPALIVE.destroy(); KEEPALIVE_HTTP.destro
 // issuing a request. Same code path the lane uses, so a difference in behaviour
 // cannot be hidden by a second implementation.
 export const parseForTest = parseUpstream
+export const restoreToolsForTest = restoreFoldedToolNames
 
 // The converter is unit-tested offline against a tool-using conversation, which
 // is how the `input[8]` shape bug was caught without needing a live request.

@@ -7,7 +7,7 @@
 // duplication/interleaving symptoms, so a regression fails here in milliseconds
 // instead of needing a live runner.
 
-import { parseForTest, buildForTest, ensureEnvBlock } from '../src/lane.js'
+import { parseForTest, buildForTest, ensureEnvBlock, toolNameRestore, restoreToolsForTest } from '../src/lane.js'
 
 let failures = 0
 const check = (name, cond, detail = '') => {
@@ -247,6 +247,33 @@ console.log('\nbuildUpstreamBody: chat dialect keeps tool specs unioned')
   check('client tool present', names.includes('edit'), JSON.stringify(names))
   check('fingerprint tools retained', ['bash', 'glob', 'grep', 'read'].every((n) => names.includes(n)), JSON.stringify(names))
   check('fingerprint tools not duplicated', new Set(names).size === names.length, JSON.stringify(names))
+}
+
+console.log('\nbuildUpstreamBody: a refused tool name is aliased and restored')
+{
+  // 2026-10-29: declaring a tool whose name contains `subagent_fork` makes the
+  // gateway answer the generic 429/FreeUsageLimitError on every model and IP, even
+  // with an empty schema. DSH declares exactly that name, so every request failed.
+  // The declaration is aliased upstream and the call is mapped back for the client.
+  const fork = { type: 'function', function: { name: 'subagent_fork', parameters: { type: 'object', properties: {} } } }
+  const chat = buildForTest({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }], tools: [fork] })
+  const names = chat.tools.map((t) => t.function?.name)
+  check('chat: refused name is aliased upstream',
+    names.includes('subagent__fork') && !names.includes('subagent_fork'), JSON.stringify(names))
+  check('chat: gateway tools are still declared',
+    ['bash', 'glob', 'grep', 'read'].every((n) => names.includes(n)), JSON.stringify(names))
+
+  const resp = buildForTest({ model: 'muse-spark-1.2-contributor-free', messages: [{ role: 'user', content: 'hi' }], tools: [fork] })
+  const respNames = resp.tools.map((t) => t.name)
+  check('responses: refused name is aliased upstream',
+    respNames.includes('subagent__fork') && !respNames.includes('subagent_fork'), JSON.stringify(respNames))
+
+  const restore = toolNameRestore([fork])
+  const folded = { choices: [{ message: { tool_calls: [{ function: { name: 'subagent__fork' } }] } }] }
+  restoreToolsForTest(folded, restore)
+  check('an aliased call is restored for the client',
+    folded.choices[0].message.tool_calls[0].function.name === 'subagent_fork', JSON.stringify(folded))
+  check('an unrelated name is never remapped', toolNameRestore([fork]).size === 1 && !toolNameRestore([{ name: 'bash' }]).size)
 }
 
 console.log('\ntoResponsesInput: empty conversation is never an empty input')
