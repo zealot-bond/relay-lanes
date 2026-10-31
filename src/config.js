@@ -175,6 +175,14 @@ export const config = {
   // Comment frame sent to a streaming client while the relay waits upstream, so an
   // intermediary's idle timer does not silently drop a legitimately slow prefill.
   STREAM_KEEPALIVE_MS: num('STREAM_KEEPALIVE_MS', 15000),
+  // A comment keeps a PROXY alive but is invisible to a client's SSE parser: pi-ai
+  // (DSH) arms a 300s idle watchdog around the parsed event iterator, so a slow
+  // prefill that only sends `: keepalive` still aborts with "pi-ai stream idle
+  // timeout after 300000ms" (measured 2026-10-31, session 700b99df). Whenever the
+  // stream has been silent for this long, the relay also sends a parsed
+  // `reasoning_content: " "` event, which creates/resets the client's thinking
+  // block. It never touches content or the folded answer. 0 disables it.
+  STREAM_THINKING_HEARTBEAT_MS: num('STREAM_THINKING_HEARTBEAT_MS', 30000),
   // Ceiling on SSE data held for a client that is not reading. Past this the client
   // is treated as gone. Bounds memory at MAX_BACKLOG_BYTES per in-flight stream.
   MAX_BACKLOG_BYTES: num('MAX_BACKLOG_BYTES', 4 * 1024 * 1024),

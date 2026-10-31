@@ -539,6 +539,45 @@ const scenarios = {
     ]
   },
 
+  // #N+1 a client watchdog around the PARSED event iterator does not see comment
+  // frames. Measured 2026-10-31 (DSH/pi-ai): a legitimately slow prefill was
+  // aborted at 300s with "pi-ai stream idle timeout after 300000ms" although the
+  // relay had been sending `: keepalive` every 15s. Before the first real delta a
+  // silent prefill must therefore also produce a parsed event, and that event must
+  // never become answer text.
+  async 'relay: a silent prefill sends a parsed heartbeat' () {
+    const { B, post } = await bootRelay(18910, {
+      LANE_STALE_MS: '60000',
+      STREAM_KEEPALIVE_MS: '40',
+      STREAM_THINKING_HEARTBEAT_MS: '80',
+    })
+    await post('/lane/register', { laneId: 'L1' })
+    const client = fetch(B + '/v1/chat/completions', {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    }).then((r) => r.text())
+    const c1 = await fetch(B + '/lane/claim?laneId=L1&wait=3000', { headers: H }).then((r) => r.json())
+    // Simulate a prefill: no delta, no result, just silence.
+    await sleep(450)
+    await post('/lane/result', {
+      laneId: 'L1', entryId: c1.entryId,
+      result: { kind: 'ok', status: 200, ms: 5, data: { choices: [{ index: 0, message: { role: 'assistant', content: 'the answer' }, finish_reason: 'stop' }] } },
+    })
+    const out = await Promise.race([client, sleep(4000).then(() => '')])
+    const deltas = [...out.matchAll(/^data: (\{.*\})$/gm)]
+      .map((m) => { try { return JSON.parse(m[1]) } catch { return null } })
+      .filter(Boolean)
+      .map((j) => j.choices?.[0]?.delta || {})
+    const heartbeats = deltas.filter((d) => d.reasoning_content === ' ')
+    const answer = deltas.map((d) => d.content || '').join('')
+    return [
+      { name: 'a parsed heartbeat arrived during the silent prefill', ok: heartbeats.length > 0, detail: `heartbeats=${heartbeats.length}` },
+      { name: 'the heartbeat is not delivered as answer text', ok: !answer.includes(' ') || answer === 'the answer', detail: JSON.stringify(answer) },
+      { name: 'the real answer still arrives in full', ok: answer === 'the answer', detail: JSON.stringify(answer) },
+      { name: 'the stream still ends cleanly', ok: out.includes('"finish_reason":"stop"') && out.includes('[DONE]'), detail: out.slice(-80).replace(/\n/g, ' ') },
+    ]
+  },
+
   // The relay used to destroy the socket the moment a request body crossed its cap.
   // Behind cloudflared an origin that dies mid-upload becomes a bodiless 502, so a
   // long session saw `502 status code (no body)` on every retry instead of a 413

@@ -293,6 +293,45 @@ This is the first thing to check when a report says "502 (no body)" from one ses
 while others work: `clients.gone` and the lane counters stay clean because the request
 never reached a handler.
 
+## A client watchdog counts EVENTS, not bytes — send a parsed heartbeat (2026-10-31)
+
+DSH's pi-ai provider arms an idle watchdog around the **parsed** assistant-event
+iterator (`@deepseek-ai/dsh-timeout` → `idleWatchdog.next`, 300s), not around the HTTP
+socket. An SSE comment (`: keepalive`) is dropped by the parser, so it keeps a proxy
+alive and leaves the client's timer untouched. Measured on 2026-10-31: a silent prefill
+was aborted with `pi-ai stream idle timeout after 300000ms` while the relay had been
+writing a comment every 15s; the retry, on a different lane, succeeded in 28s.
+
+`server.js` therefore sends, on the keepalive cadence, a parsed
+`delta.reasoning_content: " "` whenever the client has seen no data for
+`STREAM_THINKING_HEARTBEAT_MS` (30s). pi-ai yields `thinking_start`/`thinking_delta`
+only for a **non-empty** reasoning field (an empty delta yields nothing), so a space is
+the smallest event that resets the watchdog. It is never `content`, never counted as
+streamed text, and never enters the fold; `REASONING_STREAM=0` or
+`STREAM_THINKING_HEARTBEAT_MS=0` disables it. The heartbeat stops when the result is in,
+so no data frame can follow `finish_reason`.
+
+`test/regressions.mjs` pins it: a silent prefill must deliver a parsed reasoning
+heartbeat and still deliver exactly the answer.
+
+## "Context window 0" after a failure is the client's token meter
+
+DSH's `dsh-token-meter` takes the **last usage sample** from an `assistant/attempt`
+(last-wins), and a failed attempt is recorded with `usage 0/0/0` by the client. The
+context gauge therefore drops to 0 after a transport failure and recovers on the next
+successful attempt (measured: 12:18:29 `terminated` → 0, 12:18:52 success → 83,718
+prompt tokens). The relay cannot supply a prompt count when the stream died before the
+final usage chunk; `toChatCompletion` and the stream finaliser only emit usage the
+upstream actually reported. Treat it as a symptom of the transport failure, not as a
+relay window change: `/v1/models` advertised 262144/262144/200000 throughout.
+
+The same session logged 59 `Connection error.` and 19 `Request timed out.` retries in
+one day, in bursts of seconds to a minute, while `/health` showed `failed: 0`,
+`timeouts: 0` and `clients.gone: 1`. Bursts like that are the client's own link or the
+edge: a request that never reaches the relay cannot be counted by it. The mid-stream
+`terminated` at 12:18:29 was followed 4s later by two immediate connection failures and
+then a success — a network outage, not a lane failure.
+
 ## Timeout model — do not simplify this back
 
 Upstream timeouts are split by phase:

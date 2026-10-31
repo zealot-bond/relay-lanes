@@ -45,6 +45,8 @@ const directFallbackEnabled = () => String(config.DIRECT_FALLBACK) === '1'
 const usableLanes = () => lanes.liveLanes(LANE_STALE_MS).filter((l) => l.status !== 'exhausted')
 const RETRY_LIMIT = config.RETRY_LIMIT
 const STREAM_KEEPALIVE_MS = config.STREAM_KEEPALIVE_MS
+// Parsed heartbeat for clients whose idle watchdog counts SSE EVENTS, not bytes.
+const STREAM_THINKING_HEARTBEAT_MS = config.STREAM_THINKING_HEARTBEAT_MS
 const MAX_BACKLOG_BYTES = config.MAX_BACKLOG_BYTES
 // How long a finished stream may wait for a slow client to read its tail.
 const END_DRAIN_TIMEOUT_MS = config.END_DRAIN_TIMEOUT_MS
@@ -1067,6 +1069,12 @@ async function handleChat (req, res) {
   let endTimer = null
   let writeSse = () => {}
   let drainBacklog = () => {}
+  // Stops comments and thinking heartbeats as soon as the result is in: a data
+  // frame after finish_reason would be invalid ordering for a strict client.
+  let stopHeartbeat = () => {}
+  // Tracks the last frame a CLIENT PARSER can see. A comment frame is invisible to
+  // an SSE event iterator, so a client watchdog (DSH/pi-ai: 300s) does not count it.
+  let lastParsedAt = 0
   // Non-streaming responses are ended directly; the streaming block replaces this
   // with a version that waits for queued data to reach the client first.
   let endWhenDrained = () => {
@@ -1158,15 +1166,36 @@ async function handleChat (req, res) {
     // round trip of a dropped-and-retried request.
     const keepalive = setInterval(() => {
       writeSse(`: keepalive ${Date.now()}\n\n`)
+      // A comment keeps a proxy's idle timer alive but is dropped by an SSE parser,
+      // so a harness that arms its watchdog around the parsed event iterator still
+      // aborts a slow prefill. Measured 2026-10-31: DSH's pi-ai watchdog rejected a
+      // 200 with "pi-ai stream idle timeout after 300000ms" while the relay had been
+      // sending comments every 15s. Whenever the stream has been silent for the
+      // thinking-heartbeat interval, also send one space of reasoning: pi-ai yields
+      // thinking_start/thinking_delta for a non-empty field, which resets the
+      // watchdog, and a space is invisible in the UI. It is never content, never
+      // counted as streamed text, and never enters the fold. This also covers a
+      // retry after a lane died mid-thinking: the client was already committed to a
+      // thinking block, but its watchdog does not know the relay switched lanes.
+      if (STREAM_THINKING_HEARTBEAT_MS > 0 &&
+          String(config.REASONING_STREAM) !== '0' &&
+          Date.now() - lastParsedAt >= STREAM_THINKING_HEARTBEAT_MS) {
+        writeSse(`data: ${JSON.stringify({
+          id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
+          choices: [{ index: 0, delta: { reasoning_content: ' ' }, finish_reason: null }],
+        })}\n\n`)
+        lastParsedAt = Date.now()
+      }
     }, STREAM_KEEPALIVE_MS)
     keepalive.unref?.()
-    const stopKeepalive = () => clearInterval(keepalive)
-    res.on('close', stopKeepalive)
+    stopHeartbeat = () => clearInterval(keepalive)
+    res.on('close', stopHeartbeat)
 
     writeSse(`data: ${JSON.stringify({
       id: streamId, object: 'chat.completion.chunk', created: streamCreated, model,
       choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
     })}\n\n`)
+    lastParsedAt = Date.now()
   }
 
   const queued = queue.push(entry)
@@ -1196,6 +1225,7 @@ async function handleChat (req, res) {
       if (text) delta.content = text
       if (toolCalls && toolCalls.length) delta.tool_calls = toolCalls
       if (!Object.keys(delta).length) return
+      lastParsedAt = Date.now()
       // writeSse checks writability, so a client that disconnected mid-stream does
       // not turn an in-flight delta into a throw.
       writeSse(`data: ${JSON.stringify({
@@ -1220,6 +1250,7 @@ async function handleChat (req, res) {
   ensureDispatched(entry)
 
   const result = await settled
+  stopHeartbeat()
   res.off?.('close', onClientGone)
   streamers.delete(entry.id)
 
